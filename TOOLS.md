@@ -30,7 +30,8 @@ Things like:
 ## Messaging Defaults
 
 - Primary channel: **WhatsApp**
-- Behavior: when Mengwei messages on WhatsApp, **reply on WhatsApp by default**. In webchat logs you may see `NO_REPLY` to avoid duplicate messages.
+- Behavior: when Mengwei messages on WhatsApp, **reply on WhatsApp by default**. I reply on **both WhatsApp + webchat only when Mengwei includes the word “both”**.
+- In webchat logs you may see `NO_REPLY` to avoid duplicate messages.
 - If a WhatsApp reply seems missing, user can send: **“resend”**.
 
 ## Why Separate?
