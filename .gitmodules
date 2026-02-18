@@ -1,0 +1,6 @@
+[submodule "third-party/llama.cpp"]
+	path = third-party/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
+[submodule "third-party/executorch"]
+	path = third-party/executorch
+	url = https://github.com/pytorch/executorch.git
