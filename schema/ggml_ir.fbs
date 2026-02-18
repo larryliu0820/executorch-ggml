@@ -1,0 +1,33 @@
+namespace ggml_ir;
+
+enum OpCode : int32 {
+    NONE = 0,
+    ADD = 1,
+    MUL_MAT = 2,
+    LEAKY_RELU = 3,
+}
+
+enum TensorType : int32 {
+    F32 = 0,
+    F16 = 1,
+}
+
+table Tensor {
+    id:int32;
+    type:TensorType = F32;
+    ne:[int64];            // shape in ggml order (innermost first), up to 4 dims
+    op:OpCode = NONE;
+    src_ids:[int32];       // input tensor IDs for this op
+    op_params:[uint8];     // raw bytes, e.g. packed float for negative_slope
+    data:[uint8];          // constant weight/bias bytes (empty for runtime inputs)
+    is_input:bool = false;
+    is_output:bool = false;
+    input_index:int32 = -1; // index into the runtime input list (-1 if not an input)
+}
+
+table GgmlGraph {
+    tensors:[Tensor];      // in topological order
+    n_threads:int32 = 1;
+}
+
+root_type GgmlGraph;

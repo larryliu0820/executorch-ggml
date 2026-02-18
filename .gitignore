@@ -1,0 +1,13 @@
+# Build
+build/
+cmake-build-*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# Generated
+*_generated.h
