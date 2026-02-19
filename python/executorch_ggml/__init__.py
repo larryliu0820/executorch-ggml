@@ -21,5 +21,10 @@ except Exception:
 
 from executorch_ggml.ggml_partitioner import GgmlPartitioner
 from executorch_ggml.ggml_backend import GgmlBackend
+from executorch_ggml.edge_pipeline import to_edge_rewrite_and_lower
 
-__all__ = ["GgmlPartitioner", "GgmlBackend"]
+__all__ = [
+    "GgmlPartitioner",
+    "GgmlBackend",
+    "to_edge_rewrite_and_lower",
+]

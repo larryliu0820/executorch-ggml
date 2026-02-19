@@ -21,10 +21,16 @@ ggml provides highly optimized, portable C kernels for tensor operations — qua
 PyTorch Model
     │
     ▼
-torch.export.export()      # Produces Edge-dialect FX graph
+torch.export.export()      # Produces an ExportedProgram (ATen dialect)
     │
     ▼
-GgmlPartitioner            # Tags supported ATen ops for delegation
+executorch.exir.to_edge()  # Converts to Edge dialect
+    │
+    ▼
+ExportedProgram rewrites   # (optional) e.g. BN folding
+    │
+    ▼
+GgmlPartitioner            # Tags supported Edge ops for delegation
     │
     ▼
 GgmlBackend.preprocess()   # Maps ATen ops → ggml IR, serializes to FlatBuffer
@@ -43,8 +49,30 @@ GgmlBackendInterface       # C++ runtime: deserializes IR, builds ggml_cgraph,
 |---------|---------|-------|
 | `aten.addmm` | `MUL_MAT` + `ADD` | Linear layer with bias |
 | `aten.mm` | `MUL_MAT` | Linear layer without bias |
-| `aten.t` | *(no-op)* | Looked through; ggml layout already matches |
+| `aten.t` / `aten.permute_copy` | *(no-op)* | Looked through; ggml layout already matches |
 | `aten.leaky_relu` | `LEAKY_RELU` | With configurable negative slope |
+| `aten.convolution` / `aten.conv2d` | `CONV_2D` | groups==1 only (for now) |
+| `aten.convolution` / `aten.conv2d` | `CONV_2D_DW` | depthwise conv (groups>1) |
+| `aten.hardtanh` / `aten.clamp` | `HARDTANH` | used for ReLU6/clamp |
+| `aten.mean.dim` | `MEAN` | currently implemented as `ggml_mean` (all-dims); axis-specific mean TBD |
+| `aten.view` / `aten.reshape` | `VIEW` | reshape/view |
+| `aten.permute` / `aten.permute_copy` | `PERMUTE` | transpose dims |
+
+### BatchNorm folding (Conv+BN)
+
+MobileNetV2-style graphs often contain the pattern:
+
+`conv -> batch_norm (inference) -> getitem(0)`
+
+To avoid BN’s tuple-return semantics inside delegated subgraphs, we provide an
+**ExportedProgram-level rewrite pass** that folds BN parameters into the upstream
+conv weights/bias and removes the BN/getitem nodes:
+
+- `executorch_ggml.passes.BatchNormFoldingRewritePass`
+
+This pass is intended to run **after** `to_edge(...)` and **before** partitioning.
+Use `executorch_ggml.to_edge_rewrite_and_lower(..., ep_passes=[...])` to compose
+these ExportedProgram rewrites into the standard ExecuTorch lowering pipeline.
 
 More ops can be added by extending the `OpCode` enum in `schema/ggml_ir.fbs`, the ATen→IR mapping in `ggml_backend.py`, and the ggml builder call in `ggml_backend.cpp`.
 
@@ -60,8 +88,8 @@ pip install -e .
 import torch
 import torch.nn as nn
 from torch.export import export
-from executorch.exir import to_edge_transform_and_lower
-from executorch_ggml import GgmlPartitioner
+from executorch_ggml import GgmlPartitioner, to_edge_rewrite_and_lower
+from executorch_ggml.passes import BatchNormFoldingRewritePass
 
 class MyModel(nn.Module):
     def __init__(self):
@@ -74,7 +102,11 @@ class MyModel(nn.Module):
 
 model = MyModel().eval()
 exported = export(model, (torch.randn(2, 4),))
-edge = to_edge_transform_and_lower(exported, partitioner=[GgmlPartitioner()])
+edge = to_edge_rewrite_and_lower(
+    exported,
+    ep_passes=[BatchNormFoldingRewritePass()],
+    partitioner=[GgmlPartitioner()],
+)
 et_program = edge.to_executorch()
 
 with open("model.pte", "wb") as f:

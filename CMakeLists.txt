@@ -19,20 +19,14 @@ if(NOT EXECUTORCH_DIR)
 endif()
 
 # ---------------------------------------------------------------------------
-# FlatBuffers – generate C++ header from schema
+# FlatBuffers – C++ header from schema
 # ---------------------------------------------------------------------------
-find_program(FLATC flatc REQUIRED)
-
-set(GGML_IR_FBS "${CMAKE_CURRENT_SOURCE_DIR}/schema/ggml_ir.fbs")
-set(GGML_IR_GENERATED_H "${CMAKE_CURRENT_BINARY_DIR}/ggml_ir_generated.h")
-
-add_custom_command(
-  OUTPUT "${GGML_IR_GENERATED_H}"
-  COMMAND "${FLATC}" --cpp -o "${CMAKE_CURRENT_BINARY_DIR}" "${GGML_IR_FBS}"
-  DEPENDS "${GGML_IR_FBS}"
-  COMMENT "Generating ggml_ir_generated.h from FlatBuffer schema"
-)
-add_custom_target(ggml_ir_gen DEPENDS "${GGML_IR_GENERATED_H}")
+# We check in schema/ggml_ir_generated.h so builds (including pip build
+# isolation) do not require a working `flatc` binary.
+#
+# If you want to regenerate it, run:
+#   flatc --cpp -o schema schema/ggml_ir.fbs
+add_custom_target(ggml_ir_gen)
 
 # ---------------------------------------------------------------------------
 # ggml (from llama.cpp)
@@ -54,11 +48,20 @@ option(EXECUTORCH_GGML_BUILD_PYTHON_EXTENSION "Build Python extension that regis
 if(EXECUTORCH_GGML_BUILD_PYTHON_EXTENSION)
   find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 
-  execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import pybind11; print(pybind11.get_include())"
-    OUTPUT_VARIABLE PYBIND11_INCLUDE_DIR
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-  )
+  # Prefer vendored pybind11 (ExecuTorch submodule) to avoid requiring the
+  # Python pybind11 package in build isolation environments.
+  if(EXISTS "${EXECUTORCH_DIR}/third-party/pybind11/include")
+    set(PYBIND11_INCLUDE_DIR "${EXECUTORCH_DIR}/third-party/pybind11/include")
+  elseif(EXISTS "${EXECUTORCH_DIR}/third-party/executorch/third-party/pybind11/include")
+    set(PYBIND11_INCLUDE_DIR "${EXECUTORCH_DIR}/third-party/executorch/third-party/pybind11/include")
+  else()
+    execute_process(
+      COMMAND ${Python3_EXECUTABLE} -c "import pybind11; print(pybind11.get_include())"
+      OUTPUT_VARIABLE PYBIND11_INCLUDE_DIR
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+    )
+  endif()
 
   execute_process(
     COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX') or '.so')"
@@ -92,7 +95,8 @@ if(EXECUTORCH_GGML_BUILD_PYTHON_EXTENSION)
 
   target_include_directories(executorch_ggml_backend_py PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
-    "${CMAKE_CURRENT_BINARY_DIR}"            # ggml_ir_generated.h
+    "${CMAKE_CURRENT_SOURCE_DIR}/schema"     # ggml_ir_generated.h (checked in)
+    "${CMAKE_CURRENT_BINARY_DIR}"            # legacy
     "${LLAMA_CPP_DIR}/ggml/include"
     "${EXECUTORCH_DIR}/.."
     "${EXECUTORCH_DIR}"

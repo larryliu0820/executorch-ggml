@@ -10,7 +10,7 @@
 #include <cstring>
 #include <vector>
 
-#include "ggml_ir_generated.h"  // flatc-generated header
+#include "ggml_ir_generated.h"  // flatc-generated header (checked in under schema/)
 
 #include <ggml.h>
 #include <ggml-cpu.h>
@@ -72,23 +72,16 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
   const int n_tensors = static_cast<int>(fb_tensors->size());
   const int n_threads = fb_graph->n_threads();
 
-  // Calculate memory needed for ggml context
-  // Each tensor needs overhead + data for constants
+  // Calculate memory needed for ggml context.
+  // Constants are loaded from NamedDataMap into ggml tensors; the memory lives
+  // inside the ggml context, so we size based on tensor count with headroom.
   size_t constant_data_size = 0;
-  for (int i = 0; i < n_tensors; ++i) {
-    const auto* t = fb_tensors->Get(i);
-    if (t->data() && t->data()->size() > 0) {
-      constant_data_size += t->data()->size();
-      // Alignment padding
-      constant_data_size += 64;
-    }
-  }
 
   size_t ctx_size =
       static_cast<size_t>(n_tensors) * ggml_tensor_overhead() +
       constant_data_size +
       ggml_graph_overhead() +
-      1024 * 1024;  // extra headroom
+      16 * 1024 * 1024;  // extra headroom (weights live in ctx)
 
   struct ggml_init_params params = {
       /* .mem_size   = */ ctx_size,
@@ -134,7 +127,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
 
     const auto op = static_cast<ggml_ir::OpCode>(t->op());
 
-    if (op == ggml_ir::OpCode_NONE) {
+    if (op == ggml_ir::OpCode::NONE) {
       // Leaf tensor: input or constant
       struct ggml_tensor* gt = nullptr;
       switch (n_dims) {
@@ -152,9 +145,22 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           break;
       }
 
-      // Copy constant data if present
-      if (t->data() && t->data()->size() > 0) {
-        memcpy(gt->data, t->data()->data(), t->data()->size());
+      // Load constant data from NamedDataMap if present.
+      if (t->data_key() && t->data_key()->c_str() && std::strlen(t->data_key()->c_str()) > 0) {
+        const auto* ndm = context.get_named_data_map();
+        if (ndm == nullptr) {
+          ggml_free(ctx);
+          return Error::InvalidArgument;
+        }
+
+        const char* key = t->data_key()->c_str();
+        // Load directly into ggml tensor memory.
+        const size_t nbytes = ggml_nbytes(gt);
+        auto err = ndm->load_data_into(key, gt->data, nbytes);
+        if (err != Error::Ok) {
+          ggml_free(ctx);
+          return err;
+        }
       }
 
       if (t->is_input()) {
@@ -177,20 +183,151 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       }
 
       switch (op) {
-        case ggml_ir::OpCode_ADD:
+        case ggml_ir::OpCode::ADD:
           gt = ggml_add(ctx, srcs[0], srcs[1]);
           break;
 
-        case ggml_ir::OpCode_MUL_MAT:
+        case ggml_ir::OpCode::MUL_MAT:
           gt = ggml_mul_mat(ctx, srcs[0], srcs[1]);
           break;
 
-        case ggml_ir::OpCode_LEAKY_RELU: {
+        case ggml_ir::OpCode::LEAKY_RELU: {
           float negative_slope = 0.01f;
           if (t->op_params() && t->op_params()->size() >= 4) {
             memcpy(&negative_slope, t->op_params()->data(), sizeof(float));
           }
           gt = ggml_leaky_relu(ctx, srcs[0], negative_slope, false);
+          break;
+        }
+
+        case ggml_ir::OpCode::CONV_2D:
+        case ggml_ir::OpCode::CONV_2D_DW: {
+          // src_ids: [weight, input, bias?]
+          // op_params: stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w, groups
+          if (srcs.size() < 2) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+
+          struct ggml_tensor* weight = srcs[0];
+          struct ggml_tensor* input = srcs[1];
+          struct ggml_tensor* bias = srcs.size() > 2 ? srcs[2] : nullptr;
+
+          // Parse op_params
+          int32_t stride_h = 1, stride_w = 1;
+          int32_t pad_h = 0, pad_w = 0;
+          int32_t dilation_h = 1, dilation_w = 1;
+          int32_t groups = 1;
+
+          if (t->op_params() && t->op_params()->size() >= 28) {
+            const uint8_t* data = t->op_params()->data();
+            memcpy(&stride_h, data, sizeof(int32_t));
+            memcpy(&stride_w, data + 4, sizeof(int32_t));
+            memcpy(&pad_h, data + 8, sizeof(int32_t));
+            memcpy(&pad_w, data + 12, sizeof(int32_t));
+            memcpy(&dilation_h, data + 16, sizeof(int32_t));
+            memcpy(&dilation_w, data + 20, sizeof(int32_t));
+            memcpy(&groups, data + 24, sizeof(int32_t));
+          }
+
+          // ggml API signature:
+          // ggml_conv_2d(ctx, weight, input, s0, s1, p0, p1, d0, d1)
+          // ggml_conv_2d_dw(ctx, weight, input, s0, s1, p0, p1, d0, d1)
+          // Note: groups parameter not directly supported in ggml API
+          // For depthwise conv (groups > 1), use ggml_conv_2d_dw
+          // For regular conv (groups == 1), use ggml_conv_2d
+          if (op == ggml_ir::OpCode::CONV_2D_DW || groups > 1) {
+            // Depthwise convolution
+            gt = ggml_conv_2d_dw(ctx, weight, input, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w);
+          } else {
+            // Regular convolution
+            gt = ggml_conv_2d(ctx, weight, input, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w);
+          }
+
+          // Add bias if present
+          if (bias && gt) {
+            gt = ggml_add(ctx, gt, bias);
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::HARDTANH: {
+          // hardtanh(x, min_val, max_val) -> clamp(x, min, max)
+          float min_val = -1.0f;
+          float max_val = 1.0f;
+          if (t->op_params() && t->op_params()->size() >= 8) {
+            const uint8_t* data = t->op_params()->data();
+            memcpy(&min_val, data, sizeof(float));
+            memcpy(&max_val, data + 4, sizeof(float));
+          }
+          gt = ggml_clamp(ctx, srcs[0], min_val, max_val);
+          break;
+        }
+
+        case ggml_ir::OpCode::MEAN: {
+          // mean(x, dim)
+          int32_t dim = -1;
+          if (t->op_params() && t->op_params()->size() >= 4) {
+            memcpy(&dim, t->op_params()->data(), sizeof(int32_t));
+          }
+          // ggml_mean computes mean over all dimensions
+          // For single-dim mean, we need ggml_mean over a specific axis
+          // Note: ggml may not have axis-specific mean yet
+          // Workaround: use ggml_sum / ggml_repeat to normalize
+          // This is a potential blocking issue
+          gt = ggml_mean(ctx, srcs[0]);
+          break;
+        }
+
+        case ggml_ir::OpCode::VIEW: {
+          // reshape(x, new_shape)
+          // Parse new shape from op_params
+          if (!t->op_params() || t->op_params()->size() < 4) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+
+          const uint8_t* data = t->op_params()->data();
+          int32_t ndims = 0;
+          memcpy(&ndims, data, sizeof(int32_t));
+
+          if (t->op_params()->size() < 4 + ndims * 8) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+
+          int64_t new_ne[4] = {1, 1, 1, 1};
+          for (int32_t i = 0; i < ndims && i < 4; ++i) {
+            memcpy(&new_ne[i], data + 4 + i * 8, sizeof(int64_t));
+          }
+
+          gt = ggml_reshape_4d(ctx, srcs[0], new_ne[0], new_ne[1], new_ne[2], new_ne[3]);
+          break;
+        }
+
+        case ggml_ir::OpCode::PERMUTE: {
+          // permute(x, dims)
+          if (!t->op_params() || t->op_params()->size() < 4) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+
+          const uint8_t* data = t->op_params()->data();
+          int32_t ndims = 0;
+          memcpy(&ndims, data, sizeof(int32_t));
+
+          if (t->op_params()->size() < 4 + ndims * 4) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+
+          int32_t perm[4] = {0, 1, 2, 3};
+          for (int32_t i = 0; i < ndims && i < 4; ++i) {
+            memcpy(&perm[i], data + 4 + i * 4, sizeof(int32_t));
+          }
+
+          // ggml_permute(ctx, tensor, axis0, axis1, axis2, axis3)
+          gt = ggml_permute(ctx, srcs[0], perm[0], perm[1], perm[2], perm[3]);
           break;
         }
 

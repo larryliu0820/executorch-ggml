@@ -19,6 +19,12 @@ OP_NONE = 0
 OP_ADD = 1
 OP_MUL_MAT = 2
 OP_LEAKY_RELU = 3
+OP_CONV_2D = 4
+OP_CONV_2D_DW = 5     # depthwise conv2d
+OP_HARDTANH = 6        # clamp
+OP_MEAN = 7            # mean(dim)
+OP_VIEW = 8            # reshape
+OP_PERMUTE = 9         # transpose dims
 
 # TensorType
 TYPE_F32 = 0
@@ -39,7 +45,7 @@ class IrTensor:
         "op",
         "src_ids",
         "op_params",
-        "data",
+        "data_key",
         "is_input",
         "is_output",
         "input_index",
@@ -53,7 +59,7 @@ class IrTensor:
         op: int = OP_NONE,
         src_ids: Optional[List[int]] = None,
         op_params: Optional[bytes] = None,
-        data: Optional[bytes] = None,
+        data_key: Optional[str] = None,
         is_input: bool = False,
         is_output: bool = False,
         input_index: int = -1,
@@ -64,7 +70,7 @@ class IrTensor:
         self.op = op
         self.src_ids = src_ids or []
         self.op_params = op_params or b""
-        self.data = data or b""
+        self.data_key = data_key or ""
         self.is_input = is_input
         self.is_output = is_output
         self.input_index = input_index
@@ -110,10 +116,10 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
         else:
             op_params_vec = None
 
-        if t.data:
-            data_vec = _create_uint8_vector(builder, t.data)
+        if t.data_key:
+            data_key_off = builder.CreateString(t.data_key)
         else:
-            data_vec = None
+            data_key_off = None
 
         # Build the Tensor table
         # Start table with the right number of fields (10 fields)
@@ -128,8 +134,8 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
             builder.PrependUOffsetTRelativeSlot(4, src_ids_vec, 0)  # src_ids
         if op_params_vec is not None:
             builder.PrependUOffsetTRelativeSlot(5, op_params_vec, 0)  # op_params
-        if data_vec is not None:
-            builder.PrependUOffsetTRelativeSlot(6, data_vec, 0)  # data
+        if data_key_off is not None:
+            builder.PrependUOffsetTRelativeSlot(6, data_key_off, 0)  # data_key
         builder.PrependBoolSlot(7, t.is_input, False)    # is_input
         builder.PrependBoolSlot(8, t.is_output, False)   # is_output
         builder.PrependInt32Slot(9, t.input_index, -1)   # input_index
@@ -196,3 +202,62 @@ def _create_uint8_vector(builder: flatbuffers.Builder, data: bytes):
 def pack_float(value: float) -> bytes:
     """Pack a single float into little-endian bytes (for op_params)."""
     return struct.pack("<f", value)
+
+
+def pack_conv2d_params(
+    stride: List[int],
+    padding: List[int],
+    dilation: List[int],
+    groups: int,
+) -> bytes:
+    """Pack conv2d parameters into little-endian bytes.
+
+    Layout: stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w, groups
+    Each as int32 (4 bytes).
+    """
+    return struct.pack(
+        "<iiiiiii",
+        stride[0] if len(stride) > 0 else 1,
+        stride[1] if len(stride) > 1 else 1,
+        padding[0] if len(padding) > 0 else 0,
+        padding[1] if len(padding) > 1 else 0,
+        dilation[0] if len(dilation) > 0 else 1,
+        dilation[1] if len(dilation) > 1 else 1,
+        groups,
+    )
+
+
+def pack_hardtanh_params(min_val: float, max_val: float) -> bytes:
+    """Pack hardtanh/clamp parameters into little-endian bytes.
+
+    Layout: min_val, max_val (each as float32, 4 bytes).
+    """
+    return struct.pack("<ff", min_val, max_val)
+
+
+def pack_mean_params(dim: int) -> bytes:
+    """Pack mean parameters into little-endian bytes.
+
+    Layout: dim (as int32, 4 bytes).
+    """
+    return struct.pack("<i", dim)
+
+
+def pack_view_params(new_shape: List[int]) -> bytes:
+    """Pack view/reshape parameters into little-endian bytes.
+
+    Layout: ndims (int32), followed by ndims int64 values.
+    """
+    ndims = len(new_shape)
+    fmt = f"<i{ndims}q"  # i for ndims, q for each int64
+    return struct.pack(fmt, ndims, *new_shape)
+
+
+def pack_permute_params(perm: List[int]) -> bytes:
+    """Pack permute parameters into little-endian bytes.
+
+    Layout: ndims (int32), followed by ndims int32 values.
+    """
+    ndims = len(perm)
+    fmt = f"<i{ndims}i"  # i for ndims, i for each int32
+    return struct.pack(fmt, ndims, *perm)

@@ -31,7 +31,9 @@ endif()
 
 target_include_directories(executorch_ggml_runtime PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_BINARY_DIR}/.."   # for ggml_ir_generated.h
+  "${CMAKE_CURRENT_BINARY_DIR}/.."   # legacy (generated headers)
+  "${CMAKE_CURRENT_SOURCE_DIR}/.."   # repo root
+  "${CMAKE_CURRENT_SOURCE_DIR}/../schema"   # for ggml_ir_generated.h
   "${LLAMA_CPP_DIR}/ggml/include"
   "${EXECUTORCH_DIR}/.."
   "${EXECUTORCH_DIR}"

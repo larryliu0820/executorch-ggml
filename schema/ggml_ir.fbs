@@ -5,6 +5,12 @@ enum OpCode : int32 {
     ADD = 1,
     MUL_MAT = 2,
     LEAKY_RELU = 3,
+    CONV_2D = 4,
+    CONV_2D_DW = 5,     // depthwise conv2d
+    HARDTANH = 6,        // clamp
+    MEAN = 7,            // mean(dim)
+    VIEW = 8,            // reshape
+    PERMUTE = 9,         // transpose dims
 }
 
 enum TensorType : int32 {
@@ -15,11 +21,16 @@ enum TensorType : int32 {
 table Tensor {
     id:int32;
     type:TensorType = F32;
-    ne:[int64];            // shape in ggml order (innermost first), up to 4 dims
+    ne:[int64];             // shape in ggml order (innermost first), up to 4 dims
     op:OpCode = NONE;
-    src_ids:[int32];       // input tensor IDs for this op
-    op_params:[uint8];     // raw bytes, e.g. packed float for negative_slope
-    data:[uint8];          // constant weight/bias bytes (empty for runtime inputs)
+    src_ids:[int32];        // input tensor IDs for this op
+    op_params:[uint8];      // raw bytes, e.g. packed float for negative_slope
+
+    // Constants/weights are stored in ExecuTorch's NamedDataStore/NamedDataMap.
+    // Key is expected to be the *FQN* in the ExportedProgram state_dict.
+    // Empty for runtime inputs.
+    data_key:string;
+
     is_input:bool = false;
     is_output:bool = false;
     input_index:int32 = -1; // index into the runtime input list (-1 if not an input)

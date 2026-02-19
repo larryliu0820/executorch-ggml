@@ -19,6 +19,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import shutil
 from typing import List
 
 from setuptools import Extension, find_packages, setup
@@ -32,8 +33,16 @@ class CMakeExtension(Extension):
 
 class CMakeBuild(build_ext):
     def run(self) -> None:
-        # Allow "pip install" to succeed even if native deps are missing,
-        # by skipping native build unless we can locate dependencies.
+        # IMPORTANT: pip build isolation environments typically won't have
+        # pybind11/executorch available. We only build the native extension
+        # when explicitly requested.
+        if os.environ.get("EXECUTORCH_GGML_BUILD_NATIVE", "0") not in {"1", "true", "True", "yes"}:
+            print(
+                "[executorch-ggml] Skipping native extension build. "
+                "Set EXECUTORCH_GGML_BUILD_NATIVE=1 to build _ggml_backend." 
+            )
+            return
+
         for ext in self.extensions:
             self.build_extension(ext)
 
@@ -82,9 +91,39 @@ class CMakeBuild(build_ext):
             "-DEXECUTORCH_GGML_BUILD_PYTHON_EXTENSION=ON",
         ]
 
-        subprocess.check_call(["cmake", "-S", str(root), "-B", str(build_temp), *cmake_args])
+        env = os.environ.copy()
+
+        # Ensure we use a real flatc binary (not the ExecuTorch python wrapper).
+        def pick_flatc() -> str | None:
+            candidates = []
+            w = shutil.which("flatc")
+            if w:
+                candidates.append(w)
+            # common locations (brew/system)
+            candidates += ["/opt/homebrew/bin/flatc", "/usr/local/bin/flatc", "/usr/bin/flatc"]
+
+            for c in candidates:
+                if not c:
+                    continue
+                p = pathlib.Path(c)
+                if not p.exists():
+                    continue
+                # avoid venv/python wrapper scripts
+                if str(p).startswith(str(pathlib.Path(sys.executable).parent)):
+                    continue
+                return str(p)
+            return None
+
+        flatc = pick_flatc()
+        if flatc:
+            env["FLATC"] = flatc
+        else:
+            print("[executorch-ggml] Warning: could not locate system flatc; CMake may fail")
+
+        subprocess.check_call(["cmake", "-S", str(root), "-B", str(build_temp), *cmake_args], env=env)
         subprocess.check_call(
-            ["cmake", "--build", str(build_temp), "--target", "executorch_ggml_backend_py"]
+            ["cmake", "--build", str(build_temp), "--target", "executorch_ggml_backend_py"],
+            env=env,
         )
 
 

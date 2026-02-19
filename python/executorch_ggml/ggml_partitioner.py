@@ -13,16 +13,29 @@ from executorch.exir.backend.partitioner import (
 from executorch.exir.backend.utils import tag_constant_data
 
 
-# ATen ops that nn.Linear + nn.LeakyReLU decompose into after torch.export.
+# ATen ops that we support in the ggml backend.
 #
 # After conversion to Edge dialect, node.target becomes an EdgeOpOverload,
 # not equal to torch.ops. So we match by name.
 _SUPPORTED_OP_NAMES = {
+    # Linear layers
     "aten.t.default",
     "aten.permute_copy.default",
     "aten.addmm.default",
     "aten.mm.default",
     "aten.leaky_relu.default",
+    # MobileNetV2 ops
+    "aten.convolution.default",
+    "aten.conv2d.default",
+    "aten.hardtanh.default",
+    "aten.clamp.default",
+    "aten.mean.dim",
+    "aten._mean_dim.default",
+    "aten.view.default",
+    "aten._unsafe_view.default",
+    "aten.reshape.default",
+    "aten.permute.default",
+    # BatchNorm should be removed by BatchNormFoldingRewritePass prior to partitioning.
 }
 
 
