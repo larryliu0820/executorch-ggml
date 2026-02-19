@@ -35,6 +35,8 @@ _SUPPORTED_OP_NAMES = {
     "aten._unsafe_view.default",
     "aten.reshape.default",
     "aten.permute.default",
+    "aten.add.Tensor",
+    "dim_order_ops._clone_dim_order.default",
     # BatchNorm should be removed by BatchNormFoldingRewritePass prior to partitioning.
 }
 

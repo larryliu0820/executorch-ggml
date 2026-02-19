@@ -235,12 +235,21 @@ def pack_hardtanh_params(min_val: float, max_val: float) -> bytes:
     return struct.pack("<ff", min_val, max_val)
 
 
-def pack_mean_params(dim: int) -> bytes:
+def pack_mean_params(dims) -> bytes:
     """Pack mean parameters into little-endian bytes.
 
-    Layout: dim (as int32, 4 bytes).
+    Layout:
+      ndims (int32)
+      dims[0..ndims-1] (int32 each)
+
+    We keep the dims in *PyTorch* dimension order.
     """
-    return struct.pack("<i", dim)
+    if isinstance(dims, int):
+        dims = [dims]
+    dims = list(dims)
+    ndims = len(dims)
+    fmt = f"<i{ndims}i"
+    return struct.pack(fmt, ndims, *dims)
 
 
 def pack_view_params(new_shape: List[int]) -> bytes:

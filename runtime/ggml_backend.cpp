@@ -81,7 +81,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       static_cast<size_t>(n_tensors) * ggml_tensor_overhead() +
       constant_data_size +
       ggml_graph_overhead() +
-      16 * 1024 * 1024;  // extra headroom (weights live in ctx)
+      512 * 1024 * 1024;  // headroom (MV2 needs a lot of ggml objects)
 
   struct ggml_init_params params = {
       /* .mem_size   = */ ctx_size,
@@ -130,18 +130,25 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     if (op == ggml_ir::OpCode::NONE) {
       // Leaf tensor: input or constant
       struct ggml_tensor* gt = nullptr;
+
+      // Respect declared tensor type.
+      ggml_type gtype = GGML_TYPE_F32;
+      if (t->type() == ggml_ir::TensorType::F16) {
+        gtype = GGML_TYPE_F16;
+      }
+
       switch (n_dims) {
         case 1:
-          gt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+          gt = ggml_new_tensor_1d(ctx, gtype, ne[0]);
           break;
         case 2:
-          gt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+          gt = ggml_new_tensor_2d(ctx, gtype, ne[0], ne[1]);
           break;
         case 3:
-          gt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+          gt = ggml_new_tensor_3d(ctx, gtype, ne[0], ne[1], ne[2]);
           break;
         default:
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+          gt = ggml_new_tensor_4d(ctx, gtype, ne[0], ne[1], ne[2], ne[3]);
           break;
       }
 
@@ -154,13 +161,23 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         }
 
         const char* key = t->data_key()->c_str();
-        // Load directly into ggml tensor memory.
         const size_t nbytes = ggml_nbytes(gt);
-        auto err = ndm->load_data_into(key, gt->data, nbytes);
-        if (err != Error::Ok) {
+
+        // Prefer get_data() for maximum compatibility: some NamedDataMap
+        // implementations may not implement load_data_into().
+        auto fb = ndm->get_data(key);
+        if (!fb.ok()) {
           ggml_free(ctx);
-          return err;
+          return fb.error();
         }
+        auto buf = std::move(fb.get());
+        if (buf.size() < nbytes) {
+          buf.Free();
+          ggml_free(ctx);
+          return Error::InvalidExternalData;
+        }
+        memcpy(gt->data, buf.data(), nbytes);
+        buf.Free();
       }
 
       if (t->is_input()) {
@@ -183,9 +200,20 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       }
 
       switch (op) {
-        case ggml_ir::OpCode::ADD:
-          gt = ggml_add(ctx, srcs[0], srcs[1]);
+        case ggml_ir::OpCode::ADD: {
+          struct ggml_tensor* a = srcs[0];
+          struct ggml_tensor* b = srcs[1];
+          if (a->type != b->type) {
+            // Prefer casting to f32 if either side is f32.
+            ggml_type tgt = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32)
+                                ? GGML_TYPE_F32
+                                : a->type;
+            if (a->type != tgt) a = ggml_cast(ctx, a, tgt);
+            if (b->type != tgt) b = ggml_cast(ctx, b, tgt);
+          }
+          gt = ggml_add(ctx, a, b);
           break;
+        }
 
         case ggml_ir::OpCode::MUL_MAT:
           gt = ggml_mul_mat(ctx, srcs[0], srcs[1]);
@@ -212,6 +240,8 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           struct ggml_tensor* weight = srcs[0];
           struct ggml_tensor* input = srcs[1];
           struct ggml_tensor* bias = srcs.size() > 2 ? srcs[2] : nullptr;
+
+          // (debug logging removed)
 
           // Parse op_params
           int32_t stride_h = 1, stride_w = 1;
@@ -244,9 +274,23 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             gt = ggml_conv_2d(ctx, weight, input, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w);
           }
 
-          // Add bias if present
+          // Cast conv output to f32 to keep the rest of the graph in f32 and
+          // avoid mixed-type binary ops (e.g. residual adds).
+          if (gt && gt->type == GGML_TYPE_F16) {
+            gt = ggml_cast(ctx, gt, GGML_TYPE_F32);
+          }
+
+          // Add bias if present.
+          // Conv bias in PyTorch is 1D [Cout]. ggml_add requires broadcastable
+          // shapes, so reshape+repeat the bias to match conv output.
           if (bias && gt) {
-            gt = ggml_add(ctx, gt, bias);
+            // conv output layout is [W, H, Cout, N]
+            struct ggml_tensor* bias4 = ggml_reshape_4d(ctx, bias, 1, 1, bias->ne[0], 1);
+            struct ggml_tensor* bias_rep = ggml_repeat(ctx, bias4, gt);
+            if (bias_rep->type == GGML_TYPE_F16) {
+              bias_rep = ggml_cast(ctx, bias_rep, GGML_TYPE_F32);
+            }
+            gt = ggml_add(ctx, gt, bias_rep);
           }
           break;
         }
@@ -265,17 +309,47 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         }
 
         case ggml_ir::OpCode::MEAN: {
-          // mean(x, dim)
-          int32_t dim = -1;
+          // mean(x, dims)
+          // op_params: ndims (int32) + dims[] (int32)
+          int32_t ndims = 0;
+          int32_t dims[4] = {0, 0, 0, 0};
           if (t->op_params() && t->op_params()->size() >= 4) {
-            memcpy(&dim, t->op_params()->data(), sizeof(int32_t));
+            const uint8_t* data = t->op_params()->data();
+            memcpy(&ndims, data, sizeof(int32_t));
+            if (ndims < 0 || ndims > 4) {
+              ggml_free(ctx);
+              return Error::InvalidArgument;
+            }
+            if (t->op_params()->size() < static_cast<size_t>(4 + ndims * 4)) {
+              ggml_free(ctx);
+              return Error::InvalidArgument;
+            }
+            for (int i = 0; i < ndims; ++i) {
+              memcpy(&dims[i], data + 4 + i * 4, sizeof(int32_t));
+            }
           }
-          // ggml_mean computes mean over all dimensions
-          // For single-dim mean, we need ggml_mean over a specific axis
-          // Note: ggml may not have axis-specific mean yet
-          // Workaround: use ggml_sum / ggml_repeat to normalize
-          // This is a potential blocking issue
-          gt = ggml_mean(ctx, srcs[0]);
+
+          // Special-case global average pool for NCHW tensors: mean over (H, W)
+          // which is dims (2, 3) in PyTorch order.
+          if (ndims == 2 && dims[0] == 2 && dims[1] == 3) {
+            // ggml tensor layout for NCHW is [W, H, C, N]
+            const int k0 = static_cast<int>(srcs[0]->ne[0]);
+            const int k1 = static_cast<int>(srcs[0]->ne[1]);
+            gt = ggml_pool_2d(
+                ctx,
+                srcs[0],
+                GGML_OP_POOL_AVG,
+                k0,
+                k1,
+                k0,
+                k1,
+                0.0f,
+                0.0f);
+          } else {
+            // Fallback: ggml_mean is all-dims mean.
+            // TODO: implement axis-specific mean in IR/runtime.
+            gt = ggml_mean(ctx, srcs[0]);
+          }
           break;
         }
 
@@ -387,8 +461,19 @@ Error GgmlBackendInterface::execute(
   for (size_t i = 0; i < n_inputs; ++i) {
     const auto& et_tensor = args[i]->toTensor();
     struct ggml_tensor* gt = handle->inputs[i];
-    size_t nbytes = ggml_nbytes(gt);
-    memcpy(gt->data, et_tensor.const_data_ptr(), nbytes);
+
+    const size_t nelem = ggml_nelements(gt);
+
+    if (gt->type == GGML_TYPE_F16) {
+      // If a model ends up with fp16 runtime inputs, convert from fp32.
+      const float* src = static_cast<const float*>(et_tensor.const_data_ptr());
+      ggml_fp16_t* dst = static_cast<ggml_fp16_t*>(gt->data);
+      ggml_fp32_to_fp16_row(src, dst, (int64_t) nelem);
+    } else {
+      // Normal path for MV2: runtime inputs are fp32.
+      size_t nbytes = ggml_nbytes(gt);
+      memcpy(gt->data, et_tensor.const_data_ptr(), nbytes);
+    }
   }
 
   // Execute the graph
@@ -403,8 +488,18 @@ Error GgmlBackendInterface::execute(
     size_t out_idx = n_inputs + i;
     auto& et_tensor = args[out_idx]->toTensor();
     struct ggml_tensor* gt = handle->outputs[i];
-    size_t nbytes = ggml_nbytes(gt);
-    memcpy(et_tensor.mutable_data_ptr(), gt->data, nbytes);
+
+    const size_t nelem = ggml_nelements(gt);
+
+    if (gt->type == GGML_TYPE_F16) {
+      // Convert fp16 output to fp32.
+      const ggml_fp16_t* src = static_cast<const ggml_fp16_t*>(gt->data);
+      float* dst = static_cast<float*>(et_tensor.mutable_data_ptr());
+      ggml_fp16_to_fp32_row(src, dst, (int64_t) nelem);
+    } else {
+      size_t nbytes = ggml_nbytes(gt);
+      memcpy(et_tensor.mutable_data_ptr(), gt->data, nbytes);
+    }
   }
 
   return Error::Ok;

@@ -88,6 +88,12 @@ class GgmlBackend(BackendDetails):
         # to them by key from the delegate blob. Keys are state_dict FQNs.
         data_store = NamedDataStore()
 
+        # Some ggml kernels have dtype contracts. For ggml conv (im2col_f16), the
+        # CPU backend expects:
+        #   - kernel/weights: F16
+        #   - activations/image: F32
+        # We currently downcast float32 constants to F16.
+
         # ---- Pass 1: Walk graph in topological order ----
         for node in graph.nodes:
             if node.op == "placeholder":
@@ -100,10 +106,16 @@ class GgmlBackend(BackendDetails):
                     tensor = edge_program.state_dict[fqn]
                     shape = list(tensor.shape)
 
-                    # Store the tensor bytes externally (dedup handled by NamedDataStore).
+                    # Store the tensor bytes in NamedDataStore (dedup handled).
                     # Use contiguous CPU tensor for stable storage.
                     t_cpu = tensor.detach().contiguous().cpu()
-                    # Store inside the .pte (no external_tag).
+                    # DType policy:
+                    # - downcast float32 constants (including conv weights) to F16
+                    #   so ggml conv can use im2col_f16.
+                    if t_cpu.dtype == torch.float32:
+                        t_cpu = t_cpu.to(torch.float16)
+
+                    # Store inside the .pte.
                     data_store.add_named_data(fqn, t_cpu, alignment=64)
 
                     tid = alloc_id()
@@ -130,6 +142,8 @@ class GgmlBackend(BackendDetails):
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
+                            # Use F32 for runtime activations by default.
+                            # ggml conv im2col_f16 expects the *image* (src1) to be F32.
                             tensor_type=TYPE_F32,
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_NONE,
@@ -344,11 +358,22 @@ class GgmlBackend(BackendDetails):
                     # mean(x, dim, keepdim)
                     src_node = node.args[0]
                     dim = node.args[1] if len(node.args) > 1 else -1
+                    keepdim = bool(node.args[2]) if len(node.args) > 2 else False
+                    # MV2 global avg pool is exported as mean over (H, W) with keepdim=True.
+                    # We keep the semantics by returning a pooled tensor with singleton
+                    # spatial dims (H=W=1). If other keepdim=True patterns show up later,
+                    # we can extend the lowering.
+
+                    # ExecuTorch/Edge exports `mean.dim` dims as a tuple/list.
+                    # For MV2 we need global avg pool which is mean over (H, W) = dims (2, 3).
                     if isinstance(dim, (list, tuple)):
-                        # For now, only support single dim
-                        if len(dim) != 1:
-                            raise RuntimeError(f"Only single-dim mean supported, got dim={dim}")
-                        dim = dim[0]
+                        dims = [int(d) for d in list(dim)]
+                    else:
+                        dims = [int(dim)]
+
+                    # Canonicalize dims to positive indices when possible.
+                    # For NCHW 4D tensors, -1/-2 correspond to W/H.
+                    dims = [d + 4 if d < 0 else d for d in dims]
                     src_id = node_to_id[src_node]
 
                     fake_val = node.meta.get("val")
@@ -362,7 +387,7 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_MEAN,
                             src_ids=[src_id],
-                            op_params=pack_mean_params(int(dim)),
+                            op_params=pack_mean_params(dims),
                         )
                     )
                     node_to_id[node] = tid
@@ -388,6 +413,39 @@ class GgmlBackend(BackendDetails):
                         )
                     )
                     node_to_id[node] = tid
+
+                elif "aten.add.Tensor" in target_str:
+                    # add(x, y, alpha=1)
+                    x_node, y_node = node.args[0], node.args[1]
+                    # Edge graphs usually pass alpha as a kwarg.
+                    alpha = float(getattr(node, "kwargs", {}).get("alpha", 1))
+                    if alpha != 1.0:
+                        raise RuntimeError("aten.add.Tensor with alpha != 1 not supported yet")
+
+                    x_id = node_to_id[x_node]
+                    y_id = node_to_id[y_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=TYPE_F32,
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_ADD,
+                            src_ids=[x_id, y_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "dim_order_ops._clone_dim_order.default" in target_str:
+                    # `_clone_dim_order` is a layout materialization op used by
+                    # ExecuTorch/Edge for dim-order management. For ggml lowering we
+                    # treat it as a pure no-op.
+                    src_node = node.args[0]
+                    node_to_id[node] = node_to_id[src_node]
 
                 elif "aten.permute.default" in target_str or "aten.permute_copy.default" in target_str:
                     # permute(x, dims)
