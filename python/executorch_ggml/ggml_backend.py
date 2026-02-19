@@ -151,10 +151,13 @@ class GgmlBackend(BackendDetails):
                 # Existing supported ops
                 # -----------------------------------------------------------------
                 if "aten.t.default" in target_str or "aten.permute_copy.default" in target_str:
-                    # Transpose is a no-op: ggml_mul_mat expects weight in
-                    # ne=[in_features, out_features] which matches PyTorch's
-                    # [out_features, in_features] after shape reversal.
-                    # "Look through" the transpose.
+                    # NOTE: `aten.permute_copy` can show up in exported graphs as a
+                    # materializing copy after a permute. For our matmul lowering we
+                    # only care about the logical transpose of weight tensors.
+                    #
+                    # We treat both `aten.t` and `aten.permute_copy` as a no-op here
+                    # (look-through), because ggml_mul_mat expects weight layout in
+                    # a way that already matches after our shape reversal.
                     src_node = node.args[0]
                     node_to_id[node] = node_to_id[src_node]
 
@@ -388,6 +391,11 @@ class GgmlBackend(BackendDetails):
 
                 elif "aten.permute.default" in target_str or "aten.permute_copy.default" in target_str:
                     # permute(x, dims)
+                    #
+                    # NOTE: `aten.permute_copy` is a permute with explicit copy
+                    # semantics in PyTorch export. ggml doesn't need that distinction
+                    # for our purposes, so we lower both `permute` and `permute_copy`
+                    # to the same IR op (`OP_PERMUTE`).
                     src_node = node.args[0]
                     perm = list(node.args[1])
                     src_id = node_to_id[src_node]
