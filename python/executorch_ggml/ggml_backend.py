@@ -76,7 +76,7 @@ class GgmlBackend(BackendDetails):
                     fqn = param_map.get(node_name) or buffer_map.get(node_name)
                     tensor = edge_program.state_dict[fqn]
                     tensor_contig = tensor.contiguous().to(torch.float32)
-                    data_bytes = tensor_contig.numpy().tobytes()
+                    data_bytes = tensor_contig.detach().cpu().numpy().tobytes()
                     shape = list(tensor.shape)
 
                     tid = alloc_id()
@@ -115,16 +115,17 @@ class GgmlBackend(BackendDetails):
 
             elif node.op == "call_function":
                 target = node.target
+                target_str = str(target)
 
-                if target == torch.ops.aten.t.default:
+                if "aten.t.default" in target_str or "aten.permute_copy.default" in target_str:
                     # Transpose is a no-op: ggml_mul_mat expects weight in
                     # ne=[in_features, out_features] which matches PyTorch's
                     # [out_features, in_features] after shape reversal.
                     # "Look through" the transpose.
-                    (src_node,) = node.args
+                    src_node = node.args[0]
                     node_to_id[node] = node_to_id[src_node]
 
-                elif target == torch.ops.aten.mm.default:
+                elif "aten.mm.default" in target_str:
                     # mm(input, weight_t) → MUL_MAT(original_weight, input)
                     input_node, weight_t_node = node.args
                     weight_id = node_to_id[weight_t_node]
@@ -145,7 +146,7 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
-                elif target == torch.ops.aten.addmm.default:
+                elif "aten.addmm.default" in target_str:
                     # addmm(bias, input, weight_t)
                     # → MUL_MAT(original_weight, input) then ADD(result, bias)
                     bias_node, input_node, weight_t_node = node.args
@@ -182,7 +183,7 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = add_id
 
-                elif target == torch.ops.aten.leaky_relu.default:
+                elif "aten.leaky_relu.default" in target_str:
                     src_node = node.args[0]
                     negative_slope = node.args[1] if len(node.args) > 1 else 0.01
                     src_id = node_to_id[src_node]

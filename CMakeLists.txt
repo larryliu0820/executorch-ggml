@@ -45,3 +45,91 @@ add_subdirectory("${LLAMA_CPP_DIR}/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
 # Runtime library
 # ---------------------------------------------------------------------------
 add_subdirectory(runtime)
+
+# ---------------------------------------------------------------------------
+# Python extension (pybind11) - optional but recommended for runtime use
+# ---------------------------------------------------------------------------
+option(EXECUTORCH_GGML_BUILD_PYTHON_EXTENSION "Build Python extension that registers GgmlBackend" ON)
+
+if(EXECUTORCH_GGML_BUILD_PYTHON_EXTENSION)
+  find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
+
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import pybind11; print(pybind11.get_include())"
+    OUTPUT_VARIABLE PYBIND11_INCLUDE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX') or '.so')"
+    OUTPUT_VARIABLE PY_EXT_SUFFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+
+  add_library(executorch_ggml_backend_py MODULE
+    runtime/ggml_backend.cpp
+    python/executorch_ggml/_ggml_backend_pybind.cpp
+  )
+  add_dependencies(executorch_ggml_backend_py ggml_ir_gen)
+
+  set_target_properties(executorch_ggml_backend_py PROPERTIES
+    OUTPUT_NAME "_ggml_backend"
+    PREFIX ""
+    SUFFIX "${PY_EXT_SUFFIX}"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python/executorch_ggml"
+  )
+
+  # Include dirs (match runtime/CMakeLists.txt but local to this target)
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'include'))"
+    OUTPUT_VARIABLE TORCH_INCLUDE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+  if(NOT EXISTS "${TORCH_INCLUDE_DIR}/c10")
+    set(TORCH_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.venv/lib/python3.13/site-packages/torch/include")
+  endif()
+
+  target_include_directories(executorch_ggml_backend_py PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+    "${CMAKE_CURRENT_BINARY_DIR}"            # ggml_ir_generated.h
+    "${LLAMA_CPP_DIR}/ggml/include"
+    "${EXECUTORCH_DIR}/.."
+    "${EXECUTORCH_DIR}"
+    "${EXECUTORCH_DIR}/include"
+    "${EXECUTORCH_DIR}/third-party/flatbuffers/include"
+    "${TORCH_INCLUDE_DIR}"
+    "${PYBIND11_INCLUDE_DIR}"
+    ${Python3_INCLUDE_DIRS}
+  )
+
+  # Link against ggml shared libs built under our build tree.
+  target_link_directories(executorch_ggml_backend_py PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/ggml/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/ggml/src/ggml-blas"
+    "${CMAKE_CURRENT_BINARY_DIR}/ggml/src/ggml-metal"
+  )
+
+  target_link_libraries(executorch_ggml_backend_py PRIVATE
+    ggml
+    ggml-base
+    ggml-cpu
+    ggml-blas
+  )
+
+  # Ensure the loader can find ggml dylibs at runtime.
+  if(APPLE)
+    target_link_options(executorch_ggml_backend_py PRIVATE
+      "-Wl,-headerpad_max_install_names"
+      "-Wl,-rpath,${CMAKE_CURRENT_BINARY_DIR}/ggml/src"
+      "-Wl,-rpath,${CMAKE_CURRENT_BINARY_DIR}/ggml/src/ggml-blas"
+      "-Wl,-rpath,${CMAKE_CURRENT_BINARY_DIR}/ggml/src/ggml-metal"
+    )
+  endif()
+
+  # ExecuTorch symbols are expected to resolve from the already-loaded
+  # portable runtime extension (dynamic lookup).
+  if(APPLE)
+    target_link_options(executorch_ggml_backend_py PRIVATE "-undefined" "dynamic_lookup")
+  endif()
+endif()

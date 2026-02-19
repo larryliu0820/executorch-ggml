@@ -36,7 +36,7 @@ using executorch::runtime::Span;
 // Delegate handle — owns the ggml context, graph, and tensor bookkeeping
 // ---------------------------------------------------------------------------
 
-struct GgmlDelegateHandle : public DelegateHandle {
+struct GgmlDelegateHandle {
   struct ggml_context* ctx = nullptr;
   struct ggml_cgraph* graph = nullptr;
 
@@ -243,7 +243,7 @@ Error GgmlBackendInterface::execute(
     DelegateHandle* handle_raw,
     Span<EValue*> args) const {
 
-  auto* handle = static_cast<GgmlDelegateHandle*>(handle_raw);
+  auto* handle = reinterpret_cast<GgmlDelegateHandle*>(handle_raw);
 
   // Copy input data from ExecuTorch tensors → ggml tensors
   size_t n_inputs = handle->inputs.size();
@@ -274,7 +274,7 @@ Error GgmlBackendInterface::execute(
 }
 
 void GgmlBackendInterface::destroy(DelegateHandle* handle_raw) const {
-  auto* handle = static_cast<GgmlDelegateHandle*>(handle_raw);
+  auto* handle = reinterpret_cast<GgmlDelegateHandle*>(handle_raw);
   if (handle) {
     if (handle->compute_ctx) {
       ggml_free(handle->compute_ctx);

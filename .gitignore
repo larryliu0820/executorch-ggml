@@ -11,3 +11,9 @@ dist/
 
 # Generated
 *_generated.h
+
+# Artifacts
+.venv/
+model*.pte
+python/executorch_ggml/*.so
+python/executorch_ggml/*.dylib

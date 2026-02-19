@@ -13,13 +13,22 @@ from executorch.exir.backend.partitioner import (
 from executorch.exir.backend.utils import tag_constant_data
 
 
-# ATen ops that nn.Linear + nn.LeakyReLU decompose into after torch.export
-_SUPPORTED_OPS = {
-    torch.ops.aten.t.default,
-    torch.ops.aten.addmm.default,
-    torch.ops.aten.mm.default,
-    torch.ops.aten.leaky_relu.default,
+# ATen ops that nn.Linear + nn.LeakyReLU decompose into after torch.export.
+#
+# After conversion to Edge dialect, node.target becomes an EdgeOpOverload,
+# not equal to torch.ops. So we match by name.
+_SUPPORTED_OP_NAMES = {
+    "aten.t.default",
+    "aten.permute_copy.default",
+    "aten.addmm.default",
+    "aten.mm.default",
+    "aten.leaky_relu.default",
 }
+
+
+def _is_supported_target(target) -> bool:
+    s = str(target)
+    return any(name in s for name in _SUPPORTED_OP_NAMES)
 
 BACKEND_ID = "GgmlBackend"
 
@@ -38,7 +47,7 @@ class GgmlPartitioner(Partitioner):
         # Build adjacency: for each supported node, find connected supported neighbours
         supported_nodes = []
         for node in graph_module.graph.nodes:
-            if node.op == "call_function" and node.target in _SUPPORTED_OPS:
+            if node.op == "call_function" and _is_supported_target(node.target):
                 supported_nodes.append(node)
 
         if not supported_nodes:
