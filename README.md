@@ -51,12 +51,23 @@ GgmlBackendInterface       # C++ runtime: deserializes IR, builds ggml_cgraph,
 | `aten.mm` | `MUL_MAT` | Linear layer without bias |
 | `aten.t` / `aten.permute_copy` | *(no-op)* | Looked through; ggml layout already matches |
 | `aten.leaky_relu` | `LEAKY_RELU` | With configurable negative slope |
-| `aten.convolution` / `aten.conv2d` | `CONV_2D` | groups==1 only (for now) |
+| `aten.convolution` / `aten.conv2d` | `CONV_2D` | regular conv |
 | `aten.convolution` / `aten.conv2d` | `CONV_2D_DW` | depthwise conv (groups>1) |
 | `aten.hardtanh` / `aten.clamp` | `HARDTANH` | used for ReLU6/clamp |
-| `aten.mean.dim` | `MEAN` | currently implemented as `ggml_mean` (all-dims); axis-specific mean TBD |
+| `aten.add.Tensor` | `ADD` | residual connections (alpha==1) |
+| `aten.mean.dim` | `MEAN` | supports MV2 global avg pool (mean over H,W) via `ggml_pool_2d(AVG, ...)` |
 | `aten.view` / `aten.reshape` | `VIEW` | reshape/view |
 | `aten.permute` / `aten.permute_copy` | `PERMUTE` | transpose dims |
+| `dim_order_ops._clone_dim_order` | *(no-op)* | look-through layout materialization |
+
+### MobileNetV2 status
+
+`torchvision.models.mobilenet_v2(weights=None)` can now be exported, lowered, and executed end-to-end
+on the ggml backend when you run BN folding rewrite before partitioning.
+
+Notes:
+- ggml conv (CPU im2col) has dtype contracts; we store conv weights as fp16 and keep runtime activations fp32.
+- conv outputs are cast back to fp32 to avoid mixed-type residual adds.
 
 ### BatchNorm folding (Conv+BN)
 
@@ -73,6 +84,8 @@ conv weights/bias and removes the BN/getitem nodes:
 This pass is intended to run **after** `to_edge(...)` and **before** partitioning.
 Use `executorch_ggml.to_edge_rewrite_and_lower(..., ep_passes=[...])` to compose
 these ExportedProgram rewrites into the standard ExecuTorch lowering pipeline.
+
+For MobileNetV2, you should include this pass in `ep_passes`.
 
 More ops can be added by extending the `OpCode` enum in `schema/ggml_ir.fbs`, the ATen→IR mapping in `ggml_backend.py`, and the ggml builder call in `ggml_backend.cpp`.
 
