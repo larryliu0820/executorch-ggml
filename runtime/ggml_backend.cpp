@@ -232,19 +232,61 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             if (b->type != tgt) b = ggml_cast(ctx, b, tgt);
           }
 
-          // Handle simple broadcast by repeating the smaller tensor to match the larger.
+          // Handle broadcast by repeating the smaller tensor to match the larger.
           if (!ggml_are_same_shape(a, b)) {
+            auto try_repeat_1d_to_match = [&](struct ggml_tensor * small,
+                                             struct ggml_tensor * big) -> struct ggml_tensor * {
+              // If `small` is a 1D tensor and its length matches one of big's dims,
+              // reshape+permute it so the matching dim aligns, then repeat.
+              if (ggml_n_dims(small) != 1) {
+                return nullptr;
+              }
+              const int64_t n = small->ne[0];
+              for (int ax = 0; ax < 4; ++ax) {
+                if (big->ne[ax] != n) {
+                  continue;
+                }
+                // Start as 4D [n,1,1,1]
+                struct ggml_tensor * s4 = ggml_reshape_4d(ctx, small, n, 1, 1, 1);
+                // Permute so `n` ends up in axis `ax`
+                int p0 = 0, p1 = 1, p2 = 2, p3 = 3;
+                if (ax == 0) {
+                  // already in axis0
+                } else if (ax == 1) {
+                  // move axis0 -> axis1
+                  p0 = 1; p1 = 0; p2 = 2; p3 = 3;
+                } else if (ax == 2) {
+                  p0 = 1; p1 = 2; p2 = 0; p3 = 3;
+                } else {
+                  // ax == 3: move axis0 -> axis3
+                  p0 = 1; p1 = 2; p2 = 3; p3 = 0;
+                }
+                s4 = ggml_permute(ctx, s4, p0, p1, p2, p3);
+                if (ggml_can_repeat(s4, big)) {
+                  return ggml_repeat(ctx, s4, big);
+                }
+              }
+              return nullptr;
+            };
+
             if (ggml_can_repeat(b, a)) {
               b = ggml_repeat(ctx, b, a);
             } else if (ggml_can_repeat(a, b)) {
               a = ggml_repeat(ctx, a, b);
             } else {
-              fprintf(stderr,
-                      "[executorch-ggml] ADD shape mismatch not broadcastable: a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
-                      (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
-                      (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
-              ggml_free(ctx);
-              return Error::InvalidArgument;
+              // Try 1D→ND broadcast alignment
+              if (auto * bb = try_repeat_1d_to_match(b, a)) {
+                b = bb;
+              } else if (auto * aa = try_repeat_1d_to_match(a, b)) {
+                a = aa;
+              } else {
+                fprintf(stderr,
+                        "[executorch-ggml] ADD shape mismatch not broadcastable: a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
+                        (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
+                        (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
+                ggml_free(ctx);
+                return Error::InvalidArgument;
+              }
             }
           }
 
