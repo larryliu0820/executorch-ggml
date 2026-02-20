@@ -805,8 +805,26 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           if (k->type == GGML_TYPE_F32) k = ggml_cast(ctx, k, GGML_TYPE_F16);
           if (v->type == GGML_TYPE_F32) v = ggml_cast(ctx, v, GGML_TYPE_F16);
 
-          // For now pass mask=nullptr (assume causal handled internally / or mask not required).
+          // Optional attention mask.  ggml_flash_attn_ext requires it to be:
+          //   - F16 (the CPU kernel reads it as additive logit bias in FP16)
+          //   - contiguous
+          //   - ne[0] == kv_seq_len  (matches the K/V sequence dimension)
+          //   - ne[1] >= q_seq_len
+          // The Python lowering stores the causal mask as F16 (True→0.0, False→-inf)
+          // and aten.index.Tensor selects the right row via ggml_get_rows, giving
+          // shape [kv_seq_len, 1, 1, 1] in ggml order.
           struct ggml_tensor* mask = nullptr;
+          if (srcs.size() > 3 && srcs[3] != nullptr) {
+            mask = srcs[3];
+            // Ensure F16 (bool mask should already be converted at store time, but guard).
+            if (mask->type != GGML_TYPE_F16) {
+              mask = ggml_cast(ctx, mask, GGML_TYPE_F16);
+            }
+            // Ensure contiguous (get_rows result may not be contiguous).
+            if (!ggml_is_contiguous(mask)) {
+              mask = ggml_cont(ctx, mask);
+            }
+          }
 
           // scale = 1/sqrt(head_dim). head_dim is ne0 in ggml layout when tensors are [D, T, H, B]
           float scale = 1.0f;

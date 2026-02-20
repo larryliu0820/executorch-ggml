@@ -119,6 +119,11 @@ class GgmlBackend(BackendDetails):
         param_map = dict(sig.inputs_to_parameters)   # node_name → param FQN
         buffer_map = dict(sig.inputs_to_buffers)      # node_name → buffer FQN
 
+        # ep.constants holds tensor constants (like attention masks and RoPE freqs)
+        # that are not in ep.state_dict but are still compile-time constants.
+        # We need both sources when resolving constant data.
+        ep_constants = getattr(edge_program, "constants", {}) or {}
+
         # Track runtime input index (for inputs that are NOT params/buffers)
         runtime_input_idx = 0
 
@@ -137,23 +142,44 @@ class GgmlBackend(BackendDetails):
         for node in graph.nodes:
             if node.op == "placeholder":
                 node_name = node.name
-                # Some placeholders map to parameters/buffers, but not all mapped
-                # FQNs are guaranteed to live in state_dict (e.g. derived buffers
-                # like attention masks). Treat those as runtime inputs for now.
+                # Some placeholders map to parameters/buffers.  There are two
+                # sources for constant tensor data:
+                #   1) ep.state_dict  – parameters and mutable buffers (KV caches)
+                #   2) ep.constants   – non-mutable tensor constants (attention
+                #                       masks, RoPE freqs_cos/sin, etc.)
+                # We check both so that attention masks and RoPE frequency tables
+                # are treated as compile-time constants rather than runtime inputs.
                 fqn = param_map.get(node_name) or buffer_map.get(node_name)
-                is_constant = fqn is not None and fqn in edge_program.state_dict
+                tensor_from_state = fqn is not None and fqn in edge_program.state_dict
+                tensor_from_constants = fqn is not None and fqn in ep_constants
+                is_constant = tensor_from_state or tensor_from_constants
 
                 if is_constant:
-                    tensor = edge_program.state_dict[fqn]
+                    tensor = (
+                        edge_program.state_dict[fqn]
+                        if tensor_from_state
+                        else ep_constants[fqn]
+                    )
                     shape = list(tensor.shape)
 
                     # Store the tensor bytes in NamedDataStore (dedup handled).
                     # Use contiguous CPU tensor for stable storage.
                     t_cpu = tensor.detach().contiguous().cpu()
                     # DType policy:
-                    # - downcast float32 constants (including conv weights) to F16
-                    #   so ggml conv can use im2col_f16.
-                    if t_cpu.dtype == torch.float32:
+                    # - downcast float32 *conv* weights to F16 (im2col_f16 path).
+                    #   Heuristic: only 4-D (conv kernel) tensors get downcast.
+                    # - Keep 2-D float32 LLM weights (linear, RoPE freqs) as F32.
+                    # - Bool (attention mask) tensors: convert to F16 with
+                    #   0.0 for True (attend) and -inf for False (masked out).
+                    #   ggml_flash_attn_ext reads the mask as F16 additive bias;
+                    #   ggml_get_rows (used by aten.index) also handles F16.
+                    if t_cpu.dtype == torch.bool:
+                        # Convert bool causal mask to F16 additive bias:
+                        # True -> 0.0 (attend), False -> -inf (mask out)
+                        neg_inf = float("-inf")
+                        t_float = torch.where(t_cpu, torch.tensor(0.0), torch.tensor(neg_inf))
+                        t_cpu = t_float.to(torch.float16)
+                    elif t_cpu.dtype == torch.float32 and t_cpu.ndim >= 4:
                         t_cpu = t_cpu.to(torch.float16)
 
                     # Store inside the .pte.
@@ -506,6 +532,56 @@ class GgmlBackend(BackendDetails):
                             op=OP_INDEX,
                             src_ids=[src_id, idx_id],
                             op_params=pack_index_params(0),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.select.int" in target_str:
+                    # select(x, dim, index) — picks one slice along dim and squeezes it.
+                    # e.g. [1,1,1024].select(dim=1, index=-1) -> [1,1024]
+                    # Lower as: SLICE(dim, index, index+1, step=1) then VIEW to output shape.
+                    src_node = node.args[0]
+                    dim = int(node.args[1])
+                    idx = int(node.args[2])
+
+                    src_id = node_to_id[src_node]
+                    src_val = src_node.meta.get("val")
+                    src_shape = list(src_val.shape) if src_val is not None else []
+
+                    # Normalize negative index
+                    if idx < 0 and src_shape:
+                        idx = src_shape[dim] + idx
+
+                    fake_val = node.meta.get("val")
+                    out_shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    # Intermediate sliced shape: same as src but dim shrunk to 1
+                    sliced_shape = list(src_shape)
+                    sliced_shape[dim] = 1
+
+                    slice_id = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=slice_id,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(sliced_shape),
+                            op=OP_SLICE,
+                            src_ids=[src_id],
+                            op_params=pack_slice_params(dim, idx, idx + 1, 1),
+                        )
+                    )
+
+                    # Squeeze the dim via VIEW to out_shape
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(out_shape),
+                            op=OP_VIEW,
+                            src_ids=[slice_id],
+                            op_params=pack_view_params(out_shape),
                         )
                     )
                     node_to_id[node] = tid
@@ -931,6 +1007,13 @@ class GgmlBackend(BackendDetails):
                         )
                     )
                     node_to_id[node] = tid
+
+                elif "aten.type_as.default" in target_str:
+                    # type_as(input, other) casts input to other's dtype.
+                    # In the Qwen3 graph both tensors are already f32→f32, so this
+                    # is a no-op.  Treat as an identity (look-through).
+                    src_node = node.args[0]
+                    node_to_id[node] = node_to_id[src_node]
 
                 elif "aten.alias.default" in target_str or "aten.alias_copy.default" in target_str:
                     src_node = node.args[0]

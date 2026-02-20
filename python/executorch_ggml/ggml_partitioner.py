@@ -43,6 +43,7 @@ _SUPPORTED_OP_NAMES = {
     "aten.repeat_interleave.self_int",
     "aten.index.Tensor",
     "aten.index_put.default",
+    "aten.select.int",
     "aten.scaled_dot_product_attention.default",
     "aten.alias.default",
     "aten.alias_copy.default",
