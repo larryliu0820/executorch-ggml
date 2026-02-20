@@ -222,6 +222,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         case ggml_ir::OpCode::ADD: {
           struct ggml_tensor* a = srcs[0];
           struct ggml_tensor* b = srcs[1];
+
           if (a->type != b->type) {
             // Prefer casting to f32 if either side is f32.
             ggml_type tgt = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32)
@@ -230,6 +231,23 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             if (a->type != tgt) a = ggml_cast(ctx, a, tgt);
             if (b->type != tgt) b = ggml_cast(ctx, b, tgt);
           }
+
+          // Handle simple broadcast by repeating the smaller tensor to match the larger.
+          if (!ggml_are_same_shape(a, b)) {
+            if (ggml_can_repeat(b, a)) {
+              b = ggml_repeat(ctx, b, a);
+            } else if (ggml_can_repeat(a, b)) {
+              a = ggml_repeat(ctx, a, b);
+            } else {
+              fprintf(stderr,
+                      "[executorch-ggml] ADD shape mismatch not broadcastable: a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
+                      (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
+                      (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
+              ggml_free(ctx);
+              return Error::InvalidArgument;
+            }
+          }
+
           gt = ggml_add(ctx, a, b);
           break;
         }
