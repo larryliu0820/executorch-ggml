@@ -217,7 +217,11 @@ class GgmlBackend(BackendDetails):
                     const = torch.tensor(value, dtype=out_dtype).cpu()
 
                     tid = alloc_id()
-                    key = f"__const_scalar_{tid}"
+                    # Ensure NamedDataStore keys are stable and unique across
+                    # multiple delegated submodules. Using just `tid` can
+                    # collide when merging named data stores from different
+                    # lowered partitions.
+                    key = f"__const_scalar_{node.name}"
                     data_store.add_named_data(key, const, alignment=64)
                     ir_tensors.append(
                         IrTensor(
