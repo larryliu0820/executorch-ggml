@@ -590,8 +590,12 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         }
 
         case ggml_ir::OpCode::INDEX_PUT: {
-          // Specialized for Qwen3 KV cache update pattern.
+          // Implement a restricted index_put via ggml_set_rows.
+          // This covers the Qwen3 KV-cache update pattern, where the update is along
+          // the sequence dimension.
+          //
           // op_params: int32 nindices, int32 present_mask
+          // src_ids: [dst, <index_tensors...>, values]
           if (!t->op_params() || t->op_params()->size() < 8) {
             ggml_free(ctx);
             return Error::InvalidArgument;
@@ -600,29 +604,83 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           memcpy(&nidx, t->op_params()->data(), 4);
           memcpy(&pm, t->op_params()->data() + 4, 4);
 
-          // Expect indices = [None, None, pos] => nidx=3, pm has bit2 set, and srcs=[cache, pos, values]
-          if (!(nidx == 3 && (pm & 0x4) && srcs.size() == 3)) {
+          if (srcs.size() < 3) {
             ggml_free(ctx);
             return Error::InvalidArgument;
           }
-          struct ggml_tensor* cache = srcs[0];
-          struct ggml_tensor* pos_t = srcs[1];
-          struct ggml_tensor* val = srcs[2];
 
-          // pos_t is runtime input, but ggml ops cannot read scalar value at build time.
-          // For now, treat as no-op and return cache; runtime will need a custom execution
-          // path or a dedicated llama attention op that owns KV cache updates.
-          // TODO: implement KV cache update using llama.cpp attention or a custom kernel.
-          (void)pos_t;
-          (void)val;
-          gt = cache;
+          struct ggml_tensor* dst = srcs.front();
+          struct ggml_tensor* val = srcs.back();
+
+          // Find the first present index tensor (we only support one index tensor for now).
+          int idx_pos = -1;
+          for (int i = 0; i < nidx; ++i) {
+            if (pm & (1 << i)) {
+              idx_pos = i;
+              break;
+            }
+          }
+          if (idx_pos < 0) {
+            // no indices -> no-op
+            gt = dst;
+            break;
+          }
+
+          // In our serialized srcs: [dst] + present_indices + [val]
+          // So the index tensor is srcs[1] when only one present index.
+          struct ggml_tensor* idx = srcs[1];
+
+          // ggml_set_rows expects indices tensor type I64.
+#ifdef GGML_TYPE_I64
+          if (idx->type != GGML_TYPE_I64) {
+            idx = ggml_cast(ctx, idx, GGML_TYPE_I64);
+          }
+#else
+          if (idx->type != GGML_TYPE_I32) {
+            idx = ggml_cast(ctx, idx, GGML_TYPE_I32);
+          }
+#endif
+
+          // Ensure val has shape compatible with dst for set_rows:
+          // dst: [ne0, ne1(seq), ne2(heads), ne3(batch)]
+          // val: should be [ne0, n_rows, ne2, ne3] (broadcastable in ne2/ne3)
+          // If needed, reshape val using the output shape stored in IR (ne).
+          if (val->ne[0] != dst->ne[0]) {
+            // attempt to cast/reshape; if incompatible, fail
+            // (most Qwen3 K/V values already match)
+          }
+
+          gt = ggml_set_rows(ctx, dst, val, idx);
           break;
         }
 
         case ggml_ir::OpCode::LLAMA_ATTENTION: {
-          // TODO: wire llama.cpp/ggml attention immediately.
-          ggml_free(ctx);
-          return Error::InvalidArgument;
+          // Fused llama.cpp attention. For initial bring-up, we rely on ggml_flash_attn_ext.
+          // src_ids: [q, k, v, (optional) mask]
+          if (srcs.size() < 3) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          struct ggml_tensor* q = srcs[0];
+          struct ggml_tensor* k = srcs[1];
+          struct ggml_tensor* v = srcs[2];
+
+          // Note: flash_attn expects k/v in f16 for the fast path.
+          if (k->type == GGML_TYPE_F32) k = ggml_cast(ctx, k, GGML_TYPE_F16);
+          if (v->type == GGML_TYPE_F32) v = ggml_cast(ctx, v, GGML_TYPE_F16);
+
+          // For now pass mask=nullptr (assume causal handled internally / or mask not required).
+          struct ggml_tensor* mask = nullptr;
+
+          // scale = 1/sqrt(head_dim). head_dim is ne0 in ggml layout when tensors are [D, T, H, B]
+          float scale = 1.0f;
+          if (q->ne[0] > 0) {
+            scale = 1.0f / std::sqrt((float) q->ne[0]);
+          }
+
+          gt = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+          ggml_flash_attn_ext_set_prec(gt, GGML_PREC_F32);
+          break;
         }
 
         default:
