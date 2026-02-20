@@ -684,6 +684,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         }
 
         default:
+          fprintf(stderr, "[executorch-ggml] Unsupported OpCode %d\n", (int) op);
           ggml_free(ctx);
           return Error::InvalidArgument;
       }
