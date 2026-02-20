@@ -367,6 +367,14 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           if (bias && gt) {
             // conv output layout is [W, H, Cout, N]
             struct ggml_tensor* bias4 = ggml_reshape_4d(ctx, bias, 1, 1, bias->ne[0], 1);
+            if (!ggml_can_repeat(bias4, gt)) {
+              fprintf(stderr,
+                      "[executorch-ggml] CONV bias not repeatable: b=(%lld,%lld,%lld,%lld) y=(%lld,%lld,%lld,%lld)\n",
+                      (long long) bias4->ne[0], (long long) bias4->ne[1], (long long) bias4->ne[2], (long long) bias4->ne[3],
+                      (long long) gt->ne[0], (long long) gt->ne[1], (long long) gt->ne[2], (long long) gt->ne[3]);
+              ggml_free(ctx);
+              return Error::InvalidArgument;
+            }
             struct ggml_tensor* bias_rep = ggml_repeat(ctx, bias4, gt);
             if (bias_rep->type == GGML_TYPE_F16) {
               bias_rep = ggml_cast(ctx, bias_rep, GGML_TYPE_F32);
