@@ -14,21 +14,50 @@ import flatbuffers
 # (avoids requiring generated code at import time)
 # ---------------------------------------------------------------------------
 
-# OpCode
+# OpCode (keep in sync with schema/ggml_ir.fbs)
 OP_NONE = 0
+
+# Basic math
 OP_ADD = 1
 OP_MUL_MAT = 2
+OP_MUL = 10
+OP_NEG = 11
+
+# NN
 OP_LEAKY_RELU = 3
+OP_LINEAR = 20
+OP_EMBEDDING = 21
+OP_SILU = 22
+
+# Vision
 OP_CONV_2D = 4
 OP_CONV_2D_DW = 5     # depthwise conv2d
+
+# Activations / reductions / views
 OP_HARDTANH = 6        # clamp
 OP_MEAN = 7            # mean(dim)
+OP_RSQRT = 30
 OP_VIEW = 8            # reshape
-OP_PERMUTE = 9         # transpose dims
+OP_UNSQUEEZE = 31
+
+# Layout / indexing
+OP_PERMUTE = 9         # permute dims
+OP_TRANSPOSE = 40
+OP_SLICE = 41
+OP_CAT = 42
+OP_REPEAT_INTERLEAVE = 43
+OP_INDEX = 44
+OP_INDEX_PUT = 45
+
+# Fused attention (llama.cpp/ggml)
+OP_LLAMA_ATTENTION = 60
 
 # TensorType
 TYPE_F32 = 0
 TYPE_F16 = 1
+TYPE_I64 = 2
+TYPE_I32 = 3
+TYPE_BOOL = 4
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +231,44 @@ def _create_uint8_vector(builder: flatbuffers.Builder, data: bytes):
 def pack_float(value: float) -> bytes:
     """Pack a single float into little-endian bytes (for op_params)."""
     return struct.pack("<f", value)
+
+
+def pack_i32(value: int) -> bytes:
+    return struct.pack("<i", int(value))
+
+
+def pack_transpose_params(dim0: int, dim1: int) -> bytes:
+    return struct.pack("<ii", int(dim0), int(dim1))
+
+
+def pack_unsqueeze_params(dim: int) -> bytes:
+    return pack_i32(dim)
+
+
+def pack_cat_params(dim: int) -> bytes:
+    return pack_i32(dim)
+
+
+def pack_repeat_interleave_params(dim: int, repeats: int) -> bytes:
+    return struct.pack("<ii", int(dim), int(repeats))
+
+
+def pack_index_params(dim: int) -> bytes:
+    return pack_i32(dim)
+
+
+def pack_index_put_params(dim: int) -> bytes:
+    return pack_i32(dim)
+
+
+def pack_index_put_multi_params(nindices: int, present_mask: int) -> bytes:
+    # Layout: int32 nindices, int32 present_mask
+    return struct.pack('<ii', int(nindices), int(present_mask))
+
+
+def pack_slice_params(dim: int, start: int, end: int, step: int) -> bytes:
+    # start/end/step are int64 in the schema comment, but store as int64 here.
+    return struct.pack("<iqqq", int(dim), int(start), int(end), int(step))
 
 
 def pack_conv2d_params(

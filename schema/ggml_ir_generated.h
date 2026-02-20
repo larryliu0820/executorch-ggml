@@ -32,11 +32,25 @@ enum class OpCode : int32_t {
   MEAN = 7,
   VIEW = 8,
   PERMUTE = 9,
+  MUL = 10,
+  NEG = 11,
+  LINEAR = 20,
+  EMBEDDING = 21,
+  SILU = 22,
+  RSQRT = 30,
+  UNSQUEEZE = 31,
+  TRANSPOSE = 40,
+  SLICE = 41,
+  CAT = 42,
+  REPEAT_INTERLEAVE = 43,
+  INDEX = 44,
+  INDEX_PUT = 45,
+  LLAMA_ATTENTION = 60,
   MIN = NONE,
-  MAX = PERMUTE
+  MAX = LLAMA_ATTENTION
 };
 
-inline const OpCode (&EnumValuesOpCode())[10] {
+inline const OpCode (&EnumValuesOpCode())[24] {
   static const OpCode values[] = {
     OpCode::NONE,
     OpCode::ADD,
@@ -47,13 +61,27 @@ inline const OpCode (&EnumValuesOpCode())[10] {
     OpCode::HARDTANH,
     OpCode::MEAN,
     OpCode::VIEW,
-    OpCode::PERMUTE
+    OpCode::PERMUTE,
+    OpCode::MUL,
+    OpCode::NEG,
+    OpCode::LINEAR,
+    OpCode::EMBEDDING,
+    OpCode::SILU,
+    OpCode::RSQRT,
+    OpCode::UNSQUEEZE,
+    OpCode::TRANSPOSE,
+    OpCode::SLICE,
+    OpCode::CAT,
+    OpCode::REPEAT_INTERLEAVE,
+    OpCode::INDEX,
+    OpCode::INDEX_PUT,
+    OpCode::LLAMA_ATTENTION
   };
   return values;
 }
 
 inline const char * const *EnumNamesOpCode() {
-  static const char * const names[11] = {
+  static const char * const names[62] = {
     "NONE",
     "ADD",
     "MUL_MAT",
@@ -64,13 +92,64 @@ inline const char * const *EnumNamesOpCode() {
     "MEAN",
     "VIEW",
     "PERMUTE",
+    "MUL",
+    "NEG",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "LINEAR",
+    "EMBEDDING",
+    "SILU",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "RSQRT",
+    "UNSQUEEZE",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "TRANSPOSE",
+    "SLICE",
+    "CAT",
+    "REPEAT_INTERLEAVE",
+    "INDEX",
+    "INDEX_PUT",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "LLAMA_ATTENTION",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameOpCode(OpCode e) {
-  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::PERMUTE)) return "";
+  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::LLAMA_ATTENTION)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesOpCode()[index];
 }
@@ -78,29 +157,38 @@ inline const char *EnumNameOpCode(OpCode e) {
 enum class TensorType : int32_t {
   F32 = 0,
   F16 = 1,
+  I64 = 2,
+  I32 = 3,
+  BOOL = 4,
   MIN = F32,
-  MAX = F16
+  MAX = BOOL
 };
 
-inline const TensorType (&EnumValuesTensorType())[2] {
+inline const TensorType (&EnumValuesTensorType())[5] {
   static const TensorType values[] = {
     TensorType::F32,
-    TensorType::F16
+    TensorType::F16,
+    TensorType::I64,
+    TensorType::I32,
+    TensorType::BOOL
   };
   return values;
 }
 
 inline const char * const *EnumNamesTensorType() {
-  static const char * const names[3] = {
+  static const char * const names[6] = {
     "F32",
     "F16",
+    "I64",
+    "I32",
+    "BOOL",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameTensorType(TensorType e) {
-  if (::flatbuffers::IsOutRange(e, TensorType::F32, TensorType::F16)) return "";
+  if (::flatbuffers::IsOutRange(e, TensorType::F32, TensorType::BOOL)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesTensorType()[index];
 }

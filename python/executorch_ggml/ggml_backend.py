@@ -10,24 +10,53 @@ from executorch.exir.backend.compile_spec_schema import CompileSpec
 
 from executorch_ggml.serialize import (
     IrTensor,
-    OP_ADD,
-    OP_LEAKY_RELU,
-    OP_MUL_MAT,
+    # OpCodes
     OP_NONE,
+    OP_ADD,
+    OP_MUL_MAT,
+    OP_MUL,
+    OP_NEG,
+    OP_LINEAR,
+    OP_EMBEDDING,
+    OP_SILU,
+    OP_LEAKY_RELU,
     OP_CONV_2D,
     OP_CONV_2D_DW,
     OP_HARDTANH,
     OP_MEAN,
+    OP_RSQRT,
     OP_VIEW,
+    OP_UNSQUEEZE,
     OP_PERMUTE,
+    OP_TRANSPOSE,
+    OP_SLICE,
+    OP_CAT,
+    OP_REPEAT_INTERLEAVE,
+    OP_INDEX,
+    OP_INDEX_PUT,
+    OP_LLAMA_ATTENTION,
+    # Types
     TYPE_F32,
     TYPE_F16,
+    TYPE_I64,
+    TYPE_I32,
+    TYPE_BOOL,
+    # Packers
     pack_float,
+    pack_i32,
     pack_conv2d_params,
     pack_hardtanh_params,
     pack_mean_params,
     pack_view_params,
     pack_permute_params,
+    pack_transpose_params,
+    pack_unsqueeze_params,
+    pack_slice_params,
+    pack_cat_params,
+    pack_repeat_interleave_params,
+    pack_index_params,
+    pack_index_put_params,
+    pack_index_put_multi_params,
     serialize_graph,
 )
 
@@ -45,6 +74,15 @@ def _pytorch_shape_to_ggml_ne(shape: List[int]) -> List[int]:
 def _torch_dtype_to_ir_type(dtype: torch.dtype) -> int:
     if dtype == torch.float16:
         return TYPE_F16
+    if dtype == torch.float32:
+        return TYPE_F32
+    if dtype == torch.int64:
+        return TYPE_I64
+    if dtype == torch.int32:
+        return TYPE_I32
+    if dtype == torch.bool:
+        return TYPE_BOOL
+    # Default fallback
     return TYPE_F32
 
 
@@ -98,11 +136,13 @@ class GgmlBackend(BackendDetails):
         for node in graph.nodes:
             if node.op == "placeholder":
                 node_name = node.name
-                is_constant = node_name in param_map or node_name in buffer_map
+                # Some placeholders map to parameters/buffers, but not all mapped
+                # FQNs are guaranteed to live in state_dict (e.g. derived buffers
+                # like attention masks). Treat those as runtime inputs for now.
+                fqn = param_map.get(node_name) or buffer_map.get(node_name)
+                is_constant = fqn is not None and fqn in edge_program.state_dict
 
                 if is_constant:
-                    # Resolve the parameter/buffer FQN
-                    fqn = param_map.get(node_name) or buffer_map.get(node_name)
                     tensor = edge_program.state_dict[fqn]
                     shape = list(tensor.shape)
 
@@ -139,12 +179,12 @@ class GgmlBackend(BackendDetails):
                         shape = []
 
                     tid = alloc_id()
+                    # Runtime input dtype based on FakeTensor meta when available.
+                    in_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
-                            # Use F32 for runtime activations by default.
-                            # ggml conv im2col_f16 expects the *image* (src1) to be F32.
-                            tensor_type=TYPE_F32,
+                            tensor_type=_torch_dtype_to_ir_type(in_dtype),
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_NONE,
                             is_input=True,
@@ -164,7 +204,29 @@ class GgmlBackend(BackendDetails):
                 # -----------------------------------------------------------------
                 # Existing supported ops
                 # -----------------------------------------------------------------
-                if "aten.t.default" in target_str or "aten.permute_copy.default" in target_str:
+                if "aten.scalar_tensor.default" in target_str:
+                    # scalar_tensor(s, dtype?, device?) -> 0-d tensor constant
+                    fake_val = node.meta.get("val")
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    value = node.args[0]
+                    const = torch.tensor(value, dtype=out_dtype).cpu()
+
+                    tid = alloc_id()
+                    key = f"__const_scalar_{tid}"
+                    data_store.add_named_data(key, const, alignment=64)
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(list(const.shape)),
+                            op=OP_NONE,
+                            data_key=key,
+                            is_input=False,
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.t.default" in target_str or "aten.permute_copy.default" in target_str:
                     # NOTE: `aten.permute_copy` can show up in exported graphs as a
                     # materializing copy after a permute. For our matmul lowering we
                     # only care about the logical transpose of weight tensors.
@@ -174,6 +236,335 @@ class GgmlBackend(BackendDetails):
                     # a way that already matches after our shape reversal.
                     src_node = node.args[0]
                     node_to_id[node] = node_to_id[src_node]
+
+                elif "aten.linear.default" in target_str:
+                    # linear(input, weight, bias?)
+                    x_node = node.args[0]
+                    w_node = node.args[1]
+                    b_node = node.args[2] if len(node.args) > 2 else None
+
+                    x_id = node_to_id[x_node]
+                    w_id = node_to_id[w_node]
+                    src_ids = [x_id, w_id]
+                    if b_node is not None:
+                        src_ids.append(node_to_id[b_node])
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_LINEAR,
+                            src_ids=src_ids,
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.embedding.default" in target_str:
+                    # embedding(weight, indices)
+                    weight_node = node.args[0]
+                    indices_node = node.args[1]
+                    w_id = node_to_id[weight_node]
+                    idx_id = node_to_id[indices_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_EMBEDDING,
+                            src_ids=[w_id, idx_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.silu.default" in target_str:
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_SILU,
+                            src_ids=[src_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.mul.Tensor" in target_str:
+                    a_node, b_node = node.args[0], node.args[1]
+                    a_id = node_to_id[a_node]
+                    b_id = node_to_id[b_node]
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_MUL,
+                            src_ids=[a_id, b_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.neg.default" in target_str:
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_NEG,
+                            src_ids=[src_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.rsqrt.default" in target_str:
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_RSQRT,
+                            src_ids=[src_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.unsqueeze.default" in target_str or "aten.unsqueeze_copy.default" in target_str:
+                    src_node = node.args[0]
+                    dim = int(node.args[1])
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_UNSQUEEZE,
+                            src_ids=[src_id],
+                            op_params=pack_unsqueeze_params(dim),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.transpose.int" in target_str:
+                    src_node = node.args[0]
+                    dim0 = int(node.args[1])
+                    dim1 = int(node.args[2])
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_TRANSPOSE,
+                            src_ids=[src_id],
+                            op_params=pack_transpose_params(dim0, dim1),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.slice.Tensor" in target_str or "aten.slice_copy.Tensor" in target_str:
+                    # slice.Tensor(x, dim=0, start=None, end=None, step=1)
+                    src_node = node.args[0]
+                    dim = int(node.args[1]) if len(node.args) > 1 else 0
+                    start = node.args[2] if len(node.args) > 2 else None
+                    end = node.args[3] if len(node.args) > 3 else None
+                    step = int(node.args[4]) if len(node.args) > 4 else 1
+
+                    # Normalize optional start/end
+                    start_i = int(start) if start is not None else 0
+                    # If end is None, represent as a large positive bound (runtime will clamp)
+                    end_i = int(end) if end is not None else (2**62)
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_SLICE,
+                            src_ids=[src_id],
+                            op_params=pack_slice_params(dim, start_i, end_i, step),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.cat.default" in target_str:
+                    tensors = list(node.args[0])
+                    dim = int(node.args[1])
+                    src_ids = [node_to_id[t] for t in tensors]
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_CAT,
+                            src_ids=src_ids,
+                            op_params=pack_cat_params(dim),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.repeat_interleave.self_int" in target_str:
+                    src_node = node.args[0]
+                    repeats = int(node.args[1])
+                    dim = int(node.args[2]) if len(node.args) > 2 and node.args[2] is not None else 0
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_REPEAT_INTERLEAVE,
+                            src_ids=[src_id],
+                            op_params=pack_repeat_interleave_params(dim, repeats),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.index.Tensor" in target_str:
+                    src_node = node.args[0]
+                    indices = node.args[1]
+                    # indices is a list/tuple; for our qwen3 export it's typically length 1
+                    if not isinstance(indices, (list, tuple)) or len(indices) != 1:
+                        raise RuntimeError('aten.index.Tensor: only single-index supported for now')
+                    idx_node = indices[0]
+                    src_id = node_to_id[src_node]
+                    idx_id = node_to_id[idx_node]
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_INDEX,
+                            src_ids=[src_id, idx_id],
+                            op_params=pack_index_params(0),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.index_put.default" in target_str:
+                    # index_put(x, indices, values, accumulate?)
+                    x_node = node.args[0]
+                    indices = node.args[1]
+                    values_node = node.args[2]
+
+                    if not isinstance(indices, (list, tuple)):
+                        raise RuntimeError('aten.index_put: expected indices to be a list/tuple')
+
+                    # Support multi-index form: indices is a tuple of optional index tensors.
+                    # We'll serialize only the non-None index tensors as src_ids.
+                    present_mask = 0
+                    idx_src_ids: List[int] = []
+                    for i, idx in enumerate(indices):
+                        if idx is None:
+                            continue
+                        present_mask |= (1 << i)
+                        idx_src_ids.append(node_to_id[idx])
+
+                    x_id = node_to_id[x_node]
+                    v_id = node_to_id[values_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_INDEX_PUT,
+                            src_ids=[x_id] + idx_src_ids + [v_id],
+                            op_params=pack_index_put_multi_params(len(indices), present_mask),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.scaled_dot_product_attention.default" in target_str:
+                    # Lower SDPA to fused llama.cpp attention op.
+                    # Args: (q, k, v, attn_mask, dropout_p, is_causal, scale)
+                    q_node, k_node, v_node = node.args[0], node.args[1], node.args[2]
+                    mask_node = node.args[3] if len(node.args) > 3 else None
+                    q_id = node_to_id[q_node]
+                    k_id = node_to_id[k_node]
+                    v_id = node_to_id[v_node]
+                    src_ids = [q_id, k_id, v_id]
+                    if mask_node is not None:
+                        src_ids.append(node_to_id[mask_node])
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_LLAMA_ATTENTION,
+                            src_ids=src_ids,
+                            op_params=b"",  # TODO: pack model params (n_head, head_dim, start_pos binding)
+                        )
+                    )
+                    node_to_id[node] = tid
 
                 elif "aten.mm.default" in target_str:
                     # mm(input, weight_t) → MUL_MAT(original_weight, input)
@@ -392,7 +783,33 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
-                elif "aten.view.default" in target_str or "aten._unsafe_view.default" in target_str or "aten.reshape.default" in target_str:
+                elif "aten.expand.default" in target_str or "aten.expand_copy.default" in target_str:
+                    # expand is broadcast view. We lower it as a VIEW to the
+                    # resulting shape from meta.
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_VIEW,
+                            src_ids=[src_id],
+                            op_params=pack_view_params(shape),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif (
+                    "aten.view.default" in target_str
+                    or "aten.view_copy.default" in target_str
+                    or "aten._unsafe_view.default" in target_str
+                    or "aten.reshape.default" in target_str
+                ):
                     # view(x, new_shape) or reshape(x, new_shape)
                     src_node = node.args[0]
                     new_shape = list(node.args[1])
@@ -439,6 +856,10 @@ class GgmlBackend(BackendDetails):
                         )
                     )
                     node_to_id[node] = tid
+
+                elif "aten.alias.default" in target_str or "aten.alias_copy.default" in target_str:
+                    src_node = node.args[0]
+                    node_to_id[node] = node_to_id[src_node]
 
                 elif "dim_order_ops._clone_dim_order.default" in target_str:
                     # `_clone_dim_order` is a layout materialization op used by

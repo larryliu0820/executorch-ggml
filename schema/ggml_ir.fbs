@@ -1,21 +1,56 @@
 namespace ggml_ir;
 
+// NOTE: This IR is intentionally minimal and stable. Per-op parameters are
+// encoded in `Tensor.op_params` as raw little-endian bytes.
+//
+// Unless otherwise stated, `src_ids` lists input tensors for the op.
+// Shapes are stored in `ne` in ggml order (innermost dimension first).
+
 enum OpCode : int32 {
     NONE = 0,
-    ADD = 1,
-    MUL_MAT = 2,
-    LEAKY_RELU = 3,
+
+    // Basic math
+    ADD = 1,             // src_ids: [a, b]
+    MUL_MAT = 2,         // src_ids: [a, b]  (ggml_mul_mat)
+    MUL = 10,            // src_ids: [a, b]
+    NEG = 11,            // src_ids: [x]
+
+    // NN ops / activations
+    LINEAR = 20,         // src_ids: [x, w, b?]  (b optional)
+    EMBEDDING = 21,      // src_ids: [weight, indices]
+    SILU = 22,           // src_ids: [x]
+    LEAKY_RELU = 3,      // src_ids: [x]  op_params: float32 negative_slope
+    HARDTANH = 6,        // src_ids: [x]  op_params: float32 min, float32 max
+
+    // Vision (existing)
     CONV_2D = 4,
-    CONV_2D_DW = 5,     // depthwise conv2d
-    HARDTANH = 6,        // clamp
-    MEAN = 7,            // mean(dim)
-    VIEW = 8,            // reshape
-    PERMUTE = 9,         // transpose dims
+    CONV_2D_DW = 5,      // depthwise conv2d
+
+    // Reductions / views
+    MEAN = 7,            // src_ids: [x] op_params: int32 dim (only single-dim for now)
+    RSQRT = 30,          // src_ids: [x]
+    VIEW = 8,            // src_ids: [x]
+    UNSQUEEZE = 31,      // src_ids: [x] op_params: int32 dim
+
+    // Layout / indexing
+    PERMUTE = 9,         // src_ids: [x] op_params: int32 ndim, then int32[ndim] dims
+    TRANSPOSE = 40,      // src_ids: [x] op_params: int32 dim0, int32 dim1
+    SLICE = 41,          // src_ids: [x] op_params: int32 dim, int64 start, int64 end, int64 step
+    CAT = 42,            // src_ids: [x0, x1, ...] op_params: int32 dim
+    REPEAT_INTERLEAVE = 43, // src_ids: [x] op_params: int32 dim, int32 repeats
+    INDEX = 44,          // src_ids: [x, indices] op_params: int32 dim
+    INDEX_PUT = 45,      // src_ids: [x, indices, values] op_params: int32 dim
+
+    // Attention (fused llama.cpp/ggml path)
+    LLAMA_ATTENTION = 60 // src_ids: TBD; op_params: model-specific (see runtime)
 }
 
 enum TensorType : int32 {
     F32 = 0,
     F16 = 1,
+    I64 = 2,
+    I32 = 3,
+    BOOL = 4,
 }
 
 table Tensor {
