@@ -516,13 +516,17 @@ class GgmlBackend(BackendDetails):
                 elif "aten.index.Tensor" in target_str:
                     src_node = node.args[0]
                     indices = node.args[1]
-                    non_none = [i for i in indices if i is not None] if isinstance(indices, (list, tuple)) else []
+                    if not isinstance(indices, (list, tuple)):
+                        raise RuntimeError("aten.index.Tensor: expected indices to be list/tuple")
+
+                    non_none_pos = [i for i, idx in enumerate(indices) if idx is not None]
+                    non_none = [indices[i] for i in non_none_pos]
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
                     out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
 
-                    if len(non_none) == 1:
+                    if len(non_none) == 1 and len(non_none_pos) == 1 and non_none_pos[0] == 0:
                         # Single-index case: use ggml_get_rows (gather along dim 0).
                         idx_node = non_none[0]
                         src_id = node_to_id[src_node]
@@ -540,22 +544,24 @@ class GgmlBackend(BackendDetails):
                         )
                         node_to_id[node] = tid
 
-                    else:
-                        # Multi-index case (all non-None): linearize and gather.
-                        # For x[idx0, idx1, ...] where x.shape=[D0, D1, ...]:
-                        #   linear = idx0 * D1 * D2 * ... + idx1 * D2 * ... + ...
-                        #   out = x.view(-1)[linear.view(-1)].view(out_shape)
-                        #
-                        # Since ggml lacks integer mul/add, we implement this by
-                        # packing all indices into op_params and handle in C++ runtime.
-                        # op: OP_INDEX_MULTI  with src_ids = [x, idx0, idx1, ...]
-                        src_id = node_to_id[src_node]
-                        idx_ids = [node_to_id[i] for i in non_none]
-
-                        # Get source shape to compute strides
+                    elif len(non_none) > 1 and len(non_none) == len(indices):
+                        # Multi-index case (all indices present):
+                        # lower to runtime custom gather op.
                         src_val = src_node.meta.get("val")
                         src_shape = list(src_val.shape) if src_val is not None else []
+                        if len(src_shape) == 0 or len(src_shape) > 4:
+                            raise RuntimeError(
+                                "aten.index.Tensor multi-index: unsupported source rank "
+                                f"{len(src_shape)}"
+                            )
+                        if len(indices) != len(src_shape):
+                            raise RuntimeError(
+                                "aten.index.Tensor multi-index: indices rank "
+                                f"{len(indices)} does not match source rank {len(src_shape)}"
+                            )
 
+                        src_id = node_to_id[src_node]
+                        idx_ids = [node_to_id[i] for i in indices]
                         tid = alloc_id()
                         ir_tensors.append(
                             IrTensor(
@@ -568,6 +574,11 @@ class GgmlBackend(BackendDetails):
                             )
                         )
                         node_to_id[node] = tid
+
+                    else:
+                        raise RuntimeError(
+                            "aten.index.Tensor: unsupported indexing pattern for ggml lowering"
+                        )
 
                 elif "aten.select.int" in target_str:
                     # select(x, dim, index) — picks one slice along dim and squeezes it.

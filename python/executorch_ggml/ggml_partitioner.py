@@ -80,25 +80,65 @@ def _is_supported_node(node) -> bool:
     if not _is_supported_target(node.target):
         return False
     target_str = str(node.target)
-    # aten.index.Tensor: check output dtype and index count.
-    # Multi-index gathers on non-float types are not supported in ggml.
+
+    fv = node.meta.get("val")
+    out_dtype = getattr(fv, "dtype", None)
+
+    # aten.index.Tensor:
+    # 1) single-index: only support dim-0 gather (ggml_get_rows),
+    # 2) multi-index: support the "all indices present" advanced indexing case.
+    # We keep other variants (e.g. with None holes) on host for now.
     if "aten.index.Tensor" in target_str:
         indices = node.args[1]
         if not isinstance(indices, (list, tuple)):
             return False
-        non_none = [i for i in indices if i is not None]
-        # Multi-index case: only support if output is float and we fall back to
-        # single-index ggml_get_rows pattern; otherwise exclude.
-        if len(non_none) != 1:
-            fv = node.meta.get("val")
-            out_dtype = getattr(fv, "dtype", None)
-            if out_dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        non_none_pos = [i for i, idx in enumerate(indices) if idx is not None]
+        if len(non_none_pos) == 0:
+            return False
+
+        src_val = node.args[0].meta.get("val") if hasattr(node.args[0], "meta") else None
+        src_shape = list(getattr(src_val, "shape", []))
+        src_rank = len(src_shape)
+        if src_rank == 0 or src_rank > 4:
+            return False
+
+        if len(non_none_pos) == 1:
+            # Single-index lowering currently maps to ggml_get_rows(dim=0).
+            if non_none_pos[0] != 0:
                 return False
-            # Multi-index float case: supported via flatten+gather (handled in lowering)
+            if out_dtype not in (
+                torch.float32,
+                torch.float16,
+                torch.bfloat16,
+                torch.bool,
+                torch.int32,
+            ):
+                return False
+            return True
+
+        # Multi-index: require full advanced index (all dims indexed).
+        if len(non_none_pos) != len(indices):
+            return False
+        if len(indices) != src_rank:
+            return False
+        if out_dtype not in (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+            torch.bool,
+            torch.int32,
+            torch.int64,
+        ):
+            return False
+        return True
+
+    # Keep int64-producing ops on the host side by default.
+    # Exception: handled above for aten.index.Tensor.
+    if out_dtype == torch.int64:
+        return False
     # aten.add.Tensor: ggml only supports F32/F16 ADD, not integer ADDs.
     if "aten.add.Tensor" in target_str:
-        fv = node.meta.get("val")
-        dtype = getattr(fv, "dtype", None)
+        dtype = out_dtype
         if dtype is not None and dtype not in (torch.float32, torch.float16, torch.bfloat16):
             return False
     return True

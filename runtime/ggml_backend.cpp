@@ -7,7 +7,9 @@
 
 #include "ggml_backend.h"
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "ggml_ir_generated.h"  // flatc-generated header (checked in under schema/)
@@ -31,6 +33,135 @@ using executorch::runtime::EValue;
 using executorch::runtime::FreeableBuffer;
 using executorch::runtime::Result;
 using executorch::runtime::Span;
+
+namespace {
+
+constexpr int64_t kInvalidIndex = std::numeric_limits<int64_t>::min();
+
+// Read one index value from an index tensor at the broadcasted output coords.
+inline int64_t read_index_value(
+    const struct ggml_tensor* idx,
+    const int64_t coords[4]) {
+  size_t off = 0;
+  for (int ax = 0; ax < 4; ++ax) {
+    const int64_t ne = idx->ne[ax];
+    int64_t c = coords[ax];
+    if (ne == 1) {
+      c = 0;
+    } else if (c < 0 || c >= ne) {
+      return kInvalidIndex;
+    }
+    off += static_cast<size_t>(c) * static_cast<size_t>(idx->nb[ax]);
+  }
+
+  const char* base = static_cast<const char*>(idx->data);
+  if (base == nullptr) {
+    return kInvalidIndex;
+  }
+
+  switch (idx->type) {
+    case GGML_TYPE_I32:
+      return static_cast<int64_t>(*reinterpret_cast<const int32_t*>(base + off));
+    case GGML_TYPE_I64:
+      return *reinterpret_cast<const int64_t*>(base + off);
+    case GGML_TYPE_F32:
+      return static_cast<int64_t>(*reinterpret_cast<const float*>(base + off));
+    case GGML_TYPE_F16:
+      return static_cast<int64_t>(
+          ggml_fp16_to_fp32(*reinterpret_cast<const ggml_fp16_t*>(base + off)));
+    case GGML_TYPE_BF16:
+      return static_cast<int64_t>(
+          ggml_bf16_to_fp32(*reinterpret_cast<const ggml_bf16_t*>(base + off)));
+    default:
+      return kInvalidIndex;
+  }
+}
+
+// Custom runtime gather for multi-index advanced indexing:
+//   out = src[idx0, idx1, ...]
+// where dst->src[0] is src and dst->src[1..] are index tensors.
+void ggml_custom_index_multi(
+    struct ggml_tensor* dst,
+    int ith,
+    int nth,
+    void* userdata) {
+  (void)userdata;
+
+  const struct ggml_tensor* src = dst->src[0];
+  if (src == nullptr || src->data == nullptr || dst->data == nullptr) {
+    return;
+  }
+
+  int n_indices = 0;
+  for (int s = 1; s < GGML_MAX_SRC && dst->src[s] != nullptr; ++s) {
+    ++n_indices;
+  }
+  if (n_indices <= 0 || n_indices > 4) {
+    return;
+  }
+
+  // Keep implementation conservative for now: plain element-wise copy path.
+  if (ggml_is_quantized(src->type) || src->type != dst->type) {
+    return;
+  }
+
+  const size_t elem_size = ggml_type_size(src->type);
+  const int64_t n_out = ggml_nelements(dst);
+  const int64_t dr = (n_out + nth - 1) / nth;
+  const int64_t ir0 = dr * ith;
+  const int64_t ir1 = std::min<int64_t>(ir0 + dr, n_out);
+
+  const char* src_base = static_cast<const char*>(src->data);
+  char* dst_base = static_cast<char*>(dst->data);
+
+  for (int64_t i = ir0; i < ir1; ++i) {
+    int64_t tmp = i;
+    int64_t coords[4] = {0, 0, 0, 0};
+    coords[0] = tmp % dst->ne[0];
+    tmp /= dst->ne[0];
+    coords[1] = tmp % dst->ne[1];
+    tmp /= dst->ne[1];
+    coords[2] = tmp % dst->ne[2];
+    tmp /= dst->ne[2];
+    coords[3] = tmp;
+
+    size_t dst_off = 0;
+    for (int ax = 0; ax < 4; ++ax) {
+      dst_off += static_cast<size_t>(coords[ax]) * static_cast<size_t>(dst->nb[ax]);
+    }
+
+    size_t src_off = 0;
+    bool valid = true;
+    for (int k = 0; k < n_indices; ++k) {
+      const struct ggml_tensor* idx = dst->src[1 + k];
+      const int64_t idx_val_raw = read_index_value(idx, coords);
+      if (idx_val_raw == kInvalidIndex) {
+        valid = false;
+        break;
+      }
+
+      const int src_ax = n_indices - 1 - k; // ggml axis for PyTorch dim k
+      const int64_t dim_size = src->ne[src_ax];
+      int64_t idx_val = idx_val_raw;
+      if (idx_val < 0) {
+        idx_val += dim_size;
+      }
+      if (idx_val < 0 || idx_val >= dim_size) {
+        valid = false;
+        break;
+      }
+      src_off += static_cast<size_t>(idx_val) * static_cast<size_t>(src->nb[src_ax]);
+    }
+
+    if (valid) {
+      memcpy(dst_base + dst_off, src_base + src_off, elem_size);
+    } else {
+      memset(dst_base + dst_off, 0, elem_size);
+    }
+  }
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Delegate handle — owns the ggml context, graph, and tensor bookkeeping
@@ -161,11 +292,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           gtype = GGML_TYPE_F16;
           break;
         case ggml_ir::TensorType::I64:
-#ifdef GGML_TYPE_I64
           gtype = GGML_TYPE_I64;
-#else
-          gtype = GGML_TYPE_I32; // fallback
-#endif
           break;
         case ggml_ir::TensorType::I32:
           gtype = GGML_TYPE_I32;
@@ -825,107 +952,82 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
 
         case ggml_ir::OpCode::INDEX_MULTI: {
           // Multi-dimensional index gather: out = x[idx0, idx1, ...]
-          // op_params: ndims (int32), src_shape[0..ndims-1] (int64 each)
-          // src_ids: [x, idx0, idx1, ...]
-          //
-          // Implementation: allocate output tensor, compute at init time by iterating
-          // over all elements. This is fine because we only do it once (graph build).
-          //
-          // NOTE: Since ggml doesn't support int64 arithmetic natively, we implement
-          // this as a custom F32 gather. The index tensors are expected to be GGML_TYPE_I32.
-          // For the Qwen3 sliding-window mask pattern, the source and indices are F32/I32.
-          if (!t->op_params() || t->op_params()->size() < 4) {
+          // Runtime implementation uses ggml custom op so gather is computed
+          // per-execution (not frozen at init time).
+          int32_t ndims_hint = 0;
+          if (t->op_params() && t->op_params()->size() >= 4) {
+            memcpy(&ndims_hint, t->op_params()->data(), 4);
+          }
+
+          if (srcs.size() < 2) {
             ggml_free(ctx);
             return Error::InvalidArgument;
           }
 
-          int32_t ndims = 0;
-          memcpy(&ndims, t->op_params()->data(), 4);
-
-          if ((int)srcs.size() < 1 + ndims) {
+          const int ndims = static_cast<int>(srcs.size()) - 1; // src + indices
+          if (ndims < 1 || ndims > 4) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          if (ndims_hint > 0 && ndims_hint != ndims) {
             ggml_free(ctx);
             return Error::InvalidArgument;
           }
 
           struct ggml_tensor* src_x = srcs[0];
-          // Read source shape from op_params
-          std::vector<int64_t> src_shape(ndims);
+          ggml_type out_type = GGML_TYPE_F32;
+          switch (t->type()) {
+            case ggml_ir::TensorType::F16:
+              out_type = GGML_TYPE_F16;
+              break;
+            case ggml_ir::TensorType::I64:
+              out_type = GGML_TYPE_I64;
+              break;
+            case ggml_ir::TensorType::I32:
+              out_type = GGML_TYPE_I32;
+              break;
+            case ggml_ir::TensorType::BOOL:
+              out_type = GGML_TYPE_I32;
+              break;
+            case ggml_ir::TensorType::F32:
+            default:
+              out_type = GGML_TYPE_F32;
+              break;
+          }
+
+          if (src_x->type != out_type) {
+            src_x = ggml_cast(ctx, src_x, out_type);
+          }
+
+          std::vector<struct ggml_tensor*> custom_args;
+          custom_args.reserve(1 + ndims);
+          custom_args.push_back(src_x);
           for (int i = 0; i < ndims; ++i) {
-            memcpy(&src_shape[i], t->op_params()->data() + 4 + i * 8, 8);
+            struct ggml_tensor* idx = srcs[1 + i];
+            if (idx->type != GGML_TYPE_I32 && idx->type != GGML_TYPE_I64) {
+              idx = ggml_cast(ctx, idx, GGML_TYPE_I64);
+            }
+            custom_args.push_back(idx);
           }
 
-          // Compute row strides (last dim is innermost in PyTorch)
-          std::vector<int64_t> strides(ndims, 1);
-          for (int i = ndims - 2; i >= 0; --i) {
-            strides[i] = strides[i + 1] * src_shape[i + 1];
-          }
-
-          // Output shape (in ggml ne: row-major reversed)
+          // Output shape (in ggml ne order).
           int64_t out_ne0 = t->ne() ? (*t->ne())[0] : 1;
           int64_t out_ne1 = t->ne() && t->ne()->size() > 1 ? (*t->ne())[1] : 1;
           int64_t out_ne2 = t->ne() && t->ne()->size() > 2 ? (*t->ne())[2] : 1;
           int64_t out_ne3 = t->ne() && t->ne()->size() > 3 ? (*t->ne())[3] : 1;
 
-          // Allocate output as a new ggml tensor (F32)
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, out_ne0, out_ne1, out_ne2, out_ne3);
-
-          // Perform the gather computation eagerly (at graph-build time).
-          // We need the source data (it's a constant tensor) and the index tensors.
-          // For this to work, src_x must have its data already set (it's a constant).
-          if (src_x->data == nullptr) {
-            fprintf(stderr, "[executorch-ggml] INDEX_MULTI: source tensor has no data\n");
-            ggml_free(ctx);
-            return Error::InvalidArgument;
-          }
-
-          const float* src_data = static_cast<const float*>(src_x->data);
-          float* out_data = static_cast<float*>(gt->data);
-          if (out_data == nullptr) {
-            fprintf(stderr, "[executorch-ggml] INDEX_MULTI: output tensor has no data (alloc needed)\n");
-            ggml_free(ctx);
-            return Error::InvalidArgument;
-          }
-
-          int64_t n_out = out_ne0 * out_ne1 * out_ne2 * out_ne3;
-          for (int64_t i = 0; i < n_out; ++i) {
-            // Compute output coordinates (PyTorch row-major: last dim varies fastest)
-            // in ggml layout: ne[0] is innermost
-            int64_t tmp = i;
-            int64_t coords[4];
-            coords[3] = tmp / (out_ne0 * out_ne1 * out_ne2); tmp %= (out_ne0 * out_ne1 * out_ne2);
-            coords[2] = tmp / (out_ne0 * out_ne1); tmp %= (out_ne0 * out_ne1);
-            coords[1] = tmp / out_ne0;
-            coords[0] = tmp % out_ne0;
-            // Reversed for PyTorch dim order: pt_coords[d] = coords[3-d]
-
-            // For each source dimension k, read index tensor k at position i
-            int64_t linear_src = 0;
-            bool valid = true;
-            for (int k = 0; k < ndims; ++k) {
-              struct ggml_tensor* idx_k = srcs[1 + k];
-              // idx_k is stored in ggml layout; element at position i
-              int64_t src_idx = 0;
-              if (idx_k->type == GGML_TYPE_I32) {
-                const int32_t* idata = static_cast<const int32_t*>(idx_k->data);
-                src_idx = (int64_t)idata[i];
-              } else if (idx_k->type == GGML_TYPE_I64) {
-                // Stored as I64 but accessed as int64_t
-                int64_t val64 = 0;
-                memcpy(&val64, static_cast<const char*>(idx_k->data) + i * 8, 8);
-                src_idx = val64;
-              } else {
-                const float* fdata = static_cast<const float*>(idx_k->data);
-                src_idx = (int64_t)fdata[i];
-              }
-              if (src_idx < 0 || src_idx >= src_shape[k]) { valid = false; break; }
-              linear_src += src_idx * strides[k];
-            }
-            out_data[i] = valid ? src_data[linear_src] : 0.0f;
-          }
-
-          // gt is already filled with data; wrap it as a "none" op so compute graph
-          // treats it as a constant.
-          gt->op = GGML_OP_NONE;
+          gt = ggml_custom_4d(
+              ctx,
+              out_type,
+              out_ne0,
+              out_ne1,
+              out_ne2,
+              out_ne3,
+              custom_args.data(),
+              static_cast<int>(custom_args.size()),
+              ggml_custom_index_multi,
+              GGML_N_TASKS_MAX,
+              nullptr);
           break;
         }
 
@@ -971,15 +1073,9 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           struct ggml_tensor* idx = srcs[1];
 
           // ggml_set_rows expects indices tensor type I64.
-#ifdef GGML_TYPE_I64
           if (idx->type != GGML_TYPE_I64) {
             idx = ggml_cast(ctx, idx, GGML_TYPE_I64);
           }
-#else
-          if (idx->type != GGML_TYPE_I32) {
-            idx = ggml_cast(ctx, idx, GGML_TYPE_I32);
-          }
-#endif
 
           // Ensure val has shape compatible with dst for set_rows:
           // dst: [ne0, ne1(seq), ne2(heads), ne3(batch)]
