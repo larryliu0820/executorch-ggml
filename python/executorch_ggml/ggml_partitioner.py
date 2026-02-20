@@ -118,20 +118,7 @@ class GgmlPartitioner(Partitioner):
                 partition_tags={},
             )
 
-        # If we're doing an incremental prefix delegation (max_sdpa_ops set),
-        # keep things simple: tag everything in the prefix as one partition.
-        if self.max_sdpa_ops is not None:
-            tag = "ggml_partition_prefix"
-            for node in supported_nodes:
-                node.meta["delegation_tag"] = tag
-            partition_tags[tag] = self.delegation_spec
-            tag_constant_data(exported_program)
-            return PartitionResult(
-                tagged_exported_program=exported_program,
-                partition_tags=partition_tags,
-            )
-
-        # Otherwise: Union-Find to group connected supported nodes into partitions
+        # Union-Find to group connected supported nodes into partitions
         parent: Dict[torch.fx.Node, torch.fx.Node] = {}
 
         def find(n: torch.fx.Node) -> torch.fx.Node:
