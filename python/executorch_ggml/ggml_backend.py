@@ -35,6 +35,7 @@ from executorch_ggml.serialize import (
     OP_INDEX,
     OP_INDEX_PUT,
     OP_REPEAT,
+    OP_INDEX_MULTI,
     OP_LLAMA_ATTENTION,
     # Types
     TYPE_F32,
@@ -57,6 +58,7 @@ from executorch_ggml.serialize import (
     pack_repeat_interleave_params,
     pack_index_params,
     pack_index_put_params,
+    pack_index_multi_params,
     pack_index_put_multi_params,
     serialize_graph,
 )
@@ -200,14 +202,14 @@ class GgmlBackend(BackendDetails):
                 else:
                     # Runtime input
                     fake_val = node.meta.get("val")
-                    if fake_val is not None:
+                    if fake_val is not None and hasattr(fake_val, "shape"):
                         shape = list(fake_val.shape)
                     else:
                         shape = []
 
                     tid = alloc_id()
                     # Runtime input dtype based on FakeTensor meta when available.
-                    in_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    in_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None and hasattr(fake_val, "dtype") else torch.float32
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
@@ -514,27 +516,58 @@ class GgmlBackend(BackendDetails):
                 elif "aten.index.Tensor" in target_str:
                     src_node = node.args[0]
                     indices = node.args[1]
-                    # indices is a list/tuple; for our qwen3 export it's typically length 1
-                    if not isinstance(indices, (list, tuple)) or len(indices) != 1:
-                        raise RuntimeError('aten.index.Tensor: only single-index supported for now')
-                    idx_node = indices[0]
-                    src_id = node_to_id[src_node]
-                    idx_id = node_to_id[idx_node]
+                    non_none = [i for i in indices if i is not None] if isinstance(indices, (list, tuple)) else []
+
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
                     out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
-                    tid = alloc_id()
-                    ir_tensors.append(
-                        IrTensor(
-                            tensor_id=tid,
-                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
-                            ne=_pytorch_shape_to_ggml_ne(shape),
-                            op=OP_INDEX,
-                            src_ids=[src_id, idx_id],
-                            op_params=pack_index_params(0),
+
+                    if len(non_none) == 1:
+                        # Single-index case: use ggml_get_rows (gather along dim 0).
+                        idx_node = non_none[0]
+                        src_id = node_to_id[src_node]
+                        idx_id = node_to_id[idx_node]
+                        tid = alloc_id()
+                        ir_tensors.append(
+                            IrTensor(
+                                tensor_id=tid,
+                                tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                                ne=_pytorch_shape_to_ggml_ne(shape),
+                                op=OP_INDEX,
+                                src_ids=[src_id, idx_id],
+                                op_params=pack_index_params(0),
+                            )
                         )
-                    )
-                    node_to_id[node] = tid
+                        node_to_id[node] = tid
+
+                    else:
+                        # Multi-index case (all non-None): linearize and gather.
+                        # For x[idx0, idx1, ...] where x.shape=[D0, D1, ...]:
+                        #   linear = idx0 * D1 * D2 * ... + idx1 * D2 * ... + ...
+                        #   out = x.view(-1)[linear.view(-1)].view(out_shape)
+                        #
+                        # Since ggml lacks integer mul/add, we implement this by
+                        # packing all indices into op_params and handle in C++ runtime.
+                        # op: OP_INDEX_MULTI  with src_ids = [x, idx0, idx1, ...]
+                        src_id = node_to_id[src_node]
+                        idx_ids = [node_to_id[i] for i in non_none]
+
+                        # Get source shape to compute strides
+                        src_val = src_node.meta.get("val")
+                        src_shape = list(src_val.shape) if src_val is not None else []
+
+                        tid = alloc_id()
+                        ir_tensors.append(
+                            IrTensor(
+                                tensor_id=tid,
+                                tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                                ne=_pytorch_shape_to_ggml_ne(shape),
+                                op=OP_INDEX_MULTI,
+                                src_ids=[src_id] + idx_ids,
+                                op_params=pack_index_multi_params(src_shape),
+                            )
+                        )
+                        node_to_id[node] = tid
 
                 elif "aten.select.int" in target_str:
                     # select(x, dim, index) — picks one slice along dim and squeezes it.
@@ -909,11 +942,13 @@ class GgmlBackend(BackendDetails):
                 ):
                     # view(x, new_shape) or reshape(x, new_shape)
                     src_node = node.args[0]
-                    new_shape = list(node.args[1])
                     src_id = node_to_id[src_node]
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
+                    # Use concrete output shape from FakeTensor meta rather than
+                    # node.args[1] which may contain SymInt from dynamic export.
+                    new_shape = [int(d) for d in shape] if shape else [int(d) for d in node.args[1]]
 
                     tid = alloc_id()
                     ir_tensors.append(

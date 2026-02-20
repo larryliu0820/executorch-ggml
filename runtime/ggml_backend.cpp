@@ -355,9 +355,9 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             };
 
             if (ggml_can_repeat(b, a)) {
-              b = ggml_repeat(ctx, b, a);
+              b = ggml_cont(ctx, ggml_repeat(ctx, b, a));
             } else if (ggml_can_repeat(a, b)) {
-              a = ggml_repeat(ctx, a, b);
+              a = ggml_cont(ctx, ggml_repeat(ctx, a, b));
             } else {
               // Try 1D→ND broadcast alignment
               if (auto * bb = try_repeat_1d_to_match(b, a)) {
@@ -739,8 +739,11 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         }
 
         case ggml_ir::OpCode::REPEAT_INTERLEAVE: {
-          // Limited support for GQA expansion: repeats along PyTorch dim 1.
+          // Support for GQA expansion: repeat_interleave(x, repeats, dim).
           // op_params: (dim:int32, repeats:int32)
+          // Unlike ggml_repeat (which tiles the whole tensor), repeat_interleave
+          // repeats each element `repeats` times consecutively.
+          // Example: [A, B, C].repeat_interleave(2) -> [A, A, B, B, C, C]
           if (!t->op_params() || t->op_params()->size() < 8) {
             ggml_free(ctx);
             return Error::InvalidArgument;
@@ -748,19 +751,46 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           int32_t dim = 0, reps = 1;
           memcpy(&dim, t->op_params()->data(), 4);
           memcpy(&reps, t->op_params()->data() + 4, 4);
-          // Only support repeating along PyTorch dim 1 (heads)
+          // Only support repeating along PyTorch dim 1 (heads), which is ggml ax=(nd-2).
           if (dim != 1 || reps < 1) {
             ggml_free(ctx);
             return Error::InvalidArgument;
           }
-          // Implement as concatenation of identical tensor along that axis.
-          int nd = ggml_n_dims(srcs[0]);
-          int ax = (nd - 1) - dim;
-          struct ggml_tensor* cur = srcs[0];
-          for (int r = 1; r < reps; ++r) {
-            cur = ggml_concat(ctx, cur, srcs[0], ax);
+          struct ggml_tensor* src = srcs[0];
+          // src layout in ggml (ne): [ne0=D, ne1=T, ne2=H, ne3=B]
+          // We need output [ne0=D, ne1=T, ne2=H*reps, ne3=B] where output
+          // head `i` equals input head `i / reps` (interleaved, not tiled).
+          //
+          // Build by concatenating each individual head slice reps times:
+          //   concat(head0, head0, head1, head1, ...) for reps=2
+          //
+          // ggml axis for head dim: for a 4D src, ne[2] is the head dim.
+          int64_t D  = src->ne[0];
+          int64_t T  = src->ne[1];
+          int64_t H  = src->ne[2];
+          int64_t B  = src->ne[3];
+          // byte stride for one head slice along ne[2]
+          size_t  row_stride  = src->nb[1];   // stride over T (ne[1])
+          size_t  head_stride = src->nb[2];   // stride over H (ne[2])
+          size_t  batch_stride= src->nb[3];   // stride over B (ne[3])
+          struct ggml_tensor* result = nullptr;
+          for (int64_t h = 0; h < H; ++h) {
+            // Create a view of one head: shape [D, T, 1, B]
+            struct ggml_tensor* head_slice = ggml_view_4d(
+                ctx, src,
+                D, T, 1, B,
+                src->nb[1], src->nb[2], src->nb[3],
+                h * head_stride  // offset in bytes to head h
+            );
+            for (int r = 0; r < reps; ++r) {
+              if (result == nullptr) {
+                result = head_slice;
+              } else {
+                result = ggml_concat(ctx, result, head_slice, 2 /* ne[2] axis */);
+              }
+            }
           }
-          gt = cur;
+          gt = result;
           break;
         }
 
@@ -790,6 +820,112 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           }
           // ggml_get_rows selects rows by indices.
           gt = ggml_get_rows(ctx, x, idx);
+          break;
+        }
+
+        case ggml_ir::OpCode::INDEX_MULTI: {
+          // Multi-dimensional index gather: out = x[idx0, idx1, ...]
+          // op_params: ndims (int32), src_shape[0..ndims-1] (int64 each)
+          // src_ids: [x, idx0, idx1, ...]
+          //
+          // Implementation: allocate output tensor, compute at init time by iterating
+          // over all elements. This is fine because we only do it once (graph build).
+          //
+          // NOTE: Since ggml doesn't support int64 arithmetic natively, we implement
+          // this as a custom F32 gather. The index tensors are expected to be GGML_TYPE_I32.
+          // For the Qwen3 sliding-window mask pattern, the source and indices are F32/I32.
+          if (!t->op_params() || t->op_params()->size() < 4) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+
+          int32_t ndims = 0;
+          memcpy(&ndims, t->op_params()->data(), 4);
+
+          if ((int)srcs.size() < 1 + ndims) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+
+          struct ggml_tensor* src_x = srcs[0];
+          // Read source shape from op_params
+          std::vector<int64_t> src_shape(ndims);
+          for (int i = 0; i < ndims; ++i) {
+            memcpy(&src_shape[i], t->op_params()->data() + 4 + i * 8, 8);
+          }
+
+          // Compute row strides (last dim is innermost in PyTorch)
+          std::vector<int64_t> strides(ndims, 1);
+          for (int i = ndims - 2; i >= 0; --i) {
+            strides[i] = strides[i + 1] * src_shape[i + 1];
+          }
+
+          // Output shape (in ggml ne: row-major reversed)
+          int64_t out_ne0 = t->ne() ? (*t->ne())[0] : 1;
+          int64_t out_ne1 = t->ne() && t->ne()->size() > 1 ? (*t->ne())[1] : 1;
+          int64_t out_ne2 = t->ne() && t->ne()->size() > 2 ? (*t->ne())[2] : 1;
+          int64_t out_ne3 = t->ne() && t->ne()->size() > 3 ? (*t->ne())[3] : 1;
+
+          // Allocate output as a new ggml tensor (F32)
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, out_ne0, out_ne1, out_ne2, out_ne3);
+
+          // Perform the gather computation eagerly (at graph-build time).
+          // We need the source data (it's a constant tensor) and the index tensors.
+          // For this to work, src_x must have its data already set (it's a constant).
+          if (src_x->data == nullptr) {
+            fprintf(stderr, "[executorch-ggml] INDEX_MULTI: source tensor has no data\n");
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+
+          const float* src_data = static_cast<const float*>(src_x->data);
+          float* out_data = static_cast<float*>(gt->data);
+          if (out_data == nullptr) {
+            fprintf(stderr, "[executorch-ggml] INDEX_MULTI: output tensor has no data (alloc needed)\n");
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+
+          int64_t n_out = out_ne0 * out_ne1 * out_ne2 * out_ne3;
+          for (int64_t i = 0; i < n_out; ++i) {
+            // Compute output coordinates (PyTorch row-major: last dim varies fastest)
+            // in ggml layout: ne[0] is innermost
+            int64_t tmp = i;
+            int64_t coords[4];
+            coords[3] = tmp / (out_ne0 * out_ne1 * out_ne2); tmp %= (out_ne0 * out_ne1 * out_ne2);
+            coords[2] = tmp / (out_ne0 * out_ne1); tmp %= (out_ne0 * out_ne1);
+            coords[1] = tmp / out_ne0;
+            coords[0] = tmp % out_ne0;
+            // Reversed for PyTorch dim order: pt_coords[d] = coords[3-d]
+
+            // For each source dimension k, read index tensor k at position i
+            int64_t linear_src = 0;
+            bool valid = true;
+            for (int k = 0; k < ndims; ++k) {
+              struct ggml_tensor* idx_k = srcs[1 + k];
+              // idx_k is stored in ggml layout; element at position i
+              int64_t src_idx = 0;
+              if (idx_k->type == GGML_TYPE_I32) {
+                const int32_t* idata = static_cast<const int32_t*>(idx_k->data);
+                src_idx = (int64_t)idata[i];
+              } else if (idx_k->type == GGML_TYPE_I64) {
+                // Stored as I64 but accessed as int64_t
+                int64_t val64 = 0;
+                memcpy(&val64, static_cast<const char*>(idx_k->data) + i * 8, 8);
+                src_idx = val64;
+              } else {
+                const float* fdata = static_cast<const float*>(idx_k->data);
+                src_idx = (int64_t)fdata[i];
+              }
+              if (src_idx < 0 || src_idx >= src_shape[k]) { valid = false; break; }
+              linear_src += src_idx * strides[k];
+            }
+            out_data[i] = valid ? src_data[linear_src] : 0.0f;
+          }
+
+          // gt is already filled with data; wrap it as a "none" op so compute graph
+          // treats it as a constant.
+          gt->op = GGML_OP_NONE;
           break;
         }
 

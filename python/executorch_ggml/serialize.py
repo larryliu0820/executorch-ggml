@@ -49,6 +49,7 @@ OP_REPEAT_INTERLEAVE = 43
 OP_INDEX = 44
 OP_INDEX_PUT = 45
 OP_REPEAT = 46
+OP_INDEX_MULTI = 47  # Multi-index gather: x[idx0, idx1, ...] via linearized lookup
 
 # Fused attention (llama.cpp/ggml)
 OP_LLAMA_ATTENTION = 60
@@ -338,3 +339,16 @@ def pack_permute_params(perm: List[int]) -> bytes:
     ndims = len(perm)
     fmt = f"<i{ndims}i"  # i for ndims, i for each int32
     return struct.pack(fmt, ndims, *perm)
+
+
+def pack_index_multi_params(src_shape: List[int]) -> bytes:
+    """Pack multi-index gather parameters into little-endian bytes.
+
+    Encodes the source tensor shape so the C++ runtime can compute
+    row strides for linearized multi-dimensional indexing.
+
+    Layout: ndims (int32), followed by ndims int64 values (src dimension sizes).
+    """
+    ndims = len(src_shape)
+    fmt = f"<i{ndims}q"  # i for ndims, q for each int64
+    return struct.pack(fmt, ndims, *[int(d) for d in src_shape])

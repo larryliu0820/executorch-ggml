@@ -74,6 +74,35 @@ def _is_supported_target(target) -> bool:
     s = str(target)
     return any(name in s for name in _SUPPORTED_OP_NAMES)
 
+
+def _is_supported_node(node) -> bool:
+    """Additional per-node checks beyond op name matching."""
+    if not _is_supported_target(node.target):
+        return False
+    target_str = str(node.target)
+    # aten.index.Tensor: check output dtype and index count.
+    # Multi-index gathers on non-float types are not supported in ggml.
+    if "aten.index.Tensor" in target_str:
+        indices = node.args[1]
+        if not isinstance(indices, (list, tuple)):
+            return False
+        non_none = [i for i in indices if i is not None]
+        # Multi-index case: only support if output is float and we fall back to
+        # single-index ggml_get_rows pattern; otherwise exclude.
+        if len(non_none) != 1:
+            fv = node.meta.get("val")
+            out_dtype = getattr(fv, "dtype", None)
+            if out_dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                return False
+            # Multi-index float case: supported via flatten+gather (handled in lowering)
+    # aten.add.Tensor: ggml only supports F32/F16 ADD, not integer ADDs.
+    if "aten.add.Tensor" in target_str:
+        fv = node.meta.get("val")
+        dtype = getattr(fv, "dtype", None)
+        if dtype is not None and dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            return False
+    return True
+
 BACKEND_ID = "GgmlBackend"
 
 
@@ -113,7 +142,7 @@ class GgmlPartitioner(Partitioner):
         for idx, node in enumerate(graph_module.graph.nodes):
             if cutoff_idx is not None and idx >= cutoff_idx:
                 continue
-            if node.op == "call_function" and _is_supported_target(node.target):
+            if node.op == "call_function" and _is_supported_node(node):
                 supported_nodes.append(node)
 
         if not supported_nodes:

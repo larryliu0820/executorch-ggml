@@ -46,6 +46,7 @@ enum class OpCode : int32_t {
   INDEX = 44,
   INDEX_PUT = 45,
   REPEAT = 46,
+  INDEX_MULTI = 47,
   LLAMA_ATTENTION = 60,
   MIN = NONE,
   MAX = LLAMA_ATTENTION
