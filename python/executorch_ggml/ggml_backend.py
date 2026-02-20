@@ -864,14 +864,68 @@ class GgmlBackend(BackendDetails):
                     y_id = node_to_id[y_node]
 
                     fake_val = node.meta.get("val")
-                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_shape = list(fake_val.shape) if fake_val is not None else []
+
+                    # Make broadcasting explicit with OP_REPEAT where possible.
+                    x_val = x_node.meta.get("val") if isinstance(x_node, torch.fx.Node) else None
+                    y_val = y_node.meta.get("val") if isinstance(y_node, torch.fx.Node) else None
+                    x_shape = list(getattr(x_val, "shape", [])) if x_val is not None else []
+                    y_shape = list(getattr(y_val, "shape", [])) if y_val is not None else []
+
+                    def _n_non1(sh):
+                        return sum(1 for d in sh if int(d) != 1)
+
+                    def _numel(sh):
+                        n = 1
+                        for d in sh:
+                            n *= int(d)
+                        return n
+
+                    like_id = None
+                    if out_shape and x_shape and y_shape and (x_shape != y_shape):
+                        like_id = alloc_id()
+                        ir_tensors.append(
+                            IrTensor(
+                                tensor_id=like_id,
+                                tensor_type=TYPE_F32,
+                                ne=_pytorch_shape_to_ggml_ne(out_shape),
+                                op=OP_NONE,
+                                is_input=False,
+                            )
+                        )
+
+                        # repeat the smaller/broadcasted side
+                        if (_n_non1(x_shape), _numel(x_shape)) < (_n_non1(y_shape), _numel(y_shape)):
+                            x_rep = alloc_id()
+                            ir_tensors.append(
+                                IrTensor(
+                                    tensor_id=x_rep,
+                                    tensor_type=TYPE_F32,
+                                    ne=_pytorch_shape_to_ggml_ne(out_shape),
+                                    op=OP_REPEAT,
+                                    src_ids=[x_id, like_id],
+                                )
+                            )
+                            x_id = x_rep
+                        elif (_n_non1(y_shape), _numel(y_shape)) < (_n_non1(x_shape), _numel(x_shape)):
+                            y_rep = alloc_id()
+                            ir_tensors.append(
+                                IrTensor(
+                                    tensor_id=y_rep,
+                                    tensor_type=TYPE_F32,
+                                    ne=_pytorch_shape_to_ggml_ne(out_shape),
+                                    op=OP_REPEAT,
+                                    src_ids=[y_id, like_id],
+                                )
+                            )
+                            y_id = y_rep
 
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
                             tensor_type=TYPE_F32,
-                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            ne=_pytorch_shape_to_ggml_ne(out_shape),
                             op=OP_ADD,
                             src_ids=[x_id, y_id],
                         )
