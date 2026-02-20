@@ -267,7 +267,12 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           struct ggml_tensor* y = ggml_mul_mat(ctx, w, x);
           if (srcs.size() > 2) {
             struct ggml_tensor* b = srcs[2];
-            // Broadcast bias to y shape
+            // Broadcast bias to y shape.
+            // For PyTorch linear, bias is typically 1D [out]. In ggml order that is ne0=out.
+            // Make it at least 2D so ggml_repeat can broadcast along remaining dims.
+            if (ggml_n_dims(b) == 1) {
+              b = ggml_reshape_2d(ctx, b, b->ne[0], 1);
+            }
             struct ggml_tensor* b_rep = ggml_repeat(ctx, b, y);
             y = ggml_add(ctx, y, b_rep);
           }
