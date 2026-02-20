@@ -236,18 +236,41 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           if (!ggml_are_same_shape(a, b)) {
             auto try_repeat_1d_to_match = [&](struct ggml_tensor * small,
                                              struct ggml_tensor * big) -> struct ggml_tensor * {
-              // If `small` is a 1D tensor and its length matches one of big's dims,
-              // reshape+permute it so the matching dim aligns, then repeat.
-              if (ggml_n_dims(small) != 1) {
+              // If `small` is effectively 1D (exactly one dim > 1) and its length matches
+              // one of big's dims, reshape+permute it so the matching dim aligns, then repeat.
+              int non1 = 0;
+              int non1_ax = -1;
+              for (int ax = 0; ax < 4; ++ax) {
+                if (small->ne[ax] != 1) {
+                  non1++;
+                  non1_ax = ax;
+                }
+              }
+              if (non1 != 1) {
                 return nullptr;
               }
-              const int64_t n = small->ne[0];
+              const int64_t n = small->ne[non1_ax];
+
+              // Normalize to a base view where n is in axis0.
+              struct ggml_tensor * base = small;
+              if (non1_ax != 0) {
+                // permute so that old non1_ax becomes new axis0
+                int axes[4] = {0,1,2,3};
+                axes[0] = non1_ax;
+                int out = 1;
+                for (int ax = 0; ax < 4; ++ax) {
+                  if (ax == non1_ax) continue;
+                  axes[out++] = ax;
+                }
+                base = ggml_permute(ctx, base, axes[0], axes[1], axes[2], axes[3]);
+                base = ggml_cont(ctx, base);
+              }
               for (int ax = 0; ax < 4; ++ax) {
                 if (big->ne[ax] != n) {
                   continue;
                 }
                 // Start as 4D [n,1,1,1]
-                struct ggml_tensor * s4 = ggml_reshape_4d(ctx, small, n, 1, 1, 1);
+                struct ggml_tensor * s4 = ggml_reshape_4d(ctx, base, n, 1, 1, 1);
                 // Permute so `n` ends up in axis `ax`
                 int p0 = 0, p1 = 1, p2 = 2, p3 = 3;
                 if (ax == 0) {
