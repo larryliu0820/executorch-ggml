@@ -204,7 +204,12 @@ class GgmlBackend(BackendDetails):
                 # -----------------------------------------------------------------
                 # Existing supported ops
                 # -----------------------------------------------------------------
-                if "aten.scalar_tensor.default" in target_str:
+                if "aten._assert_tensor_metadata.default" in target_str:
+                    # No-op shape/dtype assertion inserted by export.
+                    src_node = node.args[0]
+                    node_to_id[node] = node_to_id[src_node]
+
+                elif "aten.scalar_tensor.default" in target_str:
                     # scalar_tensor(s, dtype?, device?) -> 0-d tensor constant
                     fake_val = node.meta.get("val")
                     out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32

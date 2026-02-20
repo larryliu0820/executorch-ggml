@@ -47,6 +47,7 @@ _SUPPORTED_OP_NAMES = {
     "aten.expand.default",
     "aten.expand_copy.default",
     "aten.scalar_tensor.default",
+    "aten._assert_tensor_metadata.default",
 
     # Legacy linear demo ops
     "aten.t.default",
