@@ -50,6 +50,7 @@ OP_INDEX = 44
 OP_INDEX_PUT = 45
 OP_REPEAT = 46
 OP_INDEX_MULTI = 47  # Multi-index gather: x[idx0, idx1, ...] via linearized lookup
+OP_CAST = 48  # Type cast: src_ids=[x], op_params=int32 target_type (TensorType enum)
 
 # Fused attention (llama.cpp/ggml)
 OP_LLAMA_ATTENTION = 60
@@ -239,16 +240,18 @@ def pack_i32(value: int) -> bytes:
     return struct.pack("<i", int(value))
 
 
-def pack_transpose_params(dim0: int, dim1: int) -> bytes:
-    return struct.pack("<ii", int(dim0), int(dim1))
+def pack_transpose_params(dim0: int, dim1: int, ndim: int) -> bytes:
+    """Pack transpose parameters. ndim is the full PyTorch rank (not ggml_n_dims)."""
+    return struct.pack("<iii", int(dim0), int(dim1), int(ndim))
 
 
 def pack_unsqueeze_params(dim: int) -> bytes:
     return pack_i32(dim)
 
 
-def pack_cat_params(dim: int) -> bytes:
-    return pack_i32(dim)
+def pack_cat_params(ggml_axis: int) -> bytes:
+    """Pack cat params. Takes the pre-computed ggml axis (not PyTorch dim)."""
+    return pack_i32(ggml_axis)
 
 
 def pack_repeat_interleave_params(dim: int, repeats: int) -> bytes:
@@ -352,3 +355,11 @@ def pack_index_multi_params(src_shape: List[int]) -> bytes:
     ndims = len(src_shape)
     fmt = f"<i{ndims}q"  # i for ndims, q for each int64
     return struct.pack(fmt, ndims, *[int(d) for d in src_shape])
+
+
+def pack_cast_params(target_type: int) -> bytes:
+    """Pack cast parameters into little-endian bytes.
+
+    Layout: target_type (int32) - TensorType enum value.
+    """
+    return struct.pack("<i", target_type)

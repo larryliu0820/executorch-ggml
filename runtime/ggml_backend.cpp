@@ -176,6 +176,10 @@ struct GgmlDelegateHandle {
   // Output tensors in the order they appear in the IR
   std::vector<struct ggml_tensor*> outputs;
 
+  // Deferred I64→I32 casts that must run during execute() (after input copy).
+  // Each pair is (src_i64_tensor, dst_i32_tensor).
+  std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>> deferred_i64_to_i32;
+
   // Separate compute context for graph_compute (needs its own memory)
   struct ggml_context* compute_ctx = nullptr;
 };
@@ -254,6 +258,8 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
   // Track inputs and outputs
   std::vector<std::pair<int, struct ggml_tensor*>> input_pairs;  // (index, tensor)
   std::vector<struct ggml_tensor*> output_tensors;
+  // Deferred I64→I32 casts (for input tensors).
+  std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>> deferred_i64_to_i32;
 
   // Walk tensors in topological order
   for (int i = 0; i < n_tensors; ++i) {
@@ -745,6 +751,8 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           }
 
           gt = ggml_reshape_4d(ctx, srcs[0], new_ne[0], new_ne[1], new_ne[2], new_ne[3]);
+          // Always make contiguous to avoid issues with nested views (e.g., view->permute).
+          gt = ggml_cont(ctx, gt);
           break;
         }
 
@@ -771,30 +779,33 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
 
           // ggml_permute(ctx, tensor, axis0, axis1, axis2, axis3)
           gt = ggml_permute(ctx, srcs[0], perm[0], perm[1], perm[2], perm[3]);
+          // Make contiguous so that output copy works correctly.
+          gt = ggml_cont(ctx, gt);
           break;
         }
 
         case ggml_ir::OpCode::TRANSPOSE: {
           // transpose(x, dim0, dim1) via permute
-          if (!t->op_params() || t->op_params()->size() < 8) {
+          // op_params: (dim0:int32, dim1:int32, ndim:int32)
+          if (!t->op_params() || t->op_params()->size() < 12) {
             ggml_free(ctx);
             return Error::InvalidArgument;
           }
-          int32_t dim0 = 0, dim1 = 1;
+          int32_t dim0 = 0, dim1 = 1, nd = 4;
           memcpy(&dim0, t->op_params()->data(), 4);
           memcpy(&dim1, t->op_params()->data() + 4, 4);
+          memcpy(&nd, t->op_params()->data() + 8, 4);
 
-          // Map PyTorch dims -> ggml axes (reverse order for up to 4D)
-          auto* a = srcs[0];
-          int nd = ggml_n_dims(a);
+          // Map PyTorch dims -> ggml axes using the PyTorch rank (not ggml_n_dims)
           int ax0 = (nd - 1) - dim0;
           int ax1 = (nd - 1) - dim1;
           int perm[4] = {0, 1, 2, 3};
-          for (int i = 0; i < 4; ++i) perm[i] = i;
           int tmp = perm[ax0];
           perm[ax0] = perm[ax1];
           perm[ax1] = tmp;
-          gt = ggml_permute(ctx, a, perm[0], perm[1], perm[2], perm[3]);
+          gt = ggml_permute(ctx, srcs[0], perm[0], perm[1], perm[2], perm[3]);
+          // Make contiguous so that output copy works correctly.
+          gt = ggml_cont(ctx, gt);
           break;
         }
 
@@ -848,15 +859,13 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         }
 
         case ggml_ir::OpCode::CAT: {
-          // Chain ggml_concat along dim (PyTorch dim mapped to ggml axis)
+          // Chain ggml_concat along pre-computed ggml axis
           if (!t->op_params() || t->op_params()->size() < 4) {
             ggml_free(ctx);
             return Error::InvalidArgument;
           }
-          int32_t dim = 0;
-          memcpy(&dim, t->op_params()->data(), 4);
-          int nd = ggml_n_dims(srcs[0]);
-          int ax = (nd - 1) - dim;
+          int32_t ax = 0;
+          memcpy(&ax, t->op_params()->data(), 4);
           struct ggml_tensor* cur = srcs[0];
           for (size_t si = 1; si < srcs.size(); ++si) {
             cur = ggml_concat(ctx, cur, srcs[si], ax);
@@ -1090,6 +1099,66 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           break;
         }
 
+        case ggml_ir::OpCode::CAST: {
+          // Type cast with eager CPU conversion (ggml_cast doesn't support all combos).
+          // op_params: int32 target_type (TensorType enum)
+          struct ggml_tensor* src = srcs[0];
+
+          // Determine target ggml type from op_params.
+          int32_t target_type_enum = 0;
+          if (t->op_params() && t->op_params()->size() >= 4) {
+            memcpy(&target_type_enum, t->op_params()->data(), 4);
+          }
+          ggml_type target_type = GGML_TYPE_F32;
+          switch (target_type_enum) {
+            case 0: target_type = GGML_TYPE_F32; break;
+            case 1: target_type = GGML_TYPE_F16; break;
+            case 2: target_type = GGML_TYPE_I64; break;
+            case 3: target_type = GGML_TYPE_I32; break;
+            default: target_type = GGML_TYPE_F32; break;
+          }
+
+          // If types match, just alias.
+          if (src->type == target_type) {
+            gt = src;
+            break;
+          }
+
+          // Create output tensor with target type.
+          gt = ggml_new_tensor(ctx, target_type, GGML_MAX_DIMS, src->ne);
+
+          // I64 → I32 conversion: check if source is an input (defer to execute).
+          if (src->type == GGML_TYPE_I64 && target_type == GGML_TYPE_I32) {
+            // Check if src is an input tensor (will have data at execute time).
+            bool is_input_src = false;
+            for (const auto& [idx, inp_tensor] : input_pairs) {
+              if (inp_tensor == src) {
+                is_input_src = true;
+                break;
+              }
+            }
+
+            if (is_input_src) {
+              // Defer conversion to execute() - record the pair.
+              deferred_i64_to_i32.emplace_back(src, gt);
+            } else {
+              // Constant source: convert now.
+              const size_t nelem = ggml_nelements(src);
+              const int64_t* src_data = static_cast<const int64_t*>(src->data);
+              int32_t* dst_data = static_cast<int32_t*>(gt->data);
+              for (size_t i = 0; i < nelem; ++i) {
+                dst_data[i] = static_cast<int32_t>(src_data[i]);
+              }
+            }
+            gt->op = GGML_OP_NONE;  // Treated as constant in compute graph.
+          } else {
+            // For other conversions, try ggml_cast (may fail at compute time
+            // if unsupported, but many combos like F32→F16 work).
+            gt = ggml_cast(ctx, src, target_type);
+          }
+          break;
+        }
+
         case ggml_ir::OpCode::LLAMA_ATTENTION: {
           // Fused llama.cpp attention. For initial bring-up, we rely on ggml_flash_attn_ext.
           // src_ids: [q, k, v, (optional) mask]
@@ -1167,6 +1236,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     handle->inputs.push_back(tensor);
   }
   handle->outputs = std::move(output_tensors);
+  handle->deferred_i64_to_i32 = std::move(deferred_i64_to_i32);
 
   // Allocate a separate context for compute
   size_t compute_size = ggml_graph_overhead() + 1024 * 1024;
@@ -1218,6 +1288,16 @@ Error GgmlBackendInterface::execute(
       // Default memcpy when storage types match.
       size_t nbytes = ggml_nbytes(gt);
       memcpy(gt->data, et_tensor.const_data_ptr(), nbytes);
+    }
+  }
+
+  // Run deferred I64→I32 casts (now that input data is available).
+  for (const auto& [src_i64, dst_i32] : handle->deferred_i64_to_i32) {
+    const size_t nelem = ggml_nelements(src_i64);
+    const int64_t* src_data = static_cast<const int64_t*>(src_i64->data);
+    int32_t* dst_data = static_cast<int32_t*>(dst_i32->data);
+    for (size_t i = 0; i < nelem; ++i) {
+      dst_data[i] = static_cast<int32_t>(src_data[i]);
     }
   }
 
