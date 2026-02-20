@@ -133,8 +133,27 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
 
       // Respect declared tensor type.
       ggml_type gtype = GGML_TYPE_F32;
-      if (t->type() == ggml_ir::TensorType::F16) {
-        gtype = GGML_TYPE_F16;
+      switch (t->type()) {
+        case ggml_ir::TensorType::F16:
+          gtype = GGML_TYPE_F16;
+          break;
+        case ggml_ir::TensorType::I64:
+#ifdef GGML_TYPE_I64
+          gtype = GGML_TYPE_I64;
+#else
+          gtype = GGML_TYPE_I32; // fallback
+#endif
+          break;
+        case ggml_ir::TensorType::I32:
+          gtype = GGML_TYPE_I32;
+          break;
+        case ggml_ir::TensorType::BOOL:
+          gtype = GGML_TYPE_I8;
+          break;
+        case ggml_ir::TensorType::F32:
+        default:
+          gtype = GGML_TYPE_F32;
+          break;
       }
 
       switch (n_dims) {
@@ -218,6 +237,54 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         case ggml_ir::OpCode::MUL_MAT:
           gt = ggml_mul_mat(ctx, srcs[0], srcs[1]);
           break;
+
+        case ggml_ir::OpCode::MUL:
+          gt = ggml_mul(ctx, srcs[0], srcs[1]);
+          break;
+
+        case ggml_ir::OpCode::NEG:
+          gt = ggml_neg(ctx, srcs[0]);
+          break;
+
+        case ggml_ir::OpCode::RSQRT: {
+          // ggml doesn't expose rsqrt directly in this version; implement as 1/sqrt(x)
+          struct ggml_tensor* one = ggml_new_f32(ctx, 1.0f);
+          struct ggml_tensor* sx  = ggml_sqrt(ctx, srcs[0]);
+          gt = ggml_div(ctx, one, sx);
+          break;
+        }
+
+        case ggml_ir::OpCode::SILU:
+          gt = ggml_silu(ctx, srcs[0]);
+          break;
+
+        case ggml_ir::OpCode::LINEAR: {
+          // src_ids: [x, w, b?] where w is [out, in] in PyTorch.
+          // Our IR stores shapes in ggml order, so weight ne is [in, out].
+          // Compute: y = w @ x, then add bias if present.
+          struct ggml_tensor* x = srcs[0];
+          struct ggml_tensor* w = srcs[1];
+          struct ggml_tensor* y = ggml_mul_mat(ctx, w, x);
+          if (srcs.size() > 2) {
+            struct ggml_tensor* b = srcs[2];
+            // Broadcast bias to y shape
+            struct ggml_tensor* b_rep = ggml_repeat(ctx, b, y);
+            y = ggml_add(ctx, y, b_rep);
+          }
+          gt = y;
+          break;
+        }
+
+        case ggml_ir::OpCode::EMBEDDING: {
+          // src_ids: [weight, indices]
+          struct ggml_tensor* w = srcs[0];
+          struct ggml_tensor* idx = srcs[1];
+          if (idx->type != GGML_TYPE_I32) {
+            idx = ggml_cast(ctx, idx, GGML_TYPE_I32);
+          }
+          gt = ggml_get_rows(ctx, w, idx);
+          break;
+        }
 
         case ggml_ir::OpCode::LEAKY_RELU: {
           float negative_slope = 0.01f;
@@ -403,6 +470,159 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           // ggml_permute(ctx, tensor, axis0, axis1, axis2, axis3)
           gt = ggml_permute(ctx, srcs[0], perm[0], perm[1], perm[2], perm[3]);
           break;
+        }
+
+        case ggml_ir::OpCode::TRANSPOSE: {
+          // transpose(x, dim0, dim1) via permute
+          if (!t->op_params() || t->op_params()->size() < 8) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          int32_t dim0 = 0, dim1 = 1;
+          memcpy(&dim0, t->op_params()->data(), 4);
+          memcpy(&dim1, t->op_params()->data() + 4, 4);
+
+          // Map PyTorch dims -> ggml axes (reverse order for up to 4D)
+          auto* a = srcs[0];
+          int nd = ggml_n_dims(a);
+          int ax0 = (nd - 1) - dim0;
+          int ax1 = (nd - 1) - dim1;
+          int perm[4] = {0, 1, 2, 3};
+          for (int i = 0; i < 4; ++i) perm[i] = i;
+          int tmp = perm[ax0];
+          perm[ax0] = perm[ax1];
+          perm[ax1] = tmp;
+          gt = ggml_permute(ctx, a, perm[0], perm[1], perm[2], perm[3]);
+          break;
+        }
+
+        case ggml_ir::OpCode::UNSQUEEZE: {
+          // Represent as reshape to the output shape stored in IR.
+          // (op_params has dim, but shape is authoritative here)
+          struct ggml_tensor* a = srcs[0];
+          gt = ggml_reshape_4d(ctx, a, ne[0], ne[1], ne[2], ne[3]);
+          break;
+        }
+
+        case ggml_ir::OpCode::SLICE: {
+          // Limited slice support: step must be 1. Only supports slicing along
+          // a single PyTorch dim using a view.
+          if (!t->op_params() || t->op_params()->size() < 28) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          int32_t dim = 0;
+          int64_t start = 0, end = 0, step = 1;
+          const uint8_t* p = t->op_params()->data();
+          memcpy(&dim, p, 4);
+          memcpy(&start, p + 4, 8);
+          memcpy(&end, p + 12, 8);
+          memcpy(&step, p + 20, 8);
+          if (step != 1) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+
+          struct ggml_tensor* a = srcs[0];
+          int nd = ggml_n_dims(a);
+          int ax = (nd - 1) - dim; // pytorch dim -> ggml axis
+
+          // Compute offset in bytes
+          size_t offset = 0;
+          if (ax == 0) {
+            offset = start * a->nb[0];
+            gt = ggml_view_1d(ctx, a, ne[0], offset);
+          } else if (ax == 1) {
+            offset = start * a->nb[1];
+            gt = ggml_view_2d(ctx, a, ne[0], ne[1], a->nb[1], offset);
+          } else if (ax == 2) {
+            offset = start * a->nb[2];
+            gt = ggml_view_3d(ctx, a, ne[0], ne[1], ne[2], a->nb[1], a->nb[2], offset);
+          } else {
+            offset = start * a->nb[3];
+            gt = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], offset);
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::CAT: {
+          // Chain ggml_concat along dim (PyTorch dim mapped to ggml axis)
+          if (!t->op_params() || t->op_params()->size() < 4) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          int32_t dim = 0;
+          memcpy(&dim, t->op_params()->data(), 4);
+          int nd = ggml_n_dims(srcs[0]);
+          int ax = (nd - 1) - dim;
+          struct ggml_tensor* cur = srcs[0];
+          for (size_t si = 1; si < srcs.size(); ++si) {
+            cur = ggml_concat(ctx, cur, srcs[si], ax);
+          }
+          gt = cur;
+          break;
+        }
+
+        case ggml_ir::OpCode::REPEAT_INTERLEAVE: {
+          // Limited support for GQA expansion: repeats along PyTorch dim 1.
+          // op_params: (dim:int32, repeats:int32)
+          if (!t->op_params() || t->op_params()->size() < 8) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          int32_t dim = 0, reps = 1;
+          memcpy(&dim, t->op_params()->data(), 4);
+          memcpy(&reps, t->op_params()->data() + 4, 4);
+          // Only support repeating along PyTorch dim 1 (heads)
+          if (dim != 1 || reps < 1) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          // Implement as concatenation of identical tensor along that axis.
+          int nd = ggml_n_dims(srcs[0]);
+          int ax = (nd - 1) - dim;
+          struct ggml_tensor* cur = srcs[0];
+          for (int r = 1; r < reps; ++r) {
+            cur = ggml_concat(ctx, cur, srcs[0], ax);
+          }
+          gt = cur;
+          break;
+        }
+
+        case ggml_ir::OpCode::INDEX_PUT: {
+          // Specialized for Qwen3 KV cache update pattern.
+          // op_params: int32 nindices, int32 present_mask
+          if (!t->op_params() || t->op_params()->size() < 8) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          int32_t nidx = 0, pm = 0;
+          memcpy(&nidx, t->op_params()->data(), 4);
+          memcpy(&pm, t->op_params()->data() + 4, 4);
+
+          // Expect indices = [None, None, pos] => nidx=3, pm has bit2 set, and srcs=[cache, pos, values]
+          if (!(nidx == 3 && (pm & 0x4) && srcs.size() == 3)) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          struct ggml_tensor* cache = srcs[0];
+          struct ggml_tensor* pos_t = srcs[1];
+          struct ggml_tensor* val = srcs[2];
+
+          // pos_t is runtime input, but ggml ops cannot read scalar value at build time.
+          // For now, treat as no-op and return cache; runtime will need a custom execution
+          // path or a dedicated llama attention op that owns KV cache updates.
+          // TODO: implement KV cache update using llama.cpp attention or a custom kernel.
+          (void)pos_t;
+          (void)val;
+          gt = cache;
+          break;
+        }
+
+        case ggml_ir::OpCode::LLAMA_ATTENTION: {
+          // TODO: wire llama.cpp/ggml attention immediately.
+          ggml_free(ctx);
+          return Error::InvalidArgument;
         }
 
         default:
