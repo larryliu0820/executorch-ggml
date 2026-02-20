@@ -12,6 +12,8 @@ from executorch.exir.backend.partitioner import (
 )
 from executorch.exir.backend.utils import tag_constant_data
 
+from torch.fx.passes.utils.fuser_utils import validate_partition
+
 
 # ATen ops that we support in the ggml backend.
 #
@@ -152,8 +154,14 @@ class GgmlPartitioner(Partitioner):
             root = find(node)
             groups.setdefault(root, []).append(node)
 
-        for idx, (_, group_nodes) in enumerate(groups.items()):
-            tag = f"ggml_partition_{idx}"
+        part_idx = 0
+        for _, group_nodes in groups.items():
+            # Skip invalid partitions (cycles / not a valid cut)
+            if not validate_partition(group_nodes):
+                continue
+
+            tag = f"ggml_partition_{part_idx}"
+            part_idx += 1
             for node in group_nodes:
                 node.meta["delegation_tag"] = tag
             partition_tags[tag] = self.delegation_spec
