@@ -12,6 +12,11 @@ from __future__ import annotations
 
 # Best-effort native backend registration
 try:
+    # Ensure ExecuTorch portable runtime pybindings are loaded first so that
+    # symbols needed by our backend module (linked with -undefined dynamic_lookup)
+    # are present in the process.
+    from executorch.extension.pybindings import _portable_lib  # noqa: F401
+
     # This module is produced by the CMake target `executorch_ggml_backend_py`.
     # Import side-effect: registers backend via static init.
     from . import _ggml_backend as _native_backend  # noqa: F401
