@@ -73,15 +73,38 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
   const int n_threads = fb_graph->n_threads();
 
   // Calculate memory needed for ggml context.
-  // Constants are loaded from NamedDataMap into ggml tensors; the memory lives
-  // inside the ggml context, so we size based on tensor count with headroom.
+  // Sum up actual constant tensor sizes from the IR so we allocate exactly
+  // what is needed, plus a fixed overhead for graph bookkeeping.
   size_t constant_data_size = 0;
+  for (int i = 0; i < n_tensors; ++i) {
+    const auto* t = fb_tensors->Get(i);
+    // Only leaf tensors with data_key hold constant data in the ggml context.
+    if (static_cast<ggml_ir::OpCode>(t->op()) != ggml_ir::OpCode::NONE) continue;
+    if (!t->data_key() || std::strlen(t->data_key()->c_str()) == 0) continue;
+
+    // Compute byte size: product of ne[] dims × element size for the type.
+    size_t n_elems = 1;
+    if (t->ne()) {
+      for (size_t d = 0; d < t->ne()->size(); ++d) {
+        n_elems *= static_cast<size_t>(t->ne()->Get(d));
+      }
+    }
+    size_t elem_size = 4; // default F32
+    switch (static_cast<ggml_ir::TensorType>(t->type())) {
+      case ggml_ir::TensorType::F16:  elem_size = 2; break;
+      case ggml_ir::TensorType::I32:  elem_size = 4; break;
+      case ggml_ir::TensorType::I64:  elem_size = 8; break;
+      case ggml_ir::TensorType::BOOL: elem_size = 4; break; // stored as I32
+      default:                        elem_size = 4; break;
+    }
+    constant_data_size += n_elems * elem_size;
+  }
 
   size_t ctx_size =
       static_cast<size_t>(n_tensors) * ggml_tensor_overhead() +
       constant_data_size +
       ggml_graph_overhead() +
-      512 * 1024 * 1024;  // headroom (MV2 needs a lot of ggml objects)
+      256 * 1024 * 1024;  // headroom for intermediate op tensors and graph nodes
 
   struct ggml_init_params params = {
       /* .mem_size   = */ ctx_size,
@@ -148,7 +171,9 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           gtype = GGML_TYPE_I32;
           break;
         case ggml_ir::TensorType::BOOL:
-          gtype = GGML_TYPE_I8;
+          // Represent bool tensors as I32 in ggml to avoid unsupported ops on I8
+          // (e.g. get_rows has limited support for I8).
+          gtype = GGML_TYPE_I32;
           break;
         case ggml_ir::TensorType::F32:
         default:
@@ -294,6 +319,41 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
               return nullptr;
             };
 
+            auto try_permute_to_match = [&](struct ggml_tensor * src,
+                                           struct ggml_tensor * dst) -> struct ggml_tensor * {
+              // If src and dst have the same multiset of extents, try a few permutes.
+              int64_t aa[4] = {dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]};
+              int64_t bb[4] = {src->ne[0], src->ne[1], src->ne[2], src->ne[3]};
+              for (int i = 0; i < 4; ++i) {
+                for (int j = i + 1; j < 4; ++j) {
+                  if (aa[j] < aa[i]) { auto t = aa[i]; aa[i] = aa[j]; aa[j] = t; }
+                  if (bb[j] < bb[i]) { auto t = bb[i]; bb[i] = bb[j]; bb[j] = t; }
+                }
+              }
+              for (int i = 0; i < 4; ++i) {
+                if (aa[i] != bb[i]) return nullptr;
+              }
+
+              const int perms[][4] = {
+                {0,1,2,3},
+                {3,1,2,0},
+                {0,2,1,3},
+                {1,0,2,3},
+                {2,1,0,3},
+                {1,2,3,0},
+                {2,3,1,0},
+                {3,2,1,0},
+              };
+              for (const auto & p : perms) {
+                struct ggml_tensor * t = ggml_permute(ctx, src, p[0], p[1], p[2], p[3]);
+                t = ggml_cont(ctx, t);
+                if (ggml_are_same_shape(t, dst)) {
+                  return t;
+                }
+              }
+              return nullptr;
+            };
+
             if (ggml_can_repeat(b, a)) {
               b = ggml_repeat(ctx, b, a);
             } else if (ggml_can_repeat(a, b)) {
@@ -304,6 +364,10 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
                 b = bb;
               } else if (auto * aa = try_repeat_1d_to_match(a, b)) {
                 a = aa;
+              } else if (auto * bp = try_permute_to_match(b, a)) {
+                b = bp;
+              } else if (auto * ap = try_permute_to_match(a, b)) {
+                a = ap;
               } else {
                 fprintf(stderr,
                         "[executorch-ggml] ADD shape mismatch not broadcastable: a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
@@ -720,6 +784,10 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           if (idx->type != GGML_TYPE_I32) {
             idx = ggml_cast(ctx, idx, GGML_TYPE_I32);
           }
+          // ggml_get_rows supports src0 types F32/I32/F16/... but not I8.
+          if (x->type == GGML_TYPE_I8) {
+            x = ggml_cast(ctx, x, GGML_TYPE_I32);
+          }
           // ggml_get_rows selects rows by indices.
           gt = ggml_get_rows(ctx, x, idx);
           break;
@@ -805,8 +873,24 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           if (k->type == GGML_TYPE_F32) k = ggml_cast(ctx, k, GGML_TYPE_F16);
           if (v->type == GGML_TYPE_F32) v = ggml_cast(ctx, v, GGML_TYPE_F16);
 
-          // For now pass mask=nullptr (assume causal handled internally / or mask not required).
+          // Optional attention mask.  ggml_flash_attn_ext requires it to be:
+          //   - F16 (the CPU kernel reads it as additive logit bias in FP16)
+          //   - contiguous
+          // The Python lowering stores the causal mask as F16 (True→0.0, False→-inf)
+          // and aten.index.Tensor selects the right row via ggml_get_rows, giving
+          // shape [kv_seq_len, 1, 1, 1] in ggml order.
           struct ggml_tensor* mask = nullptr;
+          if (srcs.size() > 3 && srcs[3] != nullptr) {
+            mask = srcs[3];
+            // Ensure F16 (bool mask should already be converted at store time, but guard).
+            if (mask->type != GGML_TYPE_F16) {
+              mask = ggml_cast(ctx, mask, GGML_TYPE_F16);
+            }
+            // Ensure contiguous (get_rows result may not be contiguous).
+            if (!ggml_is_contiguous(mask)) {
+              mask = ggml_cont(ctx, mask);
+            }
+          }
 
           // scale = 1/sqrt(head_dim). head_dim is ne0 in ggml layout when tensors are [D, T, H, B]
           float scale = 1.0f;
@@ -884,8 +968,22 @@ Error GgmlBackendInterface::execute(
       const float* src = static_cast<const float*>(et_tensor.const_data_ptr());
       ggml_fp16_t* dst = static_cast<ggml_fp16_t*>(gt->data);
       ggml_fp32_to_fp16_row(src, dst, (int64_t) nelem);
+    } else if (gt->type == GGML_TYPE_I32 && et_tensor.scalar_type() == executorch::aten::ScalarType::Bool) {
+      // Avoid over-reading bool buffers when our ggml tensor stores masks as I32.
+      const bool* src = static_cast<const bool*>(et_tensor.const_data_ptr());
+      int32_t* dst = static_cast<int32_t*>(gt->data);
+      for (size_t j = 0; j < nelem; ++j) {
+        dst[j] = src[j] ? 1 : 0;
+      }
+    } else if (gt->type == GGML_TYPE_I32 && et_tensor.scalar_type() == executorch::aten::ScalarType::Long) {
+      // Common for start_pos etc.
+      const int64_t* src = static_cast<const int64_t*>(et_tensor.const_data_ptr());
+      int32_t* dst = static_cast<int32_t*>(gt->data);
+      for (size_t j = 0; j < nelem; ++j) {
+        dst[j] = (int32_t) src[j];
+      }
     } else {
-      // Normal path for MV2: runtime inputs are fp32.
+      // Default memcpy when storage types match.
       size_t nbytes = ggml_nbytes(gt);
       memcpy(gt->data, et_tensor.const_data_ptr(), nbytes);
     }
