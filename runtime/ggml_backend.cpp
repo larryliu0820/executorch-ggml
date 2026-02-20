@@ -262,6 +262,8 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
                   p0 = 1; p1 = 2; p2 = 3; p3 = 0;
                 }
                 s4 = ggml_permute(ctx, s4, p0, p1, p2, p3);
+                // Make the view contiguous to satisfy ggml_can_repeat in some cases.
+                s4 = ggml_cont(ctx, s4);
                 if (ggml_can_repeat(s4, big)) {
                   return ggml_repeat(ctx, s4, big);
                 }
