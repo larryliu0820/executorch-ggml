@@ -589,6 +589,31 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           break;
         }
 
+        case ggml_ir::OpCode::INDEX: {
+          // index(x, indices) along a single dim (currently dim=0 in lowering)
+          // src_ids: [x, indices]
+          // op_params: int32 dim
+          if (!t->op_params() || t->op_params()->size() < 4) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          int32_t dim = 0;
+          memcpy(&dim, t->op_params()->data(), 4);
+          if (dim != 0) {
+            // Only dim=0 supported for now
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          struct ggml_tensor* x = srcs[0];
+          struct ggml_tensor* idx = srcs[1];
+          if (idx->type != GGML_TYPE_I32) {
+            idx = ggml_cast(ctx, idx, GGML_TYPE_I32);
+          }
+          // ggml_get_rows selects rows by indices.
+          gt = ggml_get_rows(ctx, x, idx);
+          break;
+        }
+
         case ggml_ir::OpCode::INDEX_PUT: {
           // Implement a restricted index_put via ggml_set_rows.
           // This covers the Qwen3 KV-cache update pattern, where the update is along
