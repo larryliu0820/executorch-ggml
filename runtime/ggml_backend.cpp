@@ -271,7 +271,16 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             // For PyTorch linear, bias is typically 1D [out]. In ggml order that is ne0=out.
             // Make it at least 2D so ggml_repeat can broadcast along remaining dims.
             if (ggml_n_dims(b) == 1) {
-              b = ggml_reshape_2d(ctx, b, b->ne[0], 1);
+              // Prefer a 4D shape to be safely repeatable against 2D/3D/4D outputs.
+              b = ggml_reshape_4d(ctx, b, b->ne[0], 1, 1, 1);
+            }
+            if (!ggml_can_repeat(b, y)) {
+              fprintf(stderr,
+                      "[executorch-ggml] LINEAR bias not repeatable: b=(%lld,%lld,%lld,%lld) y=(%lld,%lld,%lld,%lld)\n",
+                      (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3],
+                      (long long) y->ne[0], (long long) y->ne[1], (long long) y->ne[2], (long long) y->ne[3]);
+              ggml_free(ctx);
+              return Error::InvalidArgument;
             }
             struct ggml_tensor* b_rep = ggml_repeat(ctx, b, y);
             y = ggml_add(ctx, y, b_rep);
