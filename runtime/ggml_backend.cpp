@@ -327,6 +327,10 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           gt = ggml_mul(ctx, srcs[0], srcs[1]);
           break;
 
+        case ggml_ir::OpCode::REPEAT:
+          gt = ggml_repeat(ctx, srcs[0], srcs[1]);
+          break;
+
         case ggml_ir::OpCode::NEG:
           gt = ggml_neg(ctx, srcs[0]);
           break;

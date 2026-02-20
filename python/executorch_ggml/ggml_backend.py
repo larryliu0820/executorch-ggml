@@ -34,6 +34,7 @@ from executorch_ggml.serialize import (
     OP_REPEAT_INTERLEAVE,
     OP_INDEX,
     OP_INDEX_PUT,
+    OP_REPEAT,
     OP_LLAMA_ATTENTION,
     # Types
     TYPE_F32,
@@ -793,22 +794,33 @@ class GgmlBackend(BackendDetails):
                     node_to_id[node] = tid
 
                 elif "aten.expand.default" in target_str or "aten.expand_copy.default" in target_str:
-                    # expand is broadcast view. We lower it as a VIEW to the
-                    # resulting shape from meta.
+                    # expand is a broadcast. Lower as ggml_repeat(x, like).
                     src_node = node.args[0]
                     src_id = node_to_id[src_node]
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
                     out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    # Create a shape-only "like" tensor.
+                    like_id = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=like_id,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_NONE,
+                            is_input=False,
+                        )
+                    )
+
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
                             tensor_type=_torch_dtype_to_ir_type(out_dtype),
                             ne=_pytorch_shape_to_ggml_ne(shape),
-                            op=OP_VIEW,
-                            src_ids=[src_id],
-                            op_params=pack_view_params(shape),
+                            op=OP_REPEAT,
+                            src_ids=[src_id, like_id],
                         )
                     )
                     node_to_id[node] = tid

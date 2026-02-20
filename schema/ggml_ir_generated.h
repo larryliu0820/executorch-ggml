@@ -45,12 +45,13 @@ enum class OpCode : int32_t {
   REPEAT_INTERLEAVE = 43,
   INDEX = 44,
   INDEX_PUT = 45,
+  REPEAT = 46,
   LLAMA_ATTENTION = 60,
   MIN = NONE,
   MAX = LLAMA_ATTENTION
 };
 
-inline const OpCode (&EnumValuesOpCode())[24] {
+inline const OpCode (&EnumValuesOpCode())[25] {
   static const OpCode values[] = {
     OpCode::NONE,
     OpCode::ADD,
@@ -75,6 +76,7 @@ inline const OpCode (&EnumValuesOpCode())[24] {
     OpCode::REPEAT_INTERLEAVE,
     OpCode::INDEX,
     OpCode::INDEX_PUT,
+    OpCode::REPEAT,
     OpCode::LLAMA_ATTENTION
   };
   return values;
@@ -128,7 +130,7 @@ inline const char * const *EnumNamesOpCode() {
     "REPEAT_INTERLEAVE",
     "INDEX",
     "INDEX_PUT",
-    "",
+    "REPEAT",
     "",
     "",
     "",

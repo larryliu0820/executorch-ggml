@@ -40,6 +40,7 @@ enum OpCode : int32 {
     REPEAT_INTERLEAVE = 43, // src_ids: [x] op_params: int32 dim, int32 repeats
     INDEX = 44,          // src_ids: [x, indices] op_params: int32 dim
     INDEX_PUT = 45,      // src_ids: [x, indices, values] op_params: int32 dim
+    REPEAT = 46,         // src_ids: [x, like] (ggml_repeat)
 
     // Attention (fused llama.cpp/ggml path)
     LLAMA_ATTENTION = 60 // src_ids: TBD; op_params: model-specific (see runtime)

@@ -48,6 +48,7 @@ OP_CAT = 42
 OP_REPEAT_INTERLEAVE = 43
 OP_INDEX = 44
 OP_INDEX_PUT = 45
+OP_REPEAT = 46
 
 # Fused attention (llama.cpp/ggml)
 OP_LLAMA_ATTENTION = 60
