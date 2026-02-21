@@ -853,6 +853,9 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           size_t offset = static_cast<size_t>(start) * a->nb[ax];
           gt = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3],
                             a->nb[1], a->nb[2], a->nb[3], offset);
+          // Slicing the innermost axis produces a non-contiguous view;
+          // make contiguous so downstream ops and output copy work.
+          gt = ggml_cont(ctx, gt);
           break;
         }
 
