@@ -25,7 +25,9 @@ _SUPPORTED_OP_NAMES = {
     "aten.linear.default",
     "aten.silu.default",
     "aten.mul.Tensor",
+    "aten.mul.Scalar",
     "aten.add.Tensor",
+    "aten.sub.Tensor",
     "aten.neg.default",
     "aten.rsqrt.default",
     "aten.mean.dim",
@@ -51,6 +53,21 @@ _SUPPORTED_OP_NAMES = {
     "aten.expand_copy.default",
     "aten.scalar_tensor.default",
     "aten._assert_tensor_metadata.default",
+    "aten.full_like.default",
+
+    # RoPE ops
+    "aten.bmm.default",
+    "aten.cos.default",
+    "aten.sin.default",
+
+    # RMSNorm / activation ops
+    "aten.pow.Tensor_Scalar",
+    "aten.sigmoid.default",
+    "aten._softmax.default",
+    "aten.where.self",
+
+    # Layout/dtype ops (treat as no-op or identity)
+    "dim_order_ops._to_dim_order_copy.default",
 
     # Legacy linear demo ops
     "aten.t.default",
@@ -132,15 +149,42 @@ def _is_supported_node(node) -> bool:
             return False
         return True
 
-    # Keep int64-producing ops on the host side by default.
-    # Exception: handled above for aten.index.Tensor.
+    # For int64 outputs, only allow reshape/view-like ops that don't do compute.
+    # This reduces graph fragmentation by keeping index shuffling in the delegate.
     if out_dtype == torch.int64:
-        return False
+        # These ops just reshape/slice without compute - safe for int64
+        int64_safe_ops = {
+            "aten.view", "aten.view_copy", "aten._unsafe_view",
+            "aten.reshape", "aten.unsqueeze", "aten.unsqueeze_copy",
+            "aten.slice", "aten.slice_copy", "aten.select",
+            "aten.permute", "aten.permute_copy", "aten.transpose",
+            "aten.expand", "aten.expand_copy",
+            "aten.cat",  # cat of int64 tensors
+            "aten.index",  # already handled above but include for clarity
+            "aten.alias", "aten.alias_copy",
+            "dim_order_ops._clone_dim_order",
+        }
+        if not any(op in target_str for op in int64_safe_ops):
+            return False
+
     # aten.add.Tensor: ggml only supports F32/F16 ADD, not integer ADDs.
     if "aten.add.Tensor" in target_str:
         dtype = out_dtype
         if dtype is not None and dtype not in (torch.float32, torch.float16, torch.bfloat16):
             return False
+
+    # aten.sub.Tensor: ggml only supports F32/F16 SUB, not integer SUBs.
+    if "aten.sub.Tensor" in target_str:
+        dtype = out_dtype
+        if dtype is not None and dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            return False
+
+    # aten.mul.Tensor: ggml only supports F32/F16 MUL, not integer MULs.
+    if "aten.mul.Tensor" in target_str:
+        dtype = out_dtype
+        if dtype is not None and dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            return False
+
     return True
 
 BACKEND_ID = "GgmlBackend"

@@ -534,9 +534,13 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
 
         case ggml_ir::OpCode::RSQRT: {
           // ggml doesn't expose rsqrt directly in this version; implement as 1/sqrt(x)
-          struct ggml_tensor* one = ggml_new_f32(ctx, 1.0f);
+          // ggml_div(a, b) requires b to be repeatable to a's shape.
+          // Since we want 1/sqrt(x), we need a to have x's shape and be filled with 1.0.
           struct ggml_tensor* sx  = ggml_sqrt(ctx, srcs[0]);
-          gt = ggml_div(ctx, one, sx);
+          struct ggml_tensor* one = ggml_new_f32(ctx, 1.0f);
+          // Repeat the scalar 1.0 to match sqrt's shape
+          struct ggml_tensor* one_rep = ggml_repeat(ctx, one, sx);
+          gt = ggml_div(ctx, one_rep, sx);
           break;
         }
 
@@ -1195,6 +1199,133 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
 
           gt = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
           ggml_flash_attn_ext_set_prec(gt, GGML_PREC_F32);
+          break;
+        }
+
+        case ggml_ir::OpCode::SUB:
+          gt = ggml_sub(ctx, srcs[0], srcs[1]);
+          break;
+
+        case ggml_ir::OpCode::MUL_SCALAR: {
+          // mul(x, scalar)
+          // op_params: float32 scalar
+          float scalar = 1.0f;
+          if (t->op_params() && t->op_params()->size() >= 4) {
+            memcpy(&scalar, t->op_params()->data(), sizeof(float));
+          }
+          gt = ggml_scale(ctx, srcs[0], scalar);
+          break;
+        }
+
+        case ggml_ir::OpCode::POW: {
+          // pow(x, exponent) where exponent is a scalar
+          // For exponent=2, use ggml_sqr. Otherwise fall back to custom op or approximation.
+          // op_params: float32 exponent
+          float exponent = 2.0f;
+          if (t->op_params() && t->op_params()->size() >= 4) {
+            memcpy(&exponent, t->op_params()->data(), sizeof(float));
+          }
+          if (exponent == 2.0f) {
+            gt = ggml_sqr(ctx, srcs[0]);
+          } else if (exponent == 0.5f) {
+            gt = ggml_sqrt(ctx, srcs[0]);
+          } else {
+            // General power: x^n = exp(n * log(x))
+            // This won't work for negative x, but for RMSNorm (x^2) we use sqr above.
+            struct ggml_tensor* log_x = ggml_log(ctx, srcs[0]);
+            struct ggml_tensor* scaled = ggml_scale(ctx, log_x, exponent);
+            gt = ggml_exp(ctx, scaled);
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::COS:
+          gt = ggml_cos(ctx, srcs[0]);
+          break;
+
+        case ggml_ir::OpCode::SIN:
+          gt = ggml_sin(ctx, srcs[0]);
+          break;
+
+        case ggml_ir::OpCode::BMM: {
+          // Batch matrix multiply: bmm(a, b) where a is [B, M, K] and b is [B, K, N]
+          // Result is [B, M, N].
+          // In ggml order: a is [K, M, B], b is [N, K, B], result is [N, M, B].
+          // Use ggml_mul_mat which supports batch dimensions.
+          struct ggml_tensor* a = srcs[0];
+          struct ggml_tensor* b = srcs[1];
+          gt = ggml_mul_mat(ctx, b, a);
+          break;
+        }
+
+        case ggml_ir::OpCode::SIGMOID:
+          gt = ggml_sigmoid(ctx, srcs[0]);
+          break;
+
+        case ggml_ir::OpCode::SOFTMAX: {
+          // softmax(x, dim)
+          // op_params: int32 dim, int32 ndim
+          // ggml_soft_max operates on the innermost dimension (ne0).
+          // If dim != -1 in PyTorch, we need to permute first.
+          int32_t dim = -1, ndim = 4;
+          if (t->op_params() && t->op_params()->size() >= 8) {
+            memcpy(&dim, t->op_params()->data(), 4);
+            memcpy(&ndim, t->op_params()->data() + 4, 4);
+          }
+
+          // Normalize negative dim
+          if (dim < 0) dim = ndim + dim;
+
+          // ggml axis = (ndim - 1) - pytorch_dim
+          int ggml_axis = (ndim - 1) - dim;
+
+          struct ggml_tensor* x = srcs[0];
+          if (ggml_axis == 0) {
+            // Softmax on innermost dim - direct
+            gt = ggml_soft_max(ctx, x);
+          } else {
+            // Need to permute so that the softmax dim becomes axis 0
+            // Create permutation that swaps axis 0 with ggml_axis
+            int perm[4] = {0, 1, 2, 3};
+            perm[0] = ggml_axis;
+            perm[ggml_axis] = 0;
+            x = ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3]);
+            x = ggml_cont(ctx, x);
+            x = ggml_soft_max(ctx, x);
+            // Permute back
+            x = ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3]);
+            gt = ggml_cont(ctx, x);
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::WHERE: {
+          // where(cond, x, y) - select x where cond is true, y otherwise
+          // ggml doesn't have a direct where op, so we implement it as:
+          // result = cond * x + (1 - cond) * y
+          // But this requires cond to be float. For now, cast cond to float.
+          struct ggml_tensor* cond = srcs[0];
+          struct ggml_tensor* x = srcs[1];
+          struct ggml_tensor* y = srcs[2];
+
+          // Cast condition to float if needed
+          if (cond->type != GGML_TYPE_F32) {
+            cond = ggml_cast(ctx, cond, GGML_TYPE_F32);
+          }
+
+          // Ensure cond is broadcastable to x/y shape
+          if (!ggml_can_repeat(cond, x)) {
+            cond = ggml_repeat(ctx, cond, x);
+          }
+
+          // result = cond * x + (1 - cond) * y
+          struct ggml_tensor* one = ggml_new_f32(ctx, 1.0f);
+          struct ggml_tensor* one_rep = ggml_repeat(ctx, one, cond);
+          struct ggml_tensor* not_cond = ggml_sub(ctx, one_rep, cond);
+
+          struct ggml_tensor* x_part = ggml_mul(ctx, cond, x);
+          struct ggml_tensor* y_part = ggml_mul(ctx, not_cond, y);
+          gt = ggml_add(ctx, x_part, y_part);
           break;
         }
 

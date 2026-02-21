@@ -14,6 +14,20 @@ enum OpCode : int32 {
     MUL_MAT = 2,         // src_ids: [a, b]  (ggml_mul_mat)
     MUL = 10,            // src_ids: [a, b]
     NEG = 11,            // src_ids: [x]
+    SUB = 12,            // src_ids: [a, b]
+    MUL_SCALAR = 13,     // src_ids: [x] op_params: float32 scalar
+    POW = 14,            // src_ids: [x] op_params: float32 exponent
+
+    // Trigonometric
+    COS = 15,            // src_ids: [x]
+    SIN = 16,            // src_ids: [x]
+
+    // BMM (batch matmul)
+    BMM = 17,            // src_ids: [a, b]
+
+    // Activations
+    SIGMOID = 18,        // src_ids: [x]
+    SOFTMAX = 19,        // src_ids: [x] op_params: int32 dim, int32 ndim
 
     // NN ops / activations
     LINEAR = 20,         // src_ids: [x, w, b?]  (b optional)
@@ -43,6 +57,9 @@ enum OpCode : int32 {
     REPEAT = 46,         // src_ids: [x, like] (ggml_repeat)
     INDEX_MULTI = 47,    // src_ids: [x, idx0, idx1, ...] op_params: int32 ndims, int64 src_shape[ndims]
     CAST = 48,           // src_ids: [x] op_params: int32 target_type (TensorType enum)
+
+    // Conditional
+    WHERE = 50,          // src_ids: [cond, x, y]
 
     // Attention (fused llama.cpp/ggml path)
     LLAMA_ATTENTION = 60 // src_ids: TBD; op_params: model-specific (see runtime)

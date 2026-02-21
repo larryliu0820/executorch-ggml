@@ -22,6 +22,20 @@ OP_ADD = 1
 OP_MUL_MAT = 2
 OP_MUL = 10
 OP_NEG = 11
+OP_SUB = 12
+OP_MUL_SCALAR = 13
+OP_POW = 14
+
+# Trigonometric
+OP_COS = 15
+OP_SIN = 16
+
+# BMM (batch matmul)
+OP_BMM = 17
+
+# Activations
+OP_SIGMOID = 18
+OP_SOFTMAX = 19
 
 # NN
 OP_LEAKY_RELU = 3
@@ -51,6 +65,9 @@ OP_INDEX_PUT = 45
 OP_REPEAT = 46
 OP_INDEX_MULTI = 47  # Multi-index gather: x[idx0, idx1, ...] via linearized lookup
 OP_CAST = 48  # Type cast: src_ids=[x], op_params=int32 target_type (TensorType enum)
+
+# Conditional
+OP_WHERE = 50
 
 # Fused attention (llama.cpp/ggml)
 OP_LLAMA_ATTENTION = 60
@@ -363,3 +380,13 @@ def pack_cast_params(target_type: int) -> bytes:
     Layout: target_type (int32) - TensorType enum value.
     """
     return struct.pack("<i", target_type)
+
+
+def pack_softmax_params(dim: int, ndim: int) -> bytes:
+    """Pack softmax parameters: dim (int32), ndim (int32)."""
+    return struct.pack("<ii", dim, ndim)
+
+
+def pack_pow_params(exponent: float) -> bytes:
+    """Pack pow parameters: exponent (float32)."""
+    return struct.pack("<f", exponent)

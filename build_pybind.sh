@@ -35,6 +35,7 @@ clang++ -std=c++17 -O3 -DNDEBUG -arch arm64 -isysroot "$SDK" \
   -Wl,-rpath,"$R1" -Wl,-rpath,"$R2" -Wl,-rpath,"$R3" \
   $PYBIND_INCLUDES \
   -I"$ROOT_DIR/runtime" \
+  -I"$ROOT_DIR/schema" \
   -I"$ROOT_DIR/build" -I"$ROOT_DIR/build/.." \
   -I"/Volumes/larryliu/work/llama.cpp/ggml/include" \
   -I"$EXECUTORCH_REPO/.." -I"$EXECUTORCH_REPO" -I"$EXECUTORCH_REPO/include" \

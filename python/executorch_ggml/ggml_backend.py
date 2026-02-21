@@ -13,9 +13,18 @@ from executorch_ggml.serialize import (
     # OpCodes
     OP_NONE,
     OP_ADD,
+    OP_SUB,
     OP_MUL_MAT,
     OP_MUL,
+    OP_MUL_SCALAR,
     OP_NEG,
+    OP_POW,
+    OP_COS,
+    OP_SIN,
+    OP_BMM,
+    OP_SIGMOID,
+    OP_SOFTMAX,
+    OP_WHERE,
     OP_LINEAR,
     OP_EMBEDDING,
     OP_SILU,
@@ -62,6 +71,8 @@ from executorch_ggml.serialize import (
     pack_index_multi_params,
     pack_index_put_multi_params,
     pack_cast_params,
+    pack_softmax_params,
+    pack_pow_params,
     serialize_graph,
 )
 
@@ -1230,6 +1241,244 @@ class GgmlBackend(BackendDetails):
                         )
                     )
                     node_to_id[node] = tid
+
+                elif "aten.sub.Tensor" in target_str:
+                    # sub(x, y, alpha=1)
+                    x_node, y_node = node.args[0], node.args[1]
+                    x_id = node_to_id[x_node]
+                    y_id = node_to_id[y_node]
+
+                    fake_val = node.meta.get("val")
+                    out_shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(out_shape),
+                            op=OP_SUB,
+                            src_ids=[x_id, y_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.mul.Scalar" in target_str:
+                    # mul(x, scalar)
+                    src_node = node.args[0]
+                    scalar = float(node.args[1])
+                    src_id = node_to_id[src_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_MUL_SCALAR,
+                            src_ids=[src_id],
+                            op_params=pack_float(scalar),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.pow.Tensor_Scalar" in target_str:
+                    # pow(x, exponent)
+                    src_node = node.args[0]
+                    exponent = float(node.args[1])
+                    src_id = node_to_id[src_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_POW,
+                            src_ids=[src_id],
+                            op_params=pack_pow_params(exponent),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.cos.default" in target_str:
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_COS,
+                            src_ids=[src_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.sin.default" in target_str:
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_SIN,
+                            src_ids=[src_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.bmm.default" in target_str:
+                    # bmm(input, mat2) -> batch matrix multiply
+                    a_node, b_node = node.args[0], node.args[1]
+                    a_id = node_to_id[a_node]
+                    b_id = node_to_id[b_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_BMM,
+                            src_ids=[a_id, b_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.sigmoid.default" in target_str:
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_SIGMOID,
+                            src_ids=[src_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten._softmax.default" in target_str:
+                    # _softmax(x, dim, half_to_float)
+                    src_node = node.args[0]
+                    dim = int(node.args[1])
+                    src_id = node_to_id[src_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    ndim = len(shape)
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_SOFTMAX,
+                            src_ids=[src_id],
+                            op_params=pack_softmax_params(dim, ndim),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.where.self" in target_str:
+                    # where(condition, x, y)
+                    cond_node, x_node, y_node = node.args[0], node.args[1], node.args[2]
+                    cond_id = node_to_id[cond_node]
+                    x_id = node_to_id[x_node]
+                    y_id = node_to_id[y_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_WHERE,
+                            src_ids=[cond_id, x_id, y_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.full_like.default" in target_str:
+                    # full_like(input, fill_value, ...) - create tensor like input filled with fill_value
+                    # This is typically used to create constant tensors (e.g., -inf for masking).
+                    fill_value = float(node.args[1])
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    # Create a scalar constant and use MUL_SCALAR with a tensor of ones
+                    # Actually, simpler: create a VIEW of a scalar tensor.
+                    # For now, store the fill value as a named constant.
+                    import hashlib
+                    import numpy as np
+
+                    # Create numpy array with fill value
+                    numel = 1
+                    for d in shape:
+                        numel *= d
+                    const_data = np.full(numel, fill_value, dtype=np.float32)
+                    const_key = f"_full_like_{hashlib.sha256(const_data.tobytes()).hexdigest()[:16]}"
+
+                    data_store.add(const_key, const_data.tobytes())
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_NONE,  # Constant
+                            data_key=const_key,
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "dim_order_ops._to_dim_order_copy.default" in target_str:
+                    # Treat as no-op / identity for ggml purposes
+                    src_node = node.args[0]
+                    node_to_id[node] = node_to_id[src_node]
 
                 else:
                     raise RuntimeError(
