@@ -18,12 +18,21 @@ from typing import Optional, Sequence
 
 import torch
 
+from executorch.exir.pass_base import PassResult
+
 
 @dataclass
 class BroadcastCanonicalizationPass:
     """Rewrite broadcasted `aten.add.Tensor` into explicit permute+expand."""
 
     enabled: bool = True
+
+    def __call__(self, graph_module: torch.fx.GraphModule) -> PassResult:
+        """Support use as a transform pass (GraphModule-level)."""
+        # For transform passes, we can't easily run the full rewrite
+        # because we need access to the ExportedProgram for op lookups.
+        # Return unchanged for now - the rewrite happens via run() at ep level
+        return PassResult(graph_module, False)
 
     def _find_edge_target(self, ep: torch.export.ExportedProgram, opname: str):
         # Reuse existing EdgeOpOverload object when possible.
@@ -125,7 +134,9 @@ class BroadcastCanonicalizationPass:
                 b_perm = g.call_function(get_perm_tgt(), args=(b, perm))
                 b_perm.meta["val"] = b.meta.get("val")  # best-effort
 
-                b_exp = g.call_function(get_expand_tgt(), args=(b_perm, out_shape, False))
+                b_exp = g.call_function(
+                    get_expand_tgt(), args=(b_perm, out_shape, False)
+                )
                 b_exp.meta["val"] = n.meta.get("val")  # best-effort
 
                 n.replace_input_with(b, b_exp)
