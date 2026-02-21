@@ -1291,14 +1291,12 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           break;
 
         case ggml_ir::OpCode::BMM: {
-          // Batch matrix multiply: bmm(a, b) where a is [B, M, K] and b is [B, K, N]
-          // Result is [B, M, N].
-          // In ggml order: a is [K, M, B], b is [N, K, B], result is [N, M, B].
-          // Use ggml_mul_mat which supports batch dimensions.
-          struct ggml_tensor* a = srcs[0];
-          struct ggml_tensor* b = srcs[1];
-          gt = ggml_mul_mat(ctx, b, a);
-          break;
+          // TODO: BMM implementation needs work - the tensor layout handling
+          // for batched matrix multiply is complex. For now, fall through to
+          // unsupported error so BMM ops stay on host.
+          fprintf(stderr, "[executorch-ggml] BMM op not yet implemented\n");
+          ggml_free(ctx);
+          return Error::NotSupported;
         }
 
         case ggml_ir::OpCode::SIGMOID:

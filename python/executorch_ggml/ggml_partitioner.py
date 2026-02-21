@@ -55,7 +55,7 @@ _SUPPORTED_OP_NAMES = {
     "aten._assert_tensor_metadata.default",
     "aten.full_like.default",
     # RoPE ops
-    "aten.bmm.default",
+    # "aten.bmm.default",  # TODO: BMM needs proper implementation
     "aten.cos.default",
     "aten.sin.default",
     # RMSNorm / activation ops
