@@ -73,8 +73,12 @@ class TestQwen3NoKvNumerical:
     def test_single_step_next_token_logits(self, qwen3_eager, exported_program):
         from executorch_ggml import GgmlPartitioner
         from executorch_ggml.edge_pipeline import to_edge_rewrite_and_lower
-        from executorch_ggml.passes.broadcast_pass import BroadcastCanonicalizationPass as BroadcastPass
-        from executorch.extension.pybindings.portable_lib import _load_for_executorch_from_buffer
+        from executorch_ggml.passes.broadcast_pass import (
+            BroadcastCanonicalizationPass as BroadcastPass,
+        )
+        from executorch.extension.pybindings.portable_lib import (
+            _load_for_executorch_from_buffer,
+        )
 
         # Prompt length 3, then compare logits for the last position (next-token scores).
         input_ids = torch.tensor([[151644, 151645, 151646]], dtype=torch.long)
@@ -115,6 +119,49 @@ class TestQwen3NoKvNumerical:
         # Keep thresholds loose while we stabilize no-KV correctness.
         assert cos > 0.70, f"Cosine similarity too low: {cos:.4f}"
         assert max_diff < 30.0, f"Max diff too large: {max_diff:.4f}"
+
+
+@pytest.mark.xfail(
+    reason="REPEAT broadcast issue: ggml cannot handle [1,16,1,512] + [1,512] broadcast"
+)
+class TestQwen3WithSDPAPreservation:
+    """Test Qwen3 with SDPA preserved (not decomposed).
+
+    This test is expected to fail due to REPEAT broadcast issues in ggml backend.
+    The model has ADD operations with incompatible broadcast shapes that ggml cannot handle.
+    """
+
+    def test_single_token_with_sdpa_preserved(self):
+        """Test 1-token forward with SDPA preserved."""
+        from executorch_ggml import GgmlPartitioner
+        from executorch_ggml.edge_pipeline import to_edge_rewrite_and_lower
+        from executorch_ggml.passes.replace_copy_ops_pass import ReplaceCopyOpsPass
+        from executorch.extension.pybindings.portable_lib import (
+            _load_for_executorch_from_buffer,
+        )
+        from executorch.exir import to_edge_transform_and_lower
+
+        ep = torch.export.load("/tmp/qwen3_0_6b_ggml_export/qwen3_0_6b.pt2")
+
+        # Use to_edge_transform_and_lower which preserves SDPA via ops_to_not_decompose
+        edge_mgr = to_edge_transform_and_lower(
+            ep,
+            partitioner=[GgmlPartitioner()],
+            transform_passes=[ReplaceCopyOpsPass()],
+        )
+
+        et_module = edge_mgr.to_executorch()
+        pte_model = _load_for_executorch_from_buffer(et_module.buffer)
+
+        # Single token input
+        input_ids = torch.tensor([[151644]], dtype=torch.long)
+        output = pte_model.forward((input_ids,))
+
+        # Should produce valid output
+        assert output[0].shape[0] == 1  # batch
+        assert output[0].shape[1] == 1  # seq_len
+        assert output[0].shape[2] > 0  # vocab_size
+        assert torch.isfinite(output[0]).all()
 
 
 if __name__ == "__main__":
