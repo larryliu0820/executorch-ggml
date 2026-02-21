@@ -512,7 +512,17 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             }
           }
 
-          gt = ggml_add(ctx, a, b);
+          // For int64 types, use custom element-wise add
+          if (a->type == GGML_TYPE_I64) {
+            gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I64, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+            const size_t nelem = ggml_nelements(gt);
+            const int64_t* a_data = static_cast<const int64_t*>(a->data);
+            const int64_t* b_data = static_cast<const int64_t*>(b->data);
+            int64_t* out_data = static_cast<int64_t*>(gt->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = a_data[i] + b_data[i];
+          } else {
+            gt = ggml_add(ctx, a, b);
+          }
           break;
         }
 
@@ -528,14 +538,20 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           struct ggml_tensor* a = srcs[0];
           struct ggml_tensor* b = srcs[1];
           if (!ggml_can_repeat(a, b)) {
-            fprintf(stderr,
-                    "[executorch-ggml] REPEAT shape not repeatable: a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
-                    (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
-                    (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
-            ggml_free(ctx);
-            return Error::InvalidArgument;
+            // Try swapping: repeat b to match a instead
+            if (ggml_can_repeat(b, a)) {
+              gt = ggml_repeat(ctx, b, a);
+            } else {
+              fprintf(stderr,
+                      "[executorch-ggml] REPEAT shape not repeatable: a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
+                      (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
+                      (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
+              ggml_free(ctx);
+              return Error::InvalidArgument;
+            }
+          } else {
+            gt = ggml_repeat(ctx, a, b);
           }
-          gt = ggml_repeat(ctx, a, b);
           break;
         }
 
@@ -1216,9 +1232,22 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           break;
         }
 
-        case ggml_ir::OpCode::SUB:
-          gt = ggml_sub(ctx, srcs[0], srcs[1]);
+        case ggml_ir::OpCode::SUB: {
+          struct ggml_tensor* a = srcs[0];
+          struct ggml_tensor* b = srcs[1];
+          // For int64 types, use custom element-wise sub
+          if (a->type == GGML_TYPE_I64) {
+            gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I64, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+            const size_t nelem = ggml_nelements(gt);
+            const int64_t* a_data = static_cast<const int64_t*>(a->data);
+            const int64_t* b_data = static_cast<const int64_t*>(b->data);
+            int64_t* out_data = static_cast<int64_t*>(gt->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = a_data[i] - b_data[i];
+          } else {
+            gt = ggml_sub(ctx, a, b);
+          }
           break;
+        }
 
         case ggml_ir::OpCode::MUL_SCALAR: {
           // mul(x, scalar)
@@ -1340,6 +1369,405 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           struct ggml_tensor* x_part = ggml_mul(ctx, cond, x);
           struct ggml_tensor* y_part = ggml_mul(ctx, not_cond, y);
           gt = ggml_add(ctx, x_part, y_part);
+          break;
+        }
+
+        case ggml_ir::OpCode::ARANGE: {
+          // arange(start, step) - generates [start, start+step, start+2*step, ...]
+          // op_params: float64 start, float64 step
+          double start = 0.0, step = 1.0;
+          if (t->op_params() && t->op_params()->size() >= 16) {
+            memcpy(&start, t->op_params()->data(), 8);
+            memcpy(&step, t->op_params()->data() + 8, 8);
+          }
+
+          // Determine output type and shape from IR
+          ggml_type out_type = GGML_TYPE_I64;
+          switch (t->type()) {
+            case ggml_ir::TensorType::F32: out_type = GGML_TYPE_F32; break;
+            case ggml_ir::TensorType::F16: out_type = GGML_TYPE_F16; break;
+            case ggml_ir::TensorType::I32: out_type = GGML_TYPE_I32; break;
+            case ggml_ir::TensorType::I64: out_type = GGML_TYPE_I64; break;
+            default: out_type = GGML_TYPE_I64; break;
+          }
+
+          gt = ggml_new_tensor_4d(ctx, out_type, ne[0], ne[1], ne[2], ne[3]);
+          const size_t nelem = ggml_nelements(gt);
+
+          // Fill with arange values
+          if (out_type == GGML_TYPE_I64) {
+            int64_t* data = static_cast<int64_t*>(gt->data);
+            for (size_t i = 0; i < nelem; ++i) {
+              data[i] = static_cast<int64_t>(start + i * step);
+            }
+          } else if (out_type == GGML_TYPE_I32) {
+            int32_t* data = static_cast<int32_t*>(gt->data);
+            for (size_t i = 0; i < nelem; ++i) {
+              data[i] = static_cast<int32_t>(start + i * step);
+            }
+          } else {
+            float* data = static_cast<float*>(gt->data);
+            for (size_t i = 0; i < nelem; ++i) {
+              data[i] = static_cast<float>(start + i * step);
+            }
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::FULL: {
+          // full(fill_value) - creates tensor filled with fill_value
+          // op_params: float64 fill_value
+          double fill_value = 0.0;
+          if (t->op_params() && t->op_params()->size() >= 8) {
+            memcpy(&fill_value, t->op_params()->data(), 8);
+          }
+
+          ggml_type out_type = GGML_TYPE_F32;
+          switch (t->type()) {
+            case ggml_ir::TensorType::F32: out_type = GGML_TYPE_F32; break;
+            case ggml_ir::TensorType::F16: out_type = GGML_TYPE_F16; break;
+            case ggml_ir::TensorType::I32: out_type = GGML_TYPE_I32; break;
+            case ggml_ir::TensorType::I64: out_type = GGML_TYPE_I64; break;
+            case ggml_ir::TensorType::BOOL: out_type = GGML_TYPE_I32; break;
+            default: out_type = GGML_TYPE_F32; break;
+          }
+
+          gt = ggml_new_tensor_4d(ctx, out_type, ne[0], ne[1], ne[2], ne[3]);
+          const size_t nelem = ggml_nelements(gt);
+
+          if (out_type == GGML_TYPE_I64) {
+            int64_t* data = static_cast<int64_t*>(gt->data);
+            int64_t v = static_cast<int64_t>(fill_value);
+            for (size_t i = 0; i < nelem; ++i) data[i] = v;
+          } else if (out_type == GGML_TYPE_I32) {
+            int32_t* data = static_cast<int32_t*>(gt->data);
+            int32_t v = static_cast<int32_t>(fill_value);
+            for (size_t i = 0; i < nelem; ++i) data[i] = v;
+          } else {
+            float* data = static_cast<float*>(gt->data);
+            float v = static_cast<float>(fill_value);
+            for (size_t i = 0; i < nelem; ++i) data[i] = v;
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::CUMSUM: {
+          // cumsum(x, dim) - cumulative sum along dimension
+          // op_params: int32 dim, int32 ndim
+          int32_t dim = 0, ndim = 4;
+          if (t->op_params() && t->op_params()->size() >= 8) {
+            memcpy(&dim, t->op_params()->data(), 4);
+            memcpy(&ndim, t->op_params()->data() + 4, 4);
+          }
+
+          struct ggml_tensor* src = srcs[0];
+          ggml_type out_type = src->type;
+
+          gt = ggml_new_tensor_4d(ctx, out_type, ne[0], ne[1], ne[2], ne[3]);
+
+          // Convert PyTorch dim to ggml axis
+          int ggml_axis = (ndim - 1) - dim;
+          const size_t nelem = ggml_nelements(gt);
+
+          // Simple cumsum implementation for I64 type
+          if (out_type == GGML_TYPE_I64) {
+            const int64_t* in_data = static_cast<const int64_t*>(src->data);
+            int64_t* out_data = static_cast<int64_t*>(gt->data);
+
+            // For now, handle axis 0 (innermost in ggml) specially
+            int64_t stride = 1;
+            for (int ax = 0; ax < ggml_axis; ++ax) stride *= src->ne[ax];
+            int64_t dim_size = src->ne[ggml_axis];
+            int64_t outer_size = nelem / (dim_size * stride);
+
+            for (int64_t outer = 0; outer < outer_size; ++outer) {
+              for (int64_t inner = 0; inner < stride; ++inner) {
+                int64_t cumsum = 0;
+                for (int64_t d = 0; d < dim_size; ++d) {
+                  int64_t idx = outer * dim_size * stride + d * stride + inner;
+                  cumsum += in_data[idx];
+                  out_data[idx] = cumsum;
+                }
+              }
+            }
+          } else {
+            // F32 fallback
+            const float* in_data = static_cast<const float*>(src->data);
+            float* out_data = static_cast<float*>(gt->data);
+
+            int64_t stride = 1;
+            for (int ax = 0; ax < ggml_axis; ++ax) stride *= src->ne[ax];
+            int64_t dim_size = src->ne[ggml_axis];
+            int64_t outer_size = nelem / (dim_size * stride);
+
+            for (int64_t outer = 0; outer < outer_size; ++outer) {
+              for (int64_t inner = 0; inner < stride; ++inner) {
+                float cumsum = 0.0f;
+                for (int64_t d = 0; d < dim_size; ++d) {
+                  int64_t idx = outer * dim_size * stride + d * stride + inner;
+                  cumsum += in_data[idx];
+                  out_data[idx] = cumsum;
+                }
+              }
+            }
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::EQ: {
+          // eq(a, b) or eq(a, scalar)
+          // op_params: float64 scalar, int32 is_scalar
+          double scalar = 0.0;
+          int32_t is_scalar = 0;
+          if (t->op_params() && t->op_params()->size() >= 12) {
+            memcpy(&scalar, t->op_params()->data(), 8);
+            memcpy(&is_scalar, t->op_params()->data() + 8, 4);
+          }
+
+          struct ggml_tensor* a = srcs[0];
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
+          const size_t nelem = ggml_nelements(gt);
+          int32_t* out_data = static_cast<int32_t*>(gt->data);
+
+          if (is_scalar) {
+            if (a->type == GGML_TYPE_I64) {
+              const int64_t* in_data = static_cast<const int64_t*>(a->data);
+              int64_t s = static_cast<int64_t>(scalar);
+              for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] == s) ? 1 : 0;
+            } else if (a->type == GGML_TYPE_I32) {
+              const int32_t* in_data = static_cast<const int32_t*>(a->data);
+              int32_t s = static_cast<int32_t>(scalar);
+              for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] == s) ? 1 : 0;
+            } else {
+              const float* in_data = static_cast<const float*>(a->data);
+              float s = static_cast<float>(scalar);
+              for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] == s) ? 1 : 0;
+            }
+          } else {
+            struct ggml_tensor* b = srcs[1];
+            if (a->type == GGML_TYPE_I64) {
+              const int64_t* a_data = static_cast<const int64_t*>(a->data);
+              const int64_t* b_data = static_cast<const int64_t*>(b->data);
+              for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] == b_data[i]) ? 1 : 0;
+            } else if (a->type == GGML_TYPE_I32) {
+              const int32_t* a_data = static_cast<const int32_t*>(a->data);
+              const int32_t* b_data = static_cast<const int32_t*>(b->data);
+              for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] == b_data[i]) ? 1 : 0;
+            } else {
+              const float* a_data = static_cast<const float*>(a->data);
+              const float* b_data = static_cast<const float*>(b->data);
+              for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] == b_data[i]) ? 1 : 0;
+            }
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::NE: {
+          // ne(a, scalar) - not equal
+          double scalar = 0.0;
+          int32_t is_scalar = 1;
+          if (t->op_params() && t->op_params()->size() >= 12) {
+            memcpy(&scalar, t->op_params()->data(), 8);
+            memcpy(&is_scalar, t->op_params()->data() + 8, 4);
+          }
+
+          struct ggml_tensor* a = srcs[0];
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
+          const size_t nelem = ggml_nelements(gt);
+          int32_t* out_data = static_cast<int32_t*>(gt->data);
+
+          if (a->type == GGML_TYPE_I64) {
+            const int64_t* in_data = static_cast<const int64_t*>(a->data);
+            int64_t s = static_cast<int64_t>(scalar);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] != s) ? 1 : 0;
+          } else if (a->type == GGML_TYPE_I32) {
+            const int32_t* in_data = static_cast<const int32_t*>(a->data);
+            int32_t s = static_cast<int32_t>(scalar);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] != s) ? 1 : 0;
+          } else {
+            const float* in_data = static_cast<const float*>(a->data);
+            float s = static_cast<float>(scalar);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] != s) ? 1 : 0;
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::LE: {
+          // le(a, b) - less than or equal
+          struct ggml_tensor* a = srcs[0];
+          struct ggml_tensor* b = srcs[1];
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
+          const size_t nelem = ggml_nelements(gt);
+          int32_t* out_data = static_cast<int32_t*>(gt->data);
+
+          if (a->type == GGML_TYPE_I64) {
+            const int64_t* a_data = static_cast<const int64_t*>(a->data);
+            const int64_t* b_data = static_cast<const int64_t*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] <= b_data[i]) ? 1 : 0;
+          } else if (a->type == GGML_TYPE_I32) {
+            const int32_t* a_data = static_cast<const int32_t*>(a->data);
+            const int32_t* b_data = static_cast<const int32_t*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] <= b_data[i]) ? 1 : 0;
+          } else {
+            const float* a_data = static_cast<const float*>(a->data);
+            const float* b_data = static_cast<const float*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] <= b_data[i]) ? 1 : 0;
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::LT: {
+          // lt(a, b) - less than
+          struct ggml_tensor* a = srcs[0];
+          struct ggml_tensor* b = srcs[1];
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
+          const size_t nelem = ggml_nelements(gt);
+          int32_t* out_data = static_cast<int32_t*>(gt->data);
+
+          if (a->type == GGML_TYPE_I64) {
+            const int64_t* a_data = static_cast<const int64_t*>(a->data);
+            const int64_t* b_data = static_cast<const int64_t*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] < b_data[i]) ? 1 : 0;
+          } else if (a->type == GGML_TYPE_I32) {
+            const int32_t* a_data = static_cast<const int32_t*>(a->data);
+            const int32_t* b_data = static_cast<const int32_t*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] < b_data[i]) ? 1 : 0;
+          } else {
+            const float* a_data = static_cast<const float*>(a->data);
+            const float* b_data = static_cast<const float*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] < b_data[i]) ? 1 : 0;
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::GT: {
+          // gt(a, b) - greater than
+          struct ggml_tensor* a = srcs[0];
+          struct ggml_tensor* b = srcs[1];
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
+          const size_t nelem = ggml_nelements(gt);
+          int32_t* out_data = static_cast<int32_t*>(gt->data);
+
+          if (a->type == GGML_TYPE_I64) {
+            const int64_t* a_data = static_cast<const int64_t*>(a->data);
+            const int64_t* b_data = static_cast<const int64_t*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] > b_data[i]) ? 1 : 0;
+          } else if (a->type == GGML_TYPE_I32) {
+            const int32_t* a_data = static_cast<const int32_t*>(a->data);
+            const int32_t* b_data = static_cast<const int32_t*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] > b_data[i]) ? 1 : 0;
+          } else {
+            const float* a_data = static_cast<const float*>(a->data);
+            const float* b_data = static_cast<const float*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] > b_data[i]) ? 1 : 0;
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::GE: {
+          // ge(a, b) - greater than or equal
+          struct ggml_tensor* a = srcs[0];
+          struct ggml_tensor* b = srcs[1];
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
+          const size_t nelem = ggml_nelements(gt);
+          int32_t* out_data = static_cast<int32_t*>(gt->data);
+
+          if (a->type == GGML_TYPE_I64) {
+            const int64_t* a_data = static_cast<const int64_t*>(a->data);
+            const int64_t* b_data = static_cast<const int64_t*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] >= b_data[i]) ? 1 : 0;
+          } else if (a->type == GGML_TYPE_I32) {
+            const int32_t* a_data = static_cast<const int32_t*>(a->data);
+            const int32_t* b_data = static_cast<const int32_t*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] >= b_data[i]) ? 1 : 0;
+          } else {
+            const float* a_data = static_cast<const float*>(a->data);
+            const float* b_data = static_cast<const float*>(b->data);
+            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] >= b_data[i]) ? 1 : 0;
+          }
+          break;
+        }
+
+        case ggml_ir::OpCode::BITWISE_AND: {
+          // bitwise_and(a, b)
+          struct ggml_tensor* a = srcs[0];
+          struct ggml_tensor* b = srcs[1];
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
+          const size_t nelem = ggml_nelements(gt);
+          int32_t* out_data = static_cast<int32_t*>(gt->data);
+
+          const int32_t* a_data = static_cast<const int32_t*>(a->data);
+          const int32_t* b_data = static_cast<const int32_t*>(b->data);
+          for (size_t i = 0; i < nelem; ++i) out_data[i] = a_data[i] & b_data[i];
+          break;
+        }
+
+        case ggml_ir::OpCode::BITWISE_OR: {
+          // bitwise_or(a, b)
+          struct ggml_tensor* a = srcs[0];
+          struct ggml_tensor* b = srcs[1];
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
+          const size_t nelem = ggml_nelements(gt);
+          int32_t* out_data = static_cast<int32_t*>(gt->data);
+
+          const int32_t* a_data = static_cast<const int32_t*>(a->data);
+          const int32_t* b_data = static_cast<const int32_t*>(b->data);
+          for (size_t i = 0; i < nelem; ++i) out_data[i] = a_data[i] | b_data[i];
+          break;
+        }
+
+        case ggml_ir::OpCode::LOGICAL_NOT: {
+          // logical_not(x)
+          struct ggml_tensor* x = srcs[0];
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
+          const size_t nelem = ggml_nelements(gt);
+          int32_t* out_data = static_cast<int32_t*>(gt->data);
+
+          const int32_t* in_data = static_cast<const int32_t*>(x->data);
+          for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] == 0) ? 1 : 0;
+          break;
+        }
+
+        case ggml_ir::OpCode::ANY: {
+          // any(x, dim) - reduce any along dimension
+          // op_params: int32 dim, int32 ndim
+          int32_t dim = 0, ndim = 4;
+          if (t->op_params() && t->op_params()->size() >= 8) {
+            memcpy(&dim, t->op_params()->data(), 4);
+            memcpy(&ndim, t->op_params()->data() + 4, 4);
+          }
+
+          struct ggml_tensor* src = srcs[0];
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
+
+          // Convert PyTorch dim to ggml axis
+          int ggml_axis = (ndim - 1) - dim;
+          const size_t nelem_out = ggml_nelements(gt);
+
+          const int32_t* in_data = static_cast<const int32_t*>(src->data);
+          int32_t* out_data = static_cast<int32_t*>(gt->data);
+
+          // Simple reduction: for now assume output shape is source shape with dim reduced
+          int64_t stride = 1;
+          for (int ax = 0; ax < ggml_axis; ++ax) stride *= src->ne[ax];
+          int64_t dim_size = src->ne[ggml_axis];
+          int64_t outer_size = nelem_out / stride;
+          if (outer_size == 0) outer_size = 1;
+
+          for (int64_t outer = 0; outer < outer_size; ++outer) {
+            for (int64_t inner = 0; inner < stride; ++inner) {
+              int32_t any_true = 0;
+              for (int64_t d = 0; d < dim_size; ++d) {
+                int64_t in_idx = outer * dim_size * stride + d * stride + inner;
+                if (in_data[in_idx] != 0) {
+                  any_true = 1;
+                  break;
+                }
+              }
+              int64_t out_idx = outer * stride + inner;
+              out_data[out_idx] = any_true;
+            }
+          }
           break;
         }
 

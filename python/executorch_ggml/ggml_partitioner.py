@@ -63,6 +63,21 @@ _SUPPORTED_OP_NAMES = {
     "aten.sigmoid.default",
     "aten._softmax.default",
     "aten.where.self",
+    # Mask computation ops (int64/bool)
+    "aten.arange.start_step",
+    "aten.full.default",
+    "aten.cumsum.default",
+    "aten.eq.Scalar",
+    "aten.eq.Tensor",
+    "aten.ne.Scalar",
+    "aten.le.Tensor",
+    "aten.lt.Tensor",
+    "aten.gt.Tensor",
+    "aten.ge.Tensor",
+    "aten.bitwise_and.Tensor",
+    "aten.bitwise_or.Tensor",
+    "aten.logical_not.default",
+    "aten.any.dim",
     # Layout/dtype ops (treat as no-op or identity)
     "dim_order_ops._to_dim_order_copy.default",
     # Legacy linear demo ops
@@ -146,11 +161,11 @@ def _is_supported_node(node) -> bool:
             return False
         return True
 
-    # For int64 outputs, only allow reshape/view-like ops that don't do compute.
-    # This reduces graph fragmentation by keeping index shuffling in the delegate.
+    # For int64 outputs, allow reshape-like ops and mask computation ops.
+    # This reduces graph fragmentation by keeping index/mask ops in the delegate.
     if out_dtype == torch.int64:
-        # These ops just reshape/slice without compute - safe for int64
         int64_safe_ops = {
+            # Reshape/view ops
             "aten.view",
             "aten.view_copy",
             "aten._unsafe_view",
@@ -165,32 +180,39 @@ def _is_supported_node(node) -> bool:
             "aten.transpose",
             "aten.expand",
             "aten.expand_copy",
-            "aten.cat",  # cat of int64 tensors
-            "aten.index",  # already handled above but include for clarity
+            "aten.cat",
+            "aten.index",
             "aten.alias",
             "aten.alias_copy",
             "dim_order_ops._clone_dim_order",
+            # Mask computation ops that produce int64
+            "aten.arange",
+            "aten.cumsum",
+            "aten.sub",  # int64 subtraction for position calc
+            "aten.add",  # int64 addition for position calc
         }
         if not any(op in target_str for op in int64_safe_ops):
             return False
 
-    # aten.add.Tensor: ggml only supports F32/F16 ADD, not integer ADDs.
+    # aten.add.Tensor: ggml supports F32/F16 ADD, plus int64 for mask computation.
     if "aten.add.Tensor" in target_str:
         dtype = out_dtype
         if dtype is not None and dtype not in (
             torch.float32,
             torch.float16,
             torch.bfloat16,
+            torch.int64,  # Allow for mask position computation
         ):
             return False
 
-    # aten.sub.Tensor: ggml only supports F32/F16 SUB, not integer SUBs.
+    # aten.sub.Tensor: ggml supports F32/F16 SUB, plus int64 for mask computation.
     if "aten.sub.Tensor" in target_str:
         dtype = out_dtype
         if dtype is not None and dtype not in (
             torch.float32,
             torch.float16,
             torch.bfloat16,
+            torch.int64,  # Allow for mask position computation
         ):
             return False
 

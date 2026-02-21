@@ -69,6 +69,21 @@ OP_CAST = 48  # Type cast: src_ids=[x], op_params=int32 target_type (TensorType 
 # Conditional
 OP_WHERE = 50
 
+# Mask computation / comparison ops
+OP_ARANGE = 51
+OP_FULL = 52
+OP_CUMSUM = 53
+OP_EQ = 54
+OP_NE = 55
+OP_LE = 56
+OP_LT = 57
+OP_GT = 58
+OP_GE = 59
+OP_BITWISE_AND = 70
+OP_BITWISE_OR = 71
+OP_LOGICAL_NOT = 72
+OP_ANY = 73
+
 # Fused attention (llama.cpp/ggml)
 OP_LLAMA_ATTENTION = 60
 
@@ -390,3 +405,28 @@ def pack_softmax_params(dim: int, ndim: int) -> bytes:
 def pack_pow_params(exponent: float) -> bytes:
     """Pack pow parameters: exponent (float32)."""
     return struct.pack("<f", exponent)
+
+
+def pack_arange_params(start: float, step: float) -> bytes:
+    """Pack arange parameters: start (float64), step (float64)."""
+    return struct.pack("<dd", float(start), float(step))
+
+
+def pack_full_params(fill_value: float) -> bytes:
+    """Pack full parameters: fill_value (float64)."""
+    return struct.pack("<d", float(fill_value))
+
+
+def pack_cumsum_params(dim: int, ndim: int) -> bytes:
+    """Pack cumsum parameters: dim (int32), ndim (int32)."""
+    return struct.pack("<ii", int(dim), int(ndim))
+
+
+def pack_comparison_params(scalar: float = 0.0, is_scalar: bool = False) -> bytes:
+    """Pack comparison parameters: scalar (float64), is_scalar (int32)."""
+    return struct.pack("<di", float(scalar), int(is_scalar))
+
+
+def pack_any_params(dim: int, ndim: int) -> bytes:
+    """Pack any.dim parameters: dim (int32), ndim (int32)."""
+    return struct.pack("<ii", int(dim), int(ndim))

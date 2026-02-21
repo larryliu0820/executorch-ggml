@@ -61,8 +61,25 @@ enum OpCode : int32 {
     // Conditional
     WHERE = 50,          // src_ids: [cond, x, y]
 
+    // Mask computation / comparison ops
+    ARANGE = 51,         // src_ids: [] op_params: float64 start, float64 step
+    FULL = 52,           // src_ids: [] op_params: float64 fill_value
+    CUMSUM = 53,         // src_ids: [x] op_params: int32 dim, int32 ndim
+    EQ = 54,             // src_ids: [a, (b)?] op_params: float64 scalar, int32 is_scalar
+    NE = 55,             // src_ids: [a] op_params: float64 scalar, int32 is_scalar
+    LE = 56,             // src_ids: [a, b]
+    LT = 57,             // src_ids: [a, b]
+    GT = 58,             // src_ids: [a, b]
+    GE = 59,             // src_ids: [a, b]
+
     // Attention (fused llama.cpp/ggml path)
-    LLAMA_ATTENTION = 60 // src_ids: TBD; op_params: model-specific (see runtime)
+    LLAMA_ATTENTION = 60, // src_ids: TBD; op_params: model-specific (see runtime)
+
+    // Bitwise / logical ops
+    BITWISE_AND = 70,    // src_ids: [a, b]
+    BITWISE_OR = 71,     // src_ids: [a, b]
+    LOGICAL_NOT = 72,    // src_ids: [x]
+    ANY = 73             // src_ids: [x] op_params: int32 dim, int32 ndim
 }
 
 enum TensorType : int32 {

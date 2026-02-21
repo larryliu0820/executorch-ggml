@@ -57,9 +57,22 @@ enum class OpCode : int32_t {
   INDEX_MULTI = 47,
   CAST = 48,
   WHERE = 50,
+  ARANGE = 51,
+  FULL = 52,
+  CUMSUM = 53,
+  EQ = 54,
+  NE = 55,
+  LE = 56,
+  LT = 57,
+  GT = 58,
+  GE = 59,
   LLAMA_ATTENTION = 60,
+  BITWISE_AND = 70,
+  BITWISE_OR = 71,
+  LOGICAL_NOT = 72,
+  ANY = 73,
   MIN = NONE,
-  MAX = LLAMA_ATTENTION
+  MAX = ANY
 };
 
 inline const OpCode (&EnumValuesOpCode())[25] {
