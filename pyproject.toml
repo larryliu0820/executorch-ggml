@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "executorch-ggml"
+version = "0.1.0"
+description = "ExecuTorch backend delegating to ggml"
+readme = "README.md"
+license = "BSD-3-Clause"
+authors = [
+    {name = "Larry Liu"}
+]
+requires-python = ">=3.10"
+dependencies = [
+    "flatbuffers>=24.3.25",
+    "torch>=2.4.0",
+    "executorch>=1.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.urls]
+Homepage = "https://github.com/larryliu0820/executorch-ggml"
+Repository = "https://github.com/larryliu0820/executorch-ggml"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools.package-data]
+executorch_ggml = ["*.so", "*.dylib"]

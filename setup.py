@@ -1,28 +1,27 @@
-"""executorch-ggml: ExecuTorch backend delegating to ggml.
+"""
+Setup configuration for executorch-ggml.
 
-This package has two parts:
-- Pure-Python AOT lowering (partitioner + backend preprocess)
-- Optional native extension (_ggml_backend) which registers GgmlBackend with the
-  ExecuTorch runtime. The extension is built via CMake.
+Metadata and dependencies are defined in pyproject.toml (PEP 621).
+This file only handles the custom CMake build logic for the native extension.
 
-To build the native extension during pip install, set these env vars:
+To build the native extension during pip install, set:
+  - EXECUTORCH_GGML_BUILD_NATIVE=1
   - LLAMA_CPP_DIR=/path/to/llama.cpp
   - EXECUTORCH_DIR=/path/to/executorch (repo root containing executorch/)
 
 Example:
-  LLAMA_CPP_DIR=... EXECUTORCH_DIR=... pip install .
+  LLAMA_CPP_DIR=... EXECUTORCH_DIR=... EXECUTORCH_GGML_BUILD_NATIVE=1 pip install .
 """
 
 from __future__ import annotations
 
 import os
 import pathlib
-import subprocess
-import sys
 import shutil
+import sys
 from typing import List
 
-from setuptools import Extension, find_packages, setup
+from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
 
@@ -39,7 +38,7 @@ class CMakeBuild(build_ext):
         if os.environ.get("EXECUTORCH_GGML_BUILD_NATIVE", "0") not in {"1", "true", "True", "yes"}:
             print(
                 "[executorch-ggml] Skipping native extension build. "
-                "Set EXECUTORCH_GGML_BUILD_NATIVE=1 to build _ggml_backend." 
+                "Set EXECUTORCH_GGML_BUILD_NATIVE=1 to build _ggml_backend."
             )
             return
 
@@ -56,6 +55,8 @@ class CMakeBuild(build_ext):
         return None
 
     def build_extension(self, ext: Extension) -> None:
+        import subprocess
+
         root = pathlib.Path(__file__).resolve().parent
 
         # Prefer deps vendored under this repo's third-party/ if present.
@@ -127,28 +128,8 @@ class CMakeBuild(build_ext):
         )
 
 
+# Minimal setup - metadata comes from pyproject.toml
 setup(
-    name="executorch-ggml",
-    version="0.1.0",
-    description="ExecuTorch backend delegating to ggml",
-    author="Larry Liu",
-    package_dir={"": "python"},
-    packages=find_packages(where="python"),
-    python_requires=">=3.10",
-    install_requires=[
-        "flatbuffers>=24.3.25",
-        "torch>=2.4.0",
-    ],
-    extras_require={
-        "dev": [
-            "pytest",
-        ],
-    },
-    # Include prebuilt native extension when present
-    include_package_data=True,
-    package_data={
-        "executorch_ggml": ["*.so", "*.dylib"],
-    },
     ext_modules=[CMakeExtension("executorch_ggml._ggml_backend")],
     cmdclass={"build_ext": CMakeBuild},
 )

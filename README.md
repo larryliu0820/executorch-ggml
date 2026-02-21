@@ -91,11 +91,35 @@ More ops can be added by extending the `OpCode` enum in `schema/ggml_ir.fbs`, th
 
 ## Quick Start
 
-### Python (ahead-of-time compilation)
+### Installation
 
+**Stable (PyPI):**
 ```bash
 pip install -e .
 ```
+
+**Nightly builds:** Choose one of these methods:
+
+1. **With extra-index-url flag:**
+   ```bash
+   pip install -e . --extra-index-url https://download.pytorch.org/whl/nightly/cpu/
+   ```
+
+2. **Using requirements-nightly.txt:**
+   ```bash
+   pip install -r requirements-nightly.txt
+   ```
+
+3. **Set pip config globally (one-time setup):**
+   ```bash
+   pip config --user set global.extra-index-url https://download.pytorch.org/whl/nightly/cpu/
+   # Now just run:
+   pip install -e .
+   ```
+
+These methods will install the latest `executorch` nightly version from PyTorch's nightly wheel server (currently 1.2.0.dev20260218).
+
+### Python (ahead-of-time compilation)
 
 ```python
 import torch

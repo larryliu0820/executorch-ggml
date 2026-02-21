@@ -1,0 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/nightly/cpu/
+executorch>=1.1.0
+flatbuffers>=24.3.25
+torch>=2.4.0
