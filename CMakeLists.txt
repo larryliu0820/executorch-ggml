@@ -118,8 +118,10 @@ if(EXECUTORCH_GGML_BUILD_PYTHON_EXTENSION)
     ggml
     ggml-base
     ggml-cpu
-    ggml-blas
   )
+  if(TARGET ggml-blas)
+    target_link_libraries(executorch_ggml_backend_py PRIVATE ggml-blas)
+  endif()
 
   # Ensure the loader can find ggml dylibs at runtime.
   if(APPLE)
@@ -135,5 +137,7 @@ if(EXECUTORCH_GGML_BUILD_PYTHON_EXTENSION)
   # portable runtime extension (dynamic lookup).
   if(APPLE)
     target_link_options(executorch_ggml_backend_py PRIVATE "-undefined" "dynamic_lookup")
+  else()
+    target_link_options(executorch_ggml_backend_py PRIVATE "-Wl,--allow-shlib-undefined")
   endif()
 endif()

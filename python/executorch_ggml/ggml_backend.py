@@ -118,6 +118,17 @@ class GgmlBackend(BackendDetails):
             next_id += 1
             return tid
 
+        def _look_through_transpose(n: torch.fx.Node) -> torch.fx.Node:
+            """Look through aten.t, aten.permute_copy, aten.permute that
+            transposes a 2D weight tensor. ggml_mul_mat already does an
+            implicit transpose, so mm/addmm should pass the original weight."""
+            if n.op != "call_function":
+                return n
+            t = str(n.target)
+            if "aten.t" in t or "aten.permute_copy" in t or "aten.permute" in t:
+                return n.args[0]
+            return n
+
         # Build mapping from param/buffer placeholder names → FQN → tensor data
         sig = edge_program.graph_signature
         param_map = dict(sig.inputs_to_parameters)   # node_name → param FQN
@@ -527,6 +538,10 @@ class GgmlBackend(BackendDetails):
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
                     out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    # Get the source tensor's PyTorch rank for correct axis computation.
+                    src_val = src_node.meta.get("val") if isinstance(src_node, torch.fx.Node) else None
+                    src_shape = list(getattr(src_val, "shape", [])) if src_val is not None else []
+                    ndim = len(src_shape) if src_shape else len(shape)
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -535,7 +550,7 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_SLICE,
                             src_ids=[src_id],
-                            op_params=pack_slice_params(dim, start_i, end_i, step),
+                            op_params=pack_slice_params(dim, start_i, end_i, step, ndim),
                         )
                     )
                     node_to_id[node] = tid
@@ -791,8 +806,11 @@ class GgmlBackend(BackendDetails):
 
                 elif "aten.mm.default" in target_str:
                     # mm(input, weight_t) → MUL_MAT(original_weight, input)
+                    # ggml_mul_mat(a, b) computes b @ a^T, so pass the
+                    # original (un-transposed) weight.
                     input_node, weight_t_node = node.args
-                    weight_id = node_to_id[weight_t_node]
+                    orig_w_node = _look_through_transpose(weight_t_node)
+                    weight_id = node_to_id[orig_w_node]
                     input_id = node_to_id[input_node]
 
                     fake_val = node.meta.get("val")
@@ -813,9 +831,12 @@ class GgmlBackend(BackendDetails):
                 elif "aten.addmm.default" in target_str:
                     # addmm(bias, input, weight_t)
                     # → MUL_MAT(original_weight, input) then ADD(result, bias)
+                    # ggml_mul_mat(a, b) computes b @ a^T, so pass the
+                    # original (un-transposed) weight.
                     bias_node, input_node, weight_t_node = node.args
 
-                    weight_id = node_to_id[weight_t_node]
+                    orig_w_node = _look_through_transpose(weight_t_node)
+                    weight_id = node_to_id[orig_w_node]
                     input_id = node_to_id[input_node]
                     bias_id = node_to_id[bias_node]
 
@@ -1054,15 +1075,19 @@ class GgmlBackend(BackendDetails):
                     # node.args[1] which may contain SymInt from dynamic export.
                     new_shape = [int(d) for d in shape] if shape else [int(d) for d in node.args[1]]
 
+                    # Pack the shape in ggml ne order (reversed from PyTorch)
+                    # since the C++ runtime passes these directly to ggml_reshape_4d.
+                    ggml_ne = _pytorch_shape_to_ggml_ne(new_shape)
+
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
                             tensor_type=TYPE_F32,
-                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            ne=ggml_ne,
                             op=OP_VIEW,
                             src_ids=[src_id],
-                            op_params=pack_view_params(new_shape),
+                            op_params=pack_view_params(ggml_ne),
                         )
                     )
                     node_to_id[node] = tid

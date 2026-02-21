@@ -820,6 +820,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         case ggml_ir::OpCode::SLICE: {
           // Limited slice support: step must be 1. Only supports slicing along
           // a single PyTorch dim using a view.
+          // op_params: dim(i32), start(i64), end(i64), step(i64), ndim(u32)
           if (!t->op_params() || t->op_params()->size() < 28) {
             ggml_free(ctx);
             return Error::InvalidArgument;
@@ -836,25 +837,18 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             return Error::InvalidArgument;
           }
 
-          struct ggml_tensor* a = srcs[0];
-          int nd = ggml_n_dims(a);
-          int ax = (nd - 1) - dim; // pytorch dim -> ggml axis
-
-          // Compute offset in bytes
-          size_t offset = 0;
-          if (ax == 0) {
-            offset = start * a->nb[0];
-            gt = ggml_view_1d(ctx, a, ne[0], offset);
-          } else if (ax == 1) {
-            offset = start * a->nb[1];
-            gt = ggml_view_2d(ctx, a, ne[0], ne[1], a->nb[1], offset);
-          } else if (ax == 2) {
-            offset = start * a->nb[2];
-            gt = ggml_view_3d(ctx, a, ne[0], ne[1], ne[2], a->nb[1], a->nb[2], offset);
-          } else {
-            offset = start * a->nb[3];
-            gt = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], offset);
+          // Read PyTorch rank from op_params (avoids ggml_n_dims which
+          // undercounts when trailing dims are 1).
+          uint32_t nd = 4;
+          if (t->op_params()->size() >= 32) {
+            memcpy(&nd, p + 28, 4);
           }
+          struct ggml_tensor* a = srcs[0];
+          int ax = (int(nd) - 1) - dim;
+
+          size_t offset = static_cast<size_t>(start) * a->nb[ax];
+          gt = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3],
+                            a->nb[1], a->nb[2], a->nb[3], offset);
           break;
         }
 

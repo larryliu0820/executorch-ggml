@@ -271,9 +271,9 @@ def pack_index_put_multi_params(nindices: int, present_mask: int) -> bytes:
     return struct.pack('<ii', int(nindices), int(present_mask))
 
 
-def pack_slice_params(dim: int, start: int, end: int, step: int) -> bytes:
-    # start/end/step are int64 in the schema comment, but store as int64 here.
-    return struct.pack("<iqqq", int(dim), int(start), int(end), int(step))
+def pack_slice_params(dim: int, start: int, end: int, step: int, ndim: int = 4) -> bytes:
+    """Pack slice parameters. ndim is the source tensor's PyTorch rank."""
+    return struct.pack("<iqqqI", int(dim), int(start), int(end), int(step), int(ndim))
 
 
 def pack_conv2d_params(
