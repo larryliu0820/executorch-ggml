@@ -80,11 +80,23 @@ from executorch.exir._serialize._named_data_store import NamedDataStore
 
 
 def _pytorch_shape_to_ggml_ne(shape: List[int]) -> List[int]:
-    """PyTorch [d0, d1, ..., dn] → ggml ne [dn, ..., d1, d0], padded to 4D."""
-    ne = list(reversed(shape))
-    while len(ne) < 4:
-        ne.append(1)
-    return ne[:4]
+    """PyTorch [d0, d1, ..., dn] → ggml ne [dn, ..., d1, d0], padded/collapsed to 4D.
+
+    For >4D tensors, collapse leading dimensions: [a,b,c,d,e] → [a*b, c, d, e] (reversed).
+    """
+    if len(shape) <= 4:
+        ne = list(reversed(shape))
+        while len(ne) < 4:
+            ne.append(1)
+        return ne[:4]
+    else:
+        # Collapse leading dimensions for >4D tensors
+        # e.g., [1, 8, 2, 512, 128] → [1*8, 2, 512, 128] → reversed: [128, 512, 2, 8]
+        leading_prod = 1
+        for d in shape[:-4]:
+            leading_prod *= d
+        ne = [leading_prod] + list(shape[-4:])
+        return list(reversed(ne))
 
 
 def _torch_dtype_to_ir_type(dtype: torch.dtype) -> int:
@@ -142,8 +154,8 @@ class GgmlBackend(BackendDetails):
 
         # Build mapping from param/buffer placeholder names → FQN → tensor data
         sig = edge_program.graph_signature
-        param_map = dict(sig.inputs_to_parameters)   # node_name → param FQN
-        buffer_map = dict(sig.inputs_to_buffers)      # node_name → buffer FQN
+        param_map = dict(sig.inputs_to_parameters)  # node_name → param FQN
+        buffer_map = dict(sig.inputs_to_buffers)  # node_name → buffer FQN
 
         # ep.constants holds tensor constants (like attention masks and RoPE freqs)
         # that are not in ep.state_dict but are still compile-time constants.
@@ -203,7 +215,9 @@ class GgmlBackend(BackendDetails):
                         # Convert bool causal mask to F16 additive bias:
                         # True -> 0.0 (attend), False -> -inf (mask out)
                         neg_inf = float("-inf")
-                        t_float = torch.where(t_cpu, torch.tensor(0.0), torch.tensor(neg_inf))
+                        t_float = torch.where(
+                            t_cpu, torch.tensor(0.0), torch.tensor(neg_inf)
+                        )
                         t_cpu = t_float.to(torch.float16)
                     elif t_cpu.dtype == torch.float32 and t_cpu.ndim >= 4:
                         t_cpu = t_cpu.to(torch.float16)
@@ -233,7 +247,11 @@ class GgmlBackend(BackendDetails):
 
                     tid = alloc_id()
                     # Runtime input dtype based on FakeTensor meta when available.
-                    in_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None and hasattr(fake_val, "dtype") else torch.float32
+                    in_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None and hasattr(fake_val, "dtype")
+                        else torch.float32
+                    )
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
@@ -265,7 +283,11 @@ class GgmlBackend(BackendDetails):
                 elif "aten.scalar_tensor.default" in target_str:
                     # scalar_tensor(s, dtype?, device?) -> 0-d tensor constant
                     fake_val = node.meta.get("val")
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
                     value = node.args[0]
                     const = torch.tensor(value, dtype=out_dtype).cpu()
 
@@ -310,7 +332,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -333,7 +359,11 @@ class GgmlBackend(BackendDetails):
 
                     # Cast I64 indices to I32 (ggml_get_rows requires I32).
                     idx_fv = indices_node.meta.get("val")
-                    idx_dtype = getattr(idx_fv, "dtype", torch.int64) if idx_fv is not None else torch.int64
+                    idx_dtype = (
+                        getattr(idx_fv, "dtype", torch.int64)
+                        if idx_fv is not None
+                        else torch.int64
+                    )
                     if idx_dtype == torch.int64 or idx_dtype == torch.long:
                         idx_shape = list(idx_fv.shape) if idx_fv is not None else []
                         cast_tid = alloc_id()
@@ -351,7 +381,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -370,7 +404,11 @@ class GgmlBackend(BackendDetails):
                     src_id = node_to_id[src_node]
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -390,18 +428,39 @@ class GgmlBackend(BackendDetails):
                     b_id = node_to_id[b_node]
                     fake_val = node.meta.get("val")
                     out_shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     # Make broadcasting explicit with OP_REPEAT where needed.
                     # ggml_mul requires ggml_can_repeat(b, a) which fails for
                     # cases like [1,3,1] * [1,1,64] where neither can repeat into other.
-                    a_val = a_node.meta.get("val") if isinstance(a_node, torch.fx.Node) else None
-                    b_val = b_node.meta.get("val") if isinstance(b_node, torch.fx.Node) else None
-                    a_shape = list(getattr(a_val, "shape", [])) if a_val is not None else []
-                    b_shape = list(getattr(b_val, "shape", [])) if b_val is not None else []
+                    a_val = (
+                        a_node.meta.get("val")
+                        if isinstance(a_node, torch.fx.Node)
+                        else None
+                    )
+                    b_val = (
+                        b_node.meta.get("val")
+                        if isinstance(b_node, torch.fx.Node)
+                        else None
+                    )
+                    a_shape = (
+                        list(getattr(a_val, "shape", [])) if a_val is not None else []
+                    )
+                    b_shape = (
+                        list(getattr(b_val, "shape", [])) if b_val is not None else []
+                    )
 
                     like_id = None
-                    if out_shape and a_shape and b_shape and (a_shape != out_shape or b_shape != out_shape):
+                    if (
+                        out_shape
+                        and a_shape
+                        and b_shape
+                        and (a_shape != out_shape or b_shape != out_shape)
+                    ):
                         # Create a "like" tensor for REPEAT target shape
                         like_id = alloc_id()
                         ir_tensors.append(
@@ -459,7 +518,11 @@ class GgmlBackend(BackendDetails):
                     src_id = node_to_id[src_node]
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -478,7 +541,11 @@ class GgmlBackend(BackendDetails):
                     src_id = node_to_id[src_node]
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -491,13 +558,20 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
-                elif "aten.unsqueeze.default" in target_str or "aten.unsqueeze_copy.default" in target_str:
+                elif (
+                    "aten.unsqueeze.default" in target_str
+                    or "aten.unsqueeze_copy.default" in target_str
+                ):
                     src_node = node.args[0]
                     dim = int(node.args[1])
                     src_id = node_to_id[src_node]
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -518,7 +592,11 @@ class GgmlBackend(BackendDetails):
                     src_id = node_to_id[src_node]
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
                     ndim = len(shape)
                     tid = alloc_id()
                     ir_tensors.append(
@@ -533,7 +611,10 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
-                elif "aten.slice.Tensor" in target_str or "aten.slice_copy.Tensor" in target_str:
+                elif (
+                    "aten.slice.Tensor" in target_str
+                    or "aten.slice_copy.Tensor" in target_str
+                ):
                     # slice.Tensor(x, dim=0, start=None, end=None, step=1)
                     src_node = node.args[0]
                     dim = int(node.args[1]) if len(node.args) > 1 else 0
@@ -548,10 +629,22 @@ class GgmlBackend(BackendDetails):
                     src_id = node_to_id[src_node]
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
                     # Get the source tensor's PyTorch rank for correct axis computation.
-                    src_val = src_node.meta.get("val") if isinstance(src_node, torch.fx.Node) else None
-                    src_shape = list(getattr(src_val, "shape", [])) if src_val is not None else []
+                    src_val = (
+                        src_node.meta.get("val")
+                        if isinstance(src_node, torch.fx.Node)
+                        else None
+                    )
+                    src_shape = (
+                        list(getattr(src_val, "shape", []))
+                        if src_val is not None
+                        else []
+                    )
                     ndim = len(src_shape) if src_shape else len(shape)
                     tid = alloc_id()
                     ir_tensors.append(
@@ -561,7 +654,9 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_SLICE,
                             src_ids=[src_id],
-                            op_params=pack_slice_params(dim, start_i, end_i, step, ndim),
+                            op_params=pack_slice_params(
+                                dim, start_i, end_i, step, ndim
+                            ),
                         )
                     )
                     node_to_id[node] = tid
@@ -572,7 +667,11 @@ class GgmlBackend(BackendDetails):
                     src_ids = [node_to_id[t] for t in tensors]
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
                     # Normalize negative dim and compute ggml axis directly.
                     # ggml axis = (rank - 1) - dim, where rank is the full PyTorch rank.
                     ndim = len(shape)
@@ -595,11 +694,19 @@ class GgmlBackend(BackendDetails):
                 elif "aten.repeat_interleave.self_int" in target_str:
                     src_node = node.args[0]
                     repeats = int(node.args[1])
-                    dim = int(node.args[2]) if len(node.args) > 2 and node.args[2] is not None else 0
+                    dim = (
+                        int(node.args[2])
+                        if len(node.args) > 2 and node.args[2] is not None
+                        else 0
+                    )
                     src_id = node_to_id[src_node]
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -617,16 +724,28 @@ class GgmlBackend(BackendDetails):
                     src_node = node.args[0]
                     indices = node.args[1]
                     if not isinstance(indices, (list, tuple)):
-                        raise RuntimeError("aten.index.Tensor: expected indices to be list/tuple")
+                        raise RuntimeError(
+                            "aten.index.Tensor: expected indices to be list/tuple"
+                        )
 
-                    non_none_pos = [i for i, idx in enumerate(indices) if idx is not None]
+                    non_none_pos = [
+                        i for i, idx in enumerate(indices) if idx is not None
+                    ]
                     non_none = [indices[i] for i in non_none_pos]
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
-                    if len(non_none) == 1 and len(non_none_pos) == 1 and non_none_pos[0] == 0:
+                    if (
+                        len(non_none) == 1
+                        and len(non_none_pos) == 1
+                        and non_none_pos[0] == 0
+                    ):
                         # Single-index case: use ggml_get_rows (gather along dim 0).
                         idx_node = non_none[0]
                         src_id = node_to_id[src_node]
@@ -634,7 +753,11 @@ class GgmlBackend(BackendDetails):
 
                         # Cast I64 indices to I32 (ggml_get_rows requires I32).
                         idx_fv = idx_node.meta.get("val")
-                        idx_dtype = getattr(idx_fv, "dtype", torch.int64) if idx_fv is not None else torch.int64
+                        idx_dtype = (
+                            getattr(idx_fv, "dtype", torch.int64)
+                            if idx_fv is not None
+                            else torch.int64
+                        )
                         if idx_dtype == torch.int64 or idx_dtype == torch.long:
                             idx_shape = list(idx_fv.shape) if idx_fv is not None else []
                             cast_tid = alloc_id()
@@ -717,7 +840,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     out_shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     # Intermediate sliced shape: same as src but dim shrunk to 1
                     sliced_shape = list(src_shape)
@@ -756,7 +883,9 @@ class GgmlBackend(BackendDetails):
                     values_node = node.args[2]
 
                     if not isinstance(indices, (list, tuple)):
-                        raise RuntimeError('aten.index_put: expected indices to be a list/tuple')
+                        raise RuntimeError(
+                            "aten.index_put: expected indices to be a list/tuple"
+                        )
 
                     # Support multi-index form: indices is a tuple of optional index tensors.
                     # We'll serialize only the non-None index tensors as src_ids.
@@ -765,7 +894,7 @@ class GgmlBackend(BackendDetails):
                     for i, idx in enumerate(indices):
                         if idx is None:
                             continue
-                        present_mask |= (1 << i)
+                        present_mask |= 1 << i
                         idx_src_ids.append(node_to_id[idx])
 
                     x_id = node_to_id[x_node]
@@ -773,7 +902,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -783,7 +916,9 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_INDEX_PUT,
                             src_ids=[x_id] + idx_src_ids + [v_id],
-                            op_params=pack_index_put_multi_params(len(indices), present_mask),
+                            op_params=pack_index_put_multi_params(
+                                len(indices), present_mask
+                            ),
                         )
                     )
                     node_to_id[node] = tid
@@ -801,7 +936,11 @@ class GgmlBackend(BackendDetails):
                         src_ids.append(node_to_id[mask_node])
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -900,29 +1039,46 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
-                elif "aten.convolution.default" in target_str or "aten.conv2d.default" in target_str:
+                elif (
+                    "aten.convolution.default" in target_str
+                    or "aten.conv2d.default" in target_str
+                ):
                     # aten.convolution.default or aten.conv2d.default
                     # Args: (input, weight, bias?, stride, padding, dilation, transposed, output_padding, groups)
                     # For conv2d: (input, weight, bias, stride, padding, dilation, groups)
 
                     if "aten.convolution.default" in target_str:
                         if len(node.args) < 9:
-                            raise RuntimeError(f"Expected 9 args for convolution, got {len(node.args)}")
+                            raise RuntimeError(
+                                f"Expected 9 args for convolution, got {len(node.args)}"
+                            )
                         input_node = node.args[0]
                         weight_node = node.args[1]
-                        bias_node = node.args[2] if len(node.args) > 2 and node.args[2] is not None else None
+                        bias_node = (
+                            node.args[2]
+                            if len(node.args) > 2 and node.args[2] is not None
+                            else None
+                        )
                         stride = list(node.args[3]) if len(node.args) > 3 else [1, 1]
                         padding = list(node.args[4]) if len(node.args) > 4 else [0, 0]
                         dilation = list(node.args[5]) if len(node.args) > 5 else [1, 1]
                         transposed = node.args[6] if len(node.args) > 6 else False
-                        output_padding = list(node.args[7]) if len(node.args) > 7 else [0, 0]
+                        output_padding = (
+                            list(node.args[7]) if len(node.args) > 7 else [0, 0]
+                        )
                         groups = node.args[8] if len(node.args) > 8 else 1
                     else:  # conv2d
                         if len(node.args) < 7:
-                            raise RuntimeError(f"Expected 7 args for conv2d, got {len(node.args)}")
+                            raise RuntimeError(
+                                f"Expected 7 args for conv2d, got {len(node.args)}"
+                            )
                         input_node = node.args[0]
                         weight_node = node.args[1]
-                        bias_node = node.args[2] if len(node.args) > 2 and node.args[2] is not None else None
+                        bias_node = (
+                            node.args[2]
+                            if len(node.args) > 2 and node.args[2] is not None
+                            else None
+                        )
                         stride = list(node.args[3]) if len(node.args) > 3 else [1, 1]
                         padding = list(node.args[4]) if len(node.args) > 4 else [0, 0]
                         dilation = list(node.args[5]) if len(node.args) > 5 else [1, 1]
@@ -977,7 +1133,10 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
-                elif "aten.hardtanh.default" in target_str or "aten.clamp.default" in target_str:
+                elif (
+                    "aten.hardtanh.default" in target_str
+                    or "aten.clamp.default" in target_str
+                ):
                     # hardtanh(x, min_val, max_val) or clamp(x, min, max)
                     src_node = node.args[0]
                     min_val = node.args[1] if len(node.args) > 1 else -1.0
@@ -995,12 +1154,17 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_HARDTANH,
                             src_ids=[src_id],
-                            op_params=pack_hardtanh_params(float(min_val), float(max_val)),
+                            op_params=pack_hardtanh_params(
+                                float(min_val), float(max_val)
+                            ),
                         )
                     )
                     node_to_id[node] = tid
 
-                elif "aten.mean.dim" in target_str or "aten._mean_dim.default" in target_str:
+                elif (
+                    "aten.mean.dim" in target_str
+                    or "aten._mean_dim.default" in target_str
+                ):
                     # mean(x, dim, keepdim)
                     src_node = node.args[0]
                     dim = node.args[1] if len(node.args) > 1 else -1
@@ -1038,37 +1202,62 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
-                elif "aten.expand.default" in target_str or "aten.expand_copy.default" in target_str:
-                    # expand is a broadcast. Lower as ggml_repeat(x, like).
+                elif (
+                    "aten.expand.default" in target_str
+                    or "aten.expand_copy.default" in target_str
+                ):
+                    # expand is a broadcast. Lower as ggml_repeat(x, like) if compatible,
+                    # otherwise just use the source (let consumer handle broadcast).
                     src_node = node.args[0]
                     src_id = node_to_id[src_node]
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
-
-                    # Create a shape-only "like" tensor.
-                    like_id = alloc_id()
-                    ir_tensors.append(
-                        IrTensor(
-                            tensor_id=like_id,
-                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
-                            ne=_pytorch_shape_to_ggml_ne(shape),
-                            op=OP_NONE,
-                            is_input=False,
-                        )
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
                     )
 
-                    tid = alloc_id()
-                    ir_tensors.append(
-                        IrTensor(
-                            tensor_id=tid,
-                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
-                            ne=_pytorch_shape_to_ggml_ne(shape),
-                            op=OP_REPEAT,
-                            src_ids=[src_id, like_id],
-                        )
+                    src_fake = (
+                        src_node.meta.get("val") if hasattr(src_node, "meta") else None
                     )
-                    node_to_id[node] = tid
+                    src_shape = list(src_fake.shape) if src_fake is not None else []
+
+                    # Check if ggml_repeat can handle this broadcast
+                    # ggml_repeat requires each dim of src to be 1 or equal to target dim
+                    src_ne = _pytorch_shape_to_ggml_ne(src_shape)
+                    dst_ne = _pytorch_shape_to_ggml_ne(shape)
+                    can_repeat = all(
+                        src_ne[i] == 1 or src_ne[i] == dst_ne[i] for i in range(4)
+                    )
+
+                    if can_repeat:
+                        # Create a shape-only "like" tensor.
+                        like_id = alloc_id()
+                        ir_tensors.append(
+                            IrTensor(
+                                tensor_id=like_id,
+                                tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                                ne=dst_ne,
+                                op=OP_NONE,
+                                is_input=False,
+                            )
+                        )
+
+                        tid = alloc_id()
+                        ir_tensors.append(
+                            IrTensor(
+                                tensor_id=tid,
+                                tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                                ne=dst_ne,
+                                op=OP_REPEAT,
+                                src_ids=[src_id, like_id],
+                            )
+                        )
+                        node_to_id[node] = tid
+                    else:
+                        # Just use source tensor - consumer ops have broadcasting
+                        node_to_id[node] = src_id
 
                 elif (
                     "aten.view.default" in target_str
@@ -1084,7 +1273,11 @@ class GgmlBackend(BackendDetails):
                     shape = list(fake_val.shape) if fake_val is not None else []
                     # Use concrete output shape from FakeTensor meta rather than
                     # node.args[1] which may contain SymInt from dynamic export.
-                    new_shape = [int(d) for d in shape] if shape else [int(d) for d in node.args[1]]
+                    new_shape = (
+                        [int(d) for d in shape]
+                        if shape
+                        else [int(d) for d in node.args[1]]
+                    )
 
                     # Pack the shape in ggml ne order (reversed from PyTorch)
                     # since the C++ runtime passes these directly to ggml_reshape_4d.
@@ -1109,7 +1302,9 @@ class GgmlBackend(BackendDetails):
                     # Edge graphs usually pass alpha as a kwarg.
                     alpha = float(getattr(node, "kwargs", {}).get("alpha", 1))
                     if alpha != 1.0:
-                        raise RuntimeError("aten.add.Tensor with alpha != 1 not supported yet")
+                        raise RuntimeError(
+                            "aten.add.Tensor with alpha != 1 not supported yet"
+                        )
 
                     x_id = node_to_id[x_node]
                     y_id = node_to_id[y_node]
@@ -1118,10 +1313,22 @@ class GgmlBackend(BackendDetails):
                     out_shape = list(fake_val.shape) if fake_val is not None else []
 
                     # Make broadcasting explicit with OP_REPEAT where possible.
-                    x_val = x_node.meta.get("val") if isinstance(x_node, torch.fx.Node) else None
-                    y_val = y_node.meta.get("val") if isinstance(y_node, torch.fx.Node) else None
-                    x_shape = list(getattr(x_val, "shape", [])) if x_val is not None else []
-                    y_shape = list(getattr(y_val, "shape", [])) if y_val is not None else []
+                    x_val = (
+                        x_node.meta.get("val")
+                        if isinstance(x_node, torch.fx.Node)
+                        else None
+                    )
+                    y_val = (
+                        y_node.meta.get("val")
+                        if isinstance(y_node, torch.fx.Node)
+                        else None
+                    )
+                    x_shape = (
+                        list(getattr(x_val, "shape", [])) if x_val is not None else []
+                    )
+                    y_shape = (
+                        list(getattr(y_val, "shape", [])) if y_val is not None else []
+                    )
 
                     def _n_non1(sh):
                         return sum(1 for d in sh if int(d) != 1)
@@ -1146,7 +1353,10 @@ class GgmlBackend(BackendDetails):
                         )
 
                         # repeat the smaller/broadcasted side
-                        if (_n_non1(x_shape), _numel(x_shape)) < (_n_non1(y_shape), _numel(y_shape)):
+                        if (_n_non1(x_shape), _numel(x_shape)) < (
+                            _n_non1(y_shape),
+                            _numel(y_shape),
+                        ):
                             x_rep = alloc_id()
                             ir_tensors.append(
                                 IrTensor(
@@ -1158,7 +1368,10 @@ class GgmlBackend(BackendDetails):
                                 )
                             )
                             x_id = x_rep
-                        elif (_n_non1(y_shape), _numel(y_shape)) < (_n_non1(x_shape), _numel(x_shape)):
+                        elif (_n_non1(y_shape), _numel(y_shape)) < (
+                            _n_non1(x_shape),
+                            _numel(x_shape),
+                        ):
                             y_rep = alloc_id()
                             ir_tensors.append(
                                 IrTensor(
@@ -1190,7 +1403,10 @@ class GgmlBackend(BackendDetails):
                     src_node = node.args[0]
                     node_to_id[node] = node_to_id[src_node]
 
-                elif "aten.alias.default" in target_str or "aten.alias_copy.default" in target_str:
+                elif (
+                    "aten.alias.default" in target_str
+                    or "aten.alias_copy.default" in target_str
+                ):
                     src_node = node.args[0]
                     node_to_id[node] = node_to_id[src_node]
 
@@ -1201,7 +1417,10 @@ class GgmlBackend(BackendDetails):
                     src_node = node.args[0]
                     node_to_id[node] = node_to_id[src_node]
 
-                elif "aten.permute.default" in target_str or "aten.permute_copy.default" in target_str:
+                elif (
+                    "aten.permute.default" in target_str
+                    or "aten.permute_copy.default" in target_str
+                ):
                     # permute(x, dims)
                     #
                     # NOTE: `aten.permute_copy` is a permute with explicit copy
@@ -1250,7 +1469,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     out_shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1272,7 +1495,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1295,7 +1522,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1316,7 +1547,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1336,7 +1571,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1358,7 +1597,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1378,7 +1621,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1400,7 +1647,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
                     ndim = len(shape)
 
                     tid = alloc_id()
@@ -1425,7 +1676,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1446,7 +1701,11 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
-                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
                     # Create a scalar constant and use MUL_SCALAR with a tensor of ones
                     # Actually, simpler: create a VIEW of a scalar tensor.

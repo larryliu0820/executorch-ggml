@@ -239,7 +239,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       static_cast<size_t>(n_tensors) * ggml_tensor_overhead() +
       constant_data_size +
       ggml_graph_overhead() +
-      256 * 1024 * 1024;  // headroom for intermediate op tensors and graph nodes
+      4ull * 1024 * 1024 * 1024;  // 4GB headroom for intermediate op tensors and graph nodes
 
   struct ggml_init_params params = {
       /* .mem_size   = */ ctx_size,
@@ -524,9 +524,20 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           gt = ggml_mul(ctx, srcs[0], srcs[1]);
           break;
 
-        case ggml_ir::OpCode::REPEAT:
-          gt = ggml_repeat(ctx, srcs[0], srcs[1]);
+        case ggml_ir::OpCode::REPEAT: {
+          struct ggml_tensor* a = srcs[0];
+          struct ggml_tensor* b = srcs[1];
+          if (!ggml_can_repeat(a, b)) {
+            fprintf(stderr,
+                    "[executorch-ggml] REPEAT shape not repeatable: a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
+                    (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
+                    (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+          gt = ggml_repeat(ctx, a, b);
           break;
+        }
 
         case ggml_ir::OpCode::NEG:
           gt = ggml_neg(ctx, srcs[0]);

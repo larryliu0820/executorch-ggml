@@ -1,6 +1,6 @@
 """GgmlPartitioner: tags supported ATen ops for delegation to the ggml backend."""
 
-from typing import Dict, List
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.export import ExportedProgram
@@ -54,27 +54,22 @@ _SUPPORTED_OP_NAMES = {
     "aten.scalar_tensor.default",
     "aten._assert_tensor_metadata.default",
     "aten.full_like.default",
-
     # RoPE ops
     "aten.bmm.default",
     "aten.cos.default",
     "aten.sin.default",
-
     # RMSNorm / activation ops
     "aten.pow.Tensor_Scalar",
     "aten.sigmoid.default",
     "aten._softmax.default",
     "aten.where.self",
-
     # Layout/dtype ops (treat as no-op or identity)
     "dim_order_ops._to_dim_order_copy.default",
-
     # Legacy linear demo ops
     "aten.t.default",
     "aten.mm.default",
     "aten.addmm.default",
     "aten.leaky_relu.default",
-
     # MobileNetV2 ops
     "aten.convolution.default",
     "aten.conv2d.default",
@@ -113,7 +108,9 @@ def _is_supported_node(node) -> bool:
         if len(non_none_pos) == 0:
             return False
 
-        src_val = node.args[0].meta.get("val") if hasattr(node.args[0], "meta") else None
+        src_val = (
+            node.args[0].meta.get("val") if hasattr(node.args[0], "meta") else None
+        )
         src_shape = list(getattr(src_val, "shape", []))
         src_rank = len(src_shape)
         if src_rank == 0 or src_rank > 4:
@@ -154,14 +151,24 @@ def _is_supported_node(node) -> bool:
     if out_dtype == torch.int64:
         # These ops just reshape/slice without compute - safe for int64
         int64_safe_ops = {
-            "aten.view", "aten.view_copy", "aten._unsafe_view",
-            "aten.reshape", "aten.unsqueeze", "aten.unsqueeze_copy",
-            "aten.slice", "aten.slice_copy", "aten.select",
-            "aten.permute", "aten.permute_copy", "aten.transpose",
-            "aten.expand", "aten.expand_copy",
+            "aten.view",
+            "aten.view_copy",
+            "aten._unsafe_view",
+            "aten.reshape",
+            "aten.unsqueeze",
+            "aten.unsqueeze_copy",
+            "aten.slice",
+            "aten.slice_copy",
+            "aten.select",
+            "aten.permute",
+            "aten.permute_copy",
+            "aten.transpose",
+            "aten.expand",
+            "aten.expand_copy",
             "aten.cat",  # cat of int64 tensors
             "aten.index",  # already handled above but include for clarity
-            "aten.alias", "aten.alias_copy",
+            "aten.alias",
+            "aten.alias_copy",
             "dim_order_ops._clone_dim_order",
         }
         if not any(op in target_str for op in int64_safe_ops):
@@ -170,22 +177,35 @@ def _is_supported_node(node) -> bool:
     # aten.add.Tensor: ggml only supports F32/F16 ADD, not integer ADDs.
     if "aten.add.Tensor" in target_str:
         dtype = out_dtype
-        if dtype is not None and dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        if dtype is not None and dtype not in (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        ):
             return False
 
     # aten.sub.Tensor: ggml only supports F32/F16 SUB, not integer SUBs.
     if "aten.sub.Tensor" in target_str:
         dtype = out_dtype
-        if dtype is not None and dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        if dtype is not None and dtype not in (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        ):
             return False
 
     # aten.mul.Tensor: ggml only supports F32/F16 MUL, not integer MULs.
     if "aten.mul.Tensor" in target_str:
         dtype = out_dtype
-        if dtype is not None and dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        if dtype is not None and dtype not in (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        ):
             return False
 
     return True
+
 
 BACKEND_ID = "GgmlBackend"
 
@@ -206,6 +226,15 @@ class GgmlPartitioner(Partitioner):
         self.delegation_spec = DelegationSpec(BACKEND_ID, [])
         self.max_sdpa_ops = max_sdpa_ops
 
+    def ops_to_not_decompose(
+        self, ep: ExportedProgram
+    ) -> Tuple[List[torch._ops.OpOverload], Optional[Callable[[torch.fx.Node], bool]]]:
+        """Return ops that should not be decomposed during to_edge().
+
+        SDPA is preserved so ggml can lower it to efficient attention ops.
+        """
+        return ([torch.ops.aten.scaled_dot_product_attention.default], None)
+
     def partition(self, exported_program: ExportedProgram) -> PartitionResult:
         partition_tags: Dict[str, DelegationSpec] = {}
         graph_module = exported_program.graph_module
@@ -215,7 +244,10 @@ class GgmlPartitioner(Partitioner):
         if self.max_sdpa_ops is not None:
             sdpa_seen = 0
             for idx, node in enumerate(graph_module.graph.nodes):
-                if node.op == "call_function" and "aten.scaled_dot_product_attention.default" in str(node.target):
+                if (
+                    node.op == "call_function"
+                    and "aten.scaled_dot_product_attention.default" in str(node.target)
+                ):
                     sdpa_seen += 1
                     if sdpa_seen > self.max_sdpa_ops:
                         cutoff_idx = idx
