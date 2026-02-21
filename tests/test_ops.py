@@ -11,10 +11,12 @@ Usage:
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.export import export
 
 from executorch_ggml import GgmlPartitioner
 from executorch_ggml.edge_pipeline import to_edge_rewrite_and_lower
+from executorch_ggml.passes.replace_copy_ops_pass import ReplaceCopyOpsPass
 
 _NATIVE_AVAILABLE = False
 try:
@@ -464,9 +466,7 @@ class TestEmbedLinearPipeline:
             def forward(self, x):
                 return self.proj(self.embed(x))
 
-        eager, ggml = _run_ggml(
-            M(), torch.tensor([[10, 20, 30]], dtype=torch.long)
-        )
+        eager, ggml = _run_ggml(M(), torch.tensor([[10, 20, 30]], dtype=torch.long))
         _assert_close(eager, ggml)
 
     def test_embed_two_linears(self):
@@ -508,3 +508,140 @@ class TestFullAttentionHeadPattern:
 
         eager, ggml = _run_ggml(M(), torch.randn(1, 3, 64))
         _assert_close(eager, ggml)
+
+
+# ---------------------------------------------------------------------------
+# Tests for ReplaceCopyOpsPass (view_copy, permute_copy, etc.)
+# ---------------------------------------------------------------------------
+
+
+class TestCopyOpsPass:
+    """Test that _copy ops are properly converted by ReplaceCopyOpsPass."""
+
+    def _lower_with_copy_pass(self, model, inp, ep_passes=None):
+        """Lower with ReplaceCopyOpsPass enabled."""
+        model.eval()
+        with torch.no_grad():
+            ep = export(model, (inp,))
+        edge_mgr = to_edge_rewrite_and_lower(
+            ep,
+            ep_passes=ep_passes or [],
+            partitioner=[GgmlPartitioner()],
+            transform_passes=[ReplaceCopyOpsPass()],
+        )
+        return edge_mgr.to_executorch()
+
+    def test_view_copy(self):
+        """Test view_copy (becomes view after pass)."""
+
+        class M(nn.Module):
+            def forward(self, x):
+                return x.view(1, 3, 8, 8)
+
+        self._lower_with_copy_pass(M(), torch.randn(1, 3, 64))
+
+    def test_permute_copy(self):
+        """Test permute_copy (becomes permute after pass)."""
+
+        class M(nn.Module):
+            def forward(self, x):
+                return x.permute(0, 2, 1, 3).contiguous()
+
+        self._lower_with_copy_pass(M(), torch.randn(1, 3, 8, 8))
+
+    def test_unsqueeze_copy(self):
+        """Test unsqueeze_copy (becomes unsqueeze after pass)."""
+
+        class M(nn.Module):
+            def forward(self, x):
+                return x.unsqueeze(0)
+
+        self._lower_with_copy_pass(M(), torch.randn(3, 64))
+
+    def test_clone_copy(self):
+        """Test clone (becomes alias after pass)."""
+
+        class M(nn.Module):
+            def forward(self, x):
+                return x.clone()
+
+        self._lower_with_copy_pass(M(), torch.randn(3, 64))
+
+
+@requires_native
+class TestCopyOpsPassE2E:
+    """End-to-end tests for _copy ops after pass conversion."""
+
+    def _run_with_copy_pass(self, model, inp, atol=1e-4, rtol=1e-4):
+        """Run with ReplaceCopyOpsPass enabled."""
+        model.eval()
+        with torch.no_grad():
+            ep = export(model, (inp,))
+        edge_mgr = to_edge_rewrite_and_lower(
+            ep,
+            partitioner=[GgmlPartitioner()],
+            transform_passes=[ReplaceCopyOpsPass()],
+        )
+        et = edge_mgr.to_executorch()
+        pte = _load_for_executorch_from_buffer(et.buffer)
+        result = pte.forward((inp,))
+        ggml_out = result[0]
+        with torch.no_grad():
+            eager_out = model(inp)
+        return eager_out, ggml_out
+
+    def test_view_copy_e2e(self):
+        class M(nn.Module):
+            def forward(self, x):
+                return x.view(1, 3, 8, 8)
+
+        eager, ggml = self._run_with_copy_pass(M(), torch.randn(1, 3, 64))
+        _assert_close(eager, ggml)
+
+    def test_permute_copy_e2e(self):
+        class M(nn.Module):
+            def forward(self, x):
+                return x.permute(0, 2, 1, 3).contiguous()
+
+        eager, ggml = self._run_with_copy_pass(M(), torch.randn(1, 3, 8, 8))
+        _assert_close(eager, ggml)
+
+    def test_unsqueeze_copy_e2e(self):
+        class M(nn.Module):
+            def forward(self, x):
+                return x.unsqueeze(0)
+
+        eager, ggml = self._run_with_copy_pass(M(), torch.randn(3, 64))
+        _assert_close(eager, ggml)
+
+
+# ---------------------------------------------------------------------------
+# Tests for SDPA preservation (ops_to_not_decompose)
+# ---------------------------------------------------------------------------
+
+
+class TestSDPAPreservation:
+    """Test that SDPA is preserved from decomposition."""
+
+    def _lower_with_sdpa(self, model, inp):
+        """Lower with SDPA preservation."""
+        model.eval()
+        with torch.no_grad():
+            ep = export(model, (inp,))
+        edge_mgr = to_edge_rewrite_and_lower(
+            ep,
+            partitioner=[GgmlPartitioner()],
+        )
+        return edge_mgr.to_executorch()
+
+    def test_sdpa_not_decomposed(self):
+        """Test that SDPA is preserved in the graph."""
+
+        class M(nn.Module):
+            def forward(self, x):
+                q = x
+                k = x
+                v = x
+                return F.scaled_dot_product_attention(q, k, v)
+
+        self._lower_with_sdpa(M(), torch.randn(1, 2, 4, 8))
