@@ -71,11 +71,12 @@ enum class OpCode : int32_t {
   BITWISE_OR = 71,
   LOGICAL_NOT = 72,
   ANY = 73,
+  UPDATE_CACHE = 74,
   MIN = NONE,
-  MAX = ANY
+  MAX = UPDATE_CACHE
 };
 
-inline const OpCode (&EnumValuesOpCode())[25] {
+inline const OpCode (&EnumValuesOpCode())[50] {
   static const OpCode values[] = {
     OpCode::NONE,
     OpCode::ADD,
@@ -89,6 +90,14 @@ inline const OpCode (&EnumValuesOpCode())[25] {
     OpCode::PERMUTE,
     OpCode::MUL,
     OpCode::NEG,
+    OpCode::SUB,
+    OpCode::MUL_SCALAR,
+    OpCode::POW,
+    OpCode::COS,
+    OpCode::SIN,
+    OpCode::BMM,
+    OpCode::SIGMOID,
+    OpCode::SOFTMAX,
     OpCode::LINEAR,
     OpCode::EMBEDDING,
     OpCode::SILU,
@@ -101,13 +110,30 @@ inline const OpCode (&EnumValuesOpCode())[25] {
     OpCode::INDEX,
     OpCode::INDEX_PUT,
     OpCode::REPEAT,
-    OpCode::LLAMA_ATTENTION
+    OpCode::INDEX_MULTI,
+    OpCode::CAST,
+    OpCode::WHERE,
+    OpCode::ARANGE,
+    OpCode::FULL,
+    OpCode::CUMSUM,
+    OpCode::EQ,
+    OpCode::NE,
+    OpCode::LE,
+    OpCode::LT,
+    OpCode::GT,
+    OpCode::GE,
+    OpCode::LLAMA_ATTENTION,
+    OpCode::BITWISE_AND,
+    OpCode::BITWISE_OR,
+    OpCode::LOGICAL_NOT,
+    OpCode::ANY,
+    OpCode::UPDATE_CACHE
   };
   return values;
 }
 
 inline const char * const *EnumNamesOpCode() {
-  static const char * const names[62] = {
+  static const char * const names[76] = {
     "NONE",
     "ADD",
     "MUL_MAT",
@@ -120,14 +146,14 @@ inline const char * const *EnumNamesOpCode() {
     "PERMUTE",
     "MUL",
     "NEG",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
+    "SUB",
+    "MUL_SCALAR",
+    "POW",
+    "COS",
+    "SIN",
+    "BMM",
+    "SIGMOID",
+    "SOFTMAX",
     "LINEAR",
     "EMBEDDING",
     "SILU",
@@ -155,27 +181,41 @@ inline const char * const *EnumNamesOpCode() {
     "INDEX",
     "INDEX_PUT",
     "REPEAT",
+    "INDEX_MULTI",
+    "CAST",
     "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
+    "WHERE",
+    "ARANGE",
+    "FULL",
+    "CUMSUM",
+    "EQ",
+    "NE",
+    "LE",
+    "LT",
+    "GT",
+    "GE",
     "LLAMA_ATTENTION",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "BITWISE_AND",
+    "BITWISE_OR",
+    "LOGICAL_NOT",
+    "ANY",
+    "UPDATE_CACHE",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameOpCode(OpCode e) {
-  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::LLAMA_ATTENTION)) return "";
+  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::UPDATE_CACHE)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesOpCode()[index];
 }

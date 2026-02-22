@@ -1785,6 +1785,63 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           break;
         }
 
+        case ggml_ir::OpCode::UPDATE_CACHE: {
+          // update_cache(cache, value, start_pos)
+          // Inserts value into cache starting at start_pos along the seq dimension.
+          // op_params: int32 seq_dim (PyTorch dimension for sequence)
+          // src_ids: [cache, value, start_pos]
+          //
+          // cache shape: [batch, seq_len, n_heads, head_dim] or [batch, n_heads, seq_len, head_dim]
+          // value shape: [batch, seq_len_new, n_heads, head_dim] or similar
+          // start_pos: scalar tensor containing the starting position
+
+          if (srcs.size() < 3) {
+            fprintf(stderr, "[executorch-ggml] UPDATE_CACHE: expected 3 sources\n");
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
+
+          struct ggml_tensor* cache = srcs[0];
+          struct ggml_tensor* value = srcs[1];
+          struct ggml_tensor* start_pos_tensor = srcs[2];
+
+          // Get seq_dim from op_params
+          int32_t seq_dim_pytorch = 1;  // default
+          if (t->op_params() && t->op_params()->size() >= 4) {
+            memcpy(&seq_dim_pytorch, t->op_params()->data(), 4);
+          }
+
+          // Convert PyTorch seq_dim to ggml axis
+          // PyTorch: [batch, seq, heads, dim] -> seq_dim=1
+          // ggml:    [dim, heads, seq, batch] -> ggml_axis=1
+          int ndim = 4;
+          int ggml_axis = (ndim - 1) - seq_dim_pytorch;
+
+          // Get start position value
+          int64_t start_pos = 0;
+          if (start_pos_tensor->type == GGML_TYPE_I64) {
+            start_pos = *(const int64_t*)start_pos_tensor->data;
+          } else if (start_pos_tensor->type == GGML_TYPE_I32) {
+            start_pos = *(const int32_t*)start_pos_tensor->data;
+          }
+
+          // Use ggml_set_rows if we have indices, otherwise use a simple copy
+          // For contiguous update, we can create a view and copy
+          // cache[:, start_pos:start_pos+seq_len, :, :] = value
+
+          // Create indices tensor for ggml_set_rows
+          int64_t seq_len_new = value->ne[ggml_axis];
+          struct ggml_tensor* indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, seq_len_new);
+          int64_t* idx_data = static_cast<int64_t*>(indices->data);
+          for (int64_t i = 0; i < seq_len_new; ++i) {
+            idx_data[i] = start_pos + i;
+          }
+
+          // Use ggml_set_rows to scatter values into cache
+          gt = ggml_set_rows(ctx, cache, value, indices);
+          break;
+        }
+
         default:
           fprintf(stderr, "[executorch-ggml] Unsupported OpCode %d\n", (int) op);
           ggml_free(ctx);

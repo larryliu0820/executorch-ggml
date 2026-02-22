@@ -84,6 +84,9 @@ OP_BITWISE_OR = 71
 OP_LOGICAL_NOT = 72
 OP_ANY = 73
 
+# KV cache ops
+OP_UPDATE_CACHE = 74
+
 # Fused attention (llama.cpp/ggml)
 OP_LLAMA_ATTENTION = 60
 
@@ -430,3 +433,13 @@ def pack_comparison_params(scalar: float = 0.0, is_scalar: bool = False) -> byte
 def pack_any_params(dim: int, ndim: int) -> bytes:
     """Pack any.dim parameters: dim (int32), ndim (int32)."""
     return struct.pack("<ii", int(dim), int(ndim))
+
+
+def pack_update_cache_params(seq_dim: int = 1) -> bytes:
+    """Pack update_cache parameters: seq_dim (int32) - the sequence dimension in the cache tensor.
+
+    The update_cache op inserts new values into a cache tensor along the sequence dimension.
+    For typical KV cache with shape [batch, seq_len, n_heads, head_dim], seq_dim=1.
+    For shape [batch, n_heads, seq_len, head_dim], seq_dim=2.
+    """
+    return struct.pack("<i", int(seq_dim))

@@ -61,6 +61,7 @@ from executorch_ggml.serialize import (
     OP_BITWISE_OR,
     OP_LOGICAL_NOT,
     OP_ANY,
+    OP_UPDATE_CACHE,
     # Types
     TYPE_F32,
     TYPE_F16,
@@ -92,6 +93,7 @@ from executorch_ggml.serialize import (
     pack_cumsum_params,
     pack_comparison_params,
     pack_any_params,
+    pack_update_cache_params,
     serialize_graph,
 )
 
@@ -2140,6 +2142,76 @@ class GgmlBackend(BackendDetails):
                             op=OP_ANY,
                             src_ids=[src_id],
                             op_params=pack_any_params(dim, ndim),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "llama.update_cache.default" in target_str:
+                    # llama.update_cache(value, cache, start_pos) -> cache
+                    # Updates cache at start_pos with new values.
+                    # Args: value (new K/V), cache (mutable buffer), start_pos (int64 scalar)
+                    value_node = node.args[0]
+                    cache_node = node.args[1]
+
+                    value_id = node_to_id[value_node]
+                    cache_id = node_to_id[cache_node]
+
+                    # start_pos comes from: item(select(cache_position, 0, 0))
+                    # We need to trace back to find the original cache_position tensor
+                    start_pos_node = node.args[2]
+
+                    # Helper to trace back through item/select to find the tensor
+                    def trace_to_tensor(n):
+                        if n in node_to_id:
+                            return node_to_id[n]
+                        # Check if this is an item or select node
+                        if hasattr(n, "target"):
+                            target_name = str(n.target)
+                            if "item" in target_name or "select" in target_name:
+                                # Trace to input
+                                if n.args:
+                                    return trace_to_tensor(n.args[0])
+                        return None
+
+                    start_pos_id = trace_to_tensor(start_pos_node)
+                    if start_pos_id is None:
+                        raise RuntimeError(
+                            f"Could not find tensor for update_cache start_pos: {start_pos_node}"
+                        )
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
+
+                    # Determine sequence dimension from cache shape
+                    # Typical shapes: [batch, seq, n_heads, head_dim] -> seq_dim=1
+                    #                 [batch, n_heads, seq, head_dim] -> seq_dim=2
+                    cache_val = cache_node.meta.get("val") if hasattr(cache_node, "meta") else None
+                    cache_shape = list(cache_val.shape) if cache_val is not None else []
+                    value_val = value_node.meta.get("val") if hasattr(value_node, "meta") else None
+                    value_shape = list(value_val.shape) if value_val is not None else []
+
+                    # The seq dim is where cache_shape differs from value_shape
+                    seq_dim = 1  # default
+                    if len(cache_shape) == len(value_shape) and len(cache_shape) >= 2:
+                        for i in range(1, len(cache_shape)):
+                            if cache_shape[i] != value_shape[i]:
+                                seq_dim = i
+                                break
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_UPDATE_CACHE,
+                            src_ids=[cache_id, value_id, start_pos_id],
+                            op_params=pack_update_cache_params(seq_dim),
                         )
                     )
                     node_to_id[node] = tid

@@ -79,7 +79,10 @@ enum OpCode : int32 {
     BITWISE_AND = 70,    // src_ids: [a, b]
     BITWISE_OR = 71,     // src_ids: [a, b]
     LOGICAL_NOT = 72,    // src_ids: [x]
-    ANY = 73             // src_ids: [x] op_params: int32 dim, int32 ndim
+    ANY = 73,            // src_ids: [x] op_params: int32 dim, int32 ndim
+
+    // KV cache ops
+    UPDATE_CACHE = 74    // src_ids: [cache, value, start_pos] op_params: int32 seq_dim
 }
 
 enum TensorType : int32 {

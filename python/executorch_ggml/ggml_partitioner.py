@@ -78,6 +78,8 @@ _SUPPORTED_OP_NAMES = {
     "aten.bitwise_or.Tensor",
     "aten.logical_not.default",
     "aten.any.dim",
+    # KV cache ops
+    "llama.update_cache.default",
     # Layout/dtype ops (treat as no-op or identity)
     "dim_order_ops._to_dim_order_copy.default",
     # Legacy linear demo ops
