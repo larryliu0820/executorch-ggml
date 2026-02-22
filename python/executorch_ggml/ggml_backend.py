@@ -1903,6 +1903,12 @@ class GgmlBackend(BackendDetails):
                     src_node = node.args[0]
                     node_to_id[node] = node_to_id[src_node]
 
+                elif "aten.sym_size.int" in target_str:
+                    # sym_size.int returns a scalar (SymInt), not a tensor
+                    # This is used for dynamic shapes - skip in lowering
+                    # The shape info is already captured in tensor metadata
+                    pass
+
                 elif "aten.to.dtype" in target_str or "aten.to.dtype_layout" in target_str:
                     # Type casting - use CAST op
                     src_node = node.args[0]

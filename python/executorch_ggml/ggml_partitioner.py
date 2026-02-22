@@ -86,6 +86,7 @@ _SUPPORTED_OP_NAMES = {
     "aten.item.default",
     "aten.to.dtype",
     "aten.to.dtype_layout",
+    "aten.sym_size.int",  # Dynamic shape op - returns scalar, used in view/reshape
     # Note: aten._assert_scalar and aten.sym_constrain_range_for_size are
     # removed by RemoveGraphAssertsPass, so they don't need to be supported.
     # Layout/dtype ops (treat as no-op or identity)

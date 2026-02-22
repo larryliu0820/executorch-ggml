@@ -39,7 +39,10 @@ class SimpleKVCache(nn.Module):
 
 
 class SimpleAttention(nn.Module):
-    """Minimal attention with KV cache for testing."""
+    """Minimal attention with KV cache for testing.
+
+    Uses explicit attention mask for exportable incremental decoding.
+    """
 
     def __init__(self, dim: int, n_heads: int, max_seq_len: int):
         super().__init__()
@@ -55,15 +58,11 @@ class SimpleAttention(nn.Module):
 
         self.kv_cache = SimpleKVCache(max_seq_len, n_heads, self.head_dim)
 
-        # Causal mask
-        mask = torch.full((max_seq_len, max_seq_len), float("-inf"))
-        mask = torch.triu(mask, diagonal=1)
-        self.register_buffer("mask", mask)
-
-    def forward(self, x: torch.Tensor, input_pos: torch.Tensor):
+    def forward(self, x: torch.Tensor, input_pos: torch.Tensor, attn_mask: torch.Tensor):
         """
         x: [1, seq_len, dim]
         input_pos: [seq_len] - positions in the sequence
+        attn_mask: [1, 1, seq_len, max_seq_len] - attention mask (0 = attend, -inf = ignore)
         """
         bsz, seq_len, _ = x.shape
 
@@ -80,21 +79,10 @@ class SimpleAttention(nn.Module):
         # Update KV cache
         k_cache, v_cache = self.kv_cache.update(input_pos, k, v)
 
-        # For attention, use cached K/V up to current position
-        cur_pos = input_pos[-1].item() + 1
-        k_for_attn = k_cache[:, :, :cur_pos, :]
-        v_for_attn = v_cache[:, :, :cur_pos, :]
-
-        # Attention
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k_for_attn.transpose(-2, -1)) * scale
-
-        # Apply causal mask (slice to current positions)
-        mask = self.mask[input_pos][:, :cur_pos]
-        attn = attn + mask.unsqueeze(0).unsqueeze(0)
-
-        attn = torch.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_for_attn)
+        # Use SDPA with explicit mask
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k_cache, v_cache, attn_mask=attn_mask
+        )
 
         # Reshape back
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.dim)
@@ -106,18 +94,40 @@ class SimpleTransformer(nn.Module):
 
     def __init__(self, vocab_size: int, dim: int, n_heads: int, max_seq_len: int):
         super().__init__()
+        self.max_seq_len = max_seq_len
         self.embed = nn.Embedding(vocab_size, dim)
         self.attention = SimpleAttention(dim, n_heads, max_seq_len)
         self.output = nn.Linear(dim, vocab_size, bias=False)
 
-    def forward(self, tokens: torch.Tensor, input_pos: torch.Tensor):
+    def forward(self, tokens: torch.Tensor, input_pos: torch.Tensor, attn_mask: torch.Tensor):
         """
         tokens: [1, seq_len]
         input_pos: [seq_len]
+        attn_mask: [1, 1, seq_len, max_seq_len]
         """
         x = self.embed(tokens)
-        x = self.attention(x, input_pos)
+        x = self.attention(x, input_pos, attn_mask)
         return self.output(x)
+
+
+def create_causal_mask(input_pos: torch.Tensor, max_seq_len: int) -> torch.Tensor:
+    """Create causal attention mask for given input positions.
+
+    Returns mask of shape [1, 1, seq_len, max_seq_len] where:
+    - 0.0 means attend to this position
+    - -inf means ignore this position
+    """
+    seq_len = input_pos.shape[0]
+    # Create position indices for the full cache
+    cache_pos = torch.arange(max_seq_len, device=input_pos.device)
+    # For each query position, mask out future positions and unfilled cache
+    # Query at input_pos[i] can attend to cache positions <= input_pos[i]
+    mask = torch.where(
+        cache_pos.unsqueeze(0) <= input_pos.unsqueeze(1),
+        torch.tensor(0.0),
+        torch.tensor(float("-inf")),
+    )
+    return mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, max_seq_len]
 
 
 class TestKVCacheIndexPut:
@@ -210,10 +220,12 @@ class TestKVCacheMultiToken:
         # Test data - first token
         token1 = torch.tensor([[5]], dtype=torch.long)
         pos1 = torch.tensor([0], dtype=torch.long)
+        mask1 = create_causal_mask(pos1, max_seq_len)
 
         # Test data - second token
         token2 = torch.tensor([[10]], dtype=torch.long)
         pos2 = torch.tensor([1], dtype=torch.long)
+        mask2 = create_causal_mask(pos2, max_seq_len)
 
         # Get reference outputs using eager mode
         with torch.no_grad():
@@ -221,8 +233,8 @@ class TestKVCacheMultiToken:
             model.attention.kv_cache.k_cache.zero_()
             model.attention.kv_cache.v_cache.zero_()
 
-            ref1 = model(token1, pos1).clone()
-            ref2 = model(token2, pos2).clone()
+            ref1 = model(token1, pos1, mask1).clone()
+            ref2 = model(token2, pos2, mask2).clone()
 
         print(f"Reference outputs computed")
         print(f"  Token 1 output shape: {ref1.shape}")
@@ -232,7 +244,7 @@ class TestKVCacheMultiToken:
         with torch.no_grad():
             model.attention.kv_cache.k_cache.zero_()
             model.attention.kv_cache.v_cache.zero_()
-            ep = torch.export.export(model, (token1, pos1))
+            ep = torch.export.export(model, (token1, pos1, mask1))
 
         print(f"\nExported graph nodes:")
         for node in ep.graph.nodes:
@@ -261,10 +273,10 @@ class TestKVCacheMultiToken:
         # Run first token
         model.attention.kv_cache.k_cache.zero_()
         model.attention.kv_cache.v_cache.zero_()
-        result1 = pte_model.forward((token1, pos1))[0]
+        result1 = pte_model.forward((token1, pos1, mask1))[0]
 
         # Run second token
-        result2 = pte_model.forward((token2, pos2))[0]
+        result2 = pte_model.forward((token2, pos2, mask2))[0]
 
         # Compare
         diff1 = (ref1 - result1).abs().max().item()
@@ -281,7 +293,7 @@ class TestKVCacheMultiToken:
             model.attention.kv_cache.k_cache.zero_()
             model.attention.kv_cache.v_cache.zero_()
             # Run token 2 with fresh cache (should be different)
-            ref2_fresh = model(token2, pos2).clone()
+            ref2_fresh = model(token2, pos2, mask2).clone()
 
         diff_fresh = (ref2 - ref2_fresh).abs().max().item()
         print(f"  Token 2 diff (with vs without cache): {diff_fresh:.6f}")
