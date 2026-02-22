@@ -1843,6 +1843,95 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
+                elif "aten.arange.default" in target_str:
+                    # arange(end, ...) - generates [0, 1, ..., end-1]
+                    # Different from start_step: only end is specified
+                    start = 0.0
+                    step = 1.0
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.int64)
+                        if fake_val is not None
+                        else torch.int64
+                    )
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_ARANGE,
+                            src_ids=[],
+                            op_params=pack_arange_params(start, step),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.matmul.default" in target_str:
+                    # matmul(a, b) - general matrix multiplication
+                    a_node = node.args[0]
+                    b_node = node.args[1]
+                    a_id = node_to_id[a_node]
+                    b_id = node_to_id[b_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_MUL_MAT,  # Use MUL_MAT for matmul
+                            src_ids=[a_id, b_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.item.default" in target_str:
+                    # item() - extracts scalar from 0-d or 1-element tensor
+                    # For delegation purposes, pass through the source tensor
+                    src_node = node.args[0]
+                    node_to_id[node] = node_to_id[src_node]
+
+                elif "aten.to.dtype" in target_str or "aten.to.dtype_layout" in target_str:
+                    # Type casting - use CAST op
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_CAST,
+                            src_ids=[src_id],
+                            op_params=pack_cast_params(_torch_dtype_to_ir_type(out_dtype)),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                # Note: aten._assert_scalar and aten.sym_constrain_range_for_size
+                # are removed by RemoveGraphAssertsPass before lowering.
+
                 elif "aten.full.default" in target_str:
                     # full(size, fill_value, ...) - creates tensor filled with fill_value
                     fill_value = float(node.args[1]) if len(node.args) > 1 else 0.0

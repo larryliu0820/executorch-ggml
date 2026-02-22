@@ -24,6 +24,7 @@ class TestQwen3WithSDPAPreservation:
         """Test 1-token forward with SDPA preserved and verify numerical accuracy."""
         from executorch_ggml import GgmlPartitioner
         from executorch_ggml.passes.replace_copy_ops_pass import ReplaceCopyOpsPass
+        from executorch_ggml.passes import RemoveGraphAssertsPass
         from executorch.extension.pybindings.portable_lib import (
             _load_for_executorch_from_buffer,
         )
@@ -37,11 +38,11 @@ class TestQwen3WithSDPAPreservation:
         with torch.no_grad():
             eager_logits = ep.module()(tokens, {"input_pos": input_pos})
 
-        # GGML backend
+        # GGML backend - use RemoveGraphAssertsPass to remove assertion ops
         edge_mgr = to_edge_transform_and_lower(
             ep,
             partitioner=[GgmlPartitioner()],
-            transform_passes=[ReplaceCopyOpsPass()],
+            transform_passes=[ReplaceCopyOpsPass(), RemoveGraphAssertsPass()],
         )
         et_module = edge_mgr.to_executorch()
         pte_model = _load_for_executorch_from_buffer(et_module.buffer)

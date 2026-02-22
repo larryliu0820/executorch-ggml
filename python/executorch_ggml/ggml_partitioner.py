@@ -80,6 +80,14 @@ _SUPPORTED_OP_NAMES = {
     "aten.any.dim",
     # KV cache ops
     "llama.update_cache.default",
+    # Additional ops for full model export
+    "aten.arange.default",
+    "aten.matmul.default",
+    "aten.item.default",
+    "aten.to.dtype",
+    "aten.to.dtype_layout",
+    # Note: aten._assert_scalar and aten.sym_constrain_range_for_size are
+    # removed by RemoveGraphAssertsPass, so they don't need to be supported.
     # Layout/dtype ops (treat as no-op or identity)
     "dim_order_ops._to_dim_order_copy.default",
     # Legacy linear demo ops
