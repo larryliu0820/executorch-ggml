@@ -904,15 +904,16 @@ class GgmlBackend(BackendDetails):
                     )
 
                     # Squeeze the dim via VIEW to out_shape
+                    ggml_ne = _pytorch_shape_to_ggml_ne(out_shape)
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
                             tensor_type=_torch_dtype_to_ir_type(out_dtype),
-                            ne=_pytorch_shape_to_ggml_ne(out_shape),
+                            ne=ggml_ne,
                             op=OP_VIEW,
                             src_ids=[slice_id],
-                            op_params=pack_view_params(out_shape),
+                            op_params=pack_view_params(ggml_ne),
                         )
                     )
                     node_to_id[node] = tid
@@ -1792,7 +1793,9 @@ class GgmlBackend(BackendDetails):
                     const_data = np.full(numel, fill_value, dtype=np.float32)
                     const_key = f"_full_like_{hashlib.sha256(const_data.tobytes()).hexdigest()[:16]}"
 
-                    data_store.add_named_data(const_key, const_data.tobytes(), alignment=64)
+                    data_store.add_named_data(
+                        const_key, const_data.tobytes(), alignment=64
+                    )
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2122,7 +2125,9 @@ class GgmlBackend(BackendDetails):
                     fake_val = node.meta.get("val")
                     shape = list(fake_val.shape) if fake_val is not None else []
 
-                    src_val = src_node.meta.get("val") if hasattr(src_node, "meta") else None
+                    src_val = (
+                        src_node.meta.get("val") if hasattr(src_node, "meta") else None
+                    )
                     src_shape = list(src_val.shape) if src_val is not None else shape
                     ndim = len(src_shape)
 

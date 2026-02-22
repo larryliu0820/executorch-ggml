@@ -1,10 +1,8 @@
 """
-Numerical smoke test: Qwen3-0.6B no-KV-cache eager vs. ggml backend.
+Numerical smoke test: Qwen3-0.6B with ggml backend.
 
-Goal for bring-up:
-1) Disable KV cache.
-2) Lower to ggml backend.
-3) Run one forward pass and verify we can score the next token.
+Tests Qwen3-0.6B with SDPA preserved (not decomposed) and all ops
+delegated to the ggml backend. Verifies numerical accuracy against eager.
 
 Usage:
     source .venv/bin/activate
@@ -14,127 +12,17 @@ Usage:
 import pytest
 import torch
 
-MODEL_PATH = "/Users/mengweiliu/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
 
-
-class NoKvWrapper(torch.nn.Module):
-    """Wrap HF model to a single no-cache forward(input_ids) -> logits."""
-
-    def __init__(self, model: torch.nn.Module):
-        super().__init__()
-        self.model = model
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        out = self.model(input_ids=input_ids, use_cache=False)
-        return out.logits
-
-
-@pytest.fixture(scope="module")
-def qwen3_eager():
-    """Load Qwen3-0.6B in eager mode with KV cache disabled."""
-    from transformers import AutoConfig, AutoModelForCausalLM
-
-    config = AutoConfig.from_pretrained(MODEL_PATH)
-    config.use_cache = False
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        dtype=torch.float32,
-        config=config,
-        attn_implementation="sdpa",
-    )
-    model.eval()
-    return model
-
-
-@pytest.fixture(scope="module")
-def exported_program(qwen3_eager):
-    """Export no-KV wrapper with a short prompt shape [1, 3]."""
-    from torch.export import export
-
-    wrapper = NoKvWrapper(qwen3_eager)
-    sample_ids = torch.tensor([[151644, 151645, 151646]], dtype=torch.long)
-    with torch.no_grad():
-        ep = export(wrapper, (sample_ids,))
-    return ep
-
-
-def _eager_forward(model, input_ids):
-    with torch.no_grad():
-        out = model(input_ids=input_ids, use_cache=False)
-    return out.logits
-
-
-class TestQwen3NoKvNumerical:
-    """Smoke + numerical checks for no-KV-cache lowering."""
-
-    def test_export_succeeds(self, exported_program):
-        assert exported_program is not None
-
-    def test_single_step_next_token_logits(self, qwen3_eager, exported_program):
-        from executorch_ggml import GgmlPartitioner
-        from executorch_ggml.edge_pipeline import to_edge_rewrite_and_lower
-        from executorch_ggml.passes.broadcast_pass import (
-            BroadcastCanonicalizationPass as BroadcastPass,
-        )
-        from executorch.extension.pybindings.portable_lib import (
-            _load_for_executorch_from_buffer,
-        )
-
-        # Prompt length 3, then compare logits for the last position (next-token scores).
-        input_ids = torch.tensor([[151644, 151645, 151646]], dtype=torch.long)
-
-        eager_logits = _eager_forward(qwen3_eager, input_ids)[0, -1]  # [vocab]
-
-        edge_mgr = to_edge_rewrite_and_lower(
-            exported_program,
-            ep_passes=[BroadcastPass()],
-            partitioner=[GgmlPartitioner()],
-        )
-        et_module = edge_mgr.to_executorch()
-        pte_model = _load_for_executorch_from_buffer(et_module.buffer)
-
-        ggml_out = pte_model.forward((input_ids,))
-        ggml_logits = ggml_out[0][0, -1]  # [vocab]
-
-        top_k = 1024
-        eager_top_ids = eager_logits.topk(top_k).indices
-        eager_top_vals = eager_logits[eager_top_ids]
-        ggml_top_vals = ggml_logits[eager_top_ids]
-        cos = torch.nn.functional.cosine_similarity(
-            eager_top_vals.unsqueeze(0), ggml_top_vals.unsqueeze(0)
-        ).item()
-
-        max_diff = (eager_logits - ggml_logits).abs().max().item()
-        eager_argmax = eager_logits.argmax().item()
-        ggml_argmax = ggml_logits.argmax().item()
-
-        print(f"Cosine(top-{top_k}): {cos:.6f}")
-        print(f"Max |eager - ggml|: {max_diff:.6f}")
-        print(f"Eager argmax: {eager_argmax}, GGML argmax: {ggml_argmax}")
-
-        # Bring-up gate: no crash, finite logits, and reasonable numerical proximity.
-        assert ggml_logits.shape == eager_logits.shape
-        assert torch.isfinite(ggml_logits).all()
-        assert 0 <= ggml_argmax < ggml_logits.numel()
-        # Keep thresholds loose while we stabilize no-KV correctness.
-        assert cos > 0.70, f"Cosine similarity too low: {cos:.4f}"
-        assert max_diff < 30.0, f"Max diff too large: {max_diff:.4f}"
-
-
-@pytest.mark.xfail(
-    reason="REPEAT broadcast issue: ggml cannot handle [1,16,1,512] + [1,512] broadcast"
-)
 class TestQwen3WithSDPAPreservation:
     """Test Qwen3 with SDPA preserved (not decomposed).
 
-    This test is expected to fail due to REPEAT broadcast issues in ggml backend.
-    The model has ADD operations with incompatible broadcast shapes that ggml cannot handle.
+    Uses to_edge_transform_and_lower which preserves SDPA via
+    ops_to_not_decompose, with all ops delegated to the ggml backend.
     """
 
     def test_single_token_with_sdpa_preserved(self):
-        """Test 1-token forward with SDPA preserved."""
+        """Test 1-token forward with SDPA preserved and verify numerical accuracy."""
         from executorch_ggml import GgmlPartitioner
-        from executorch_ggml.edge_pipeline import to_edge_rewrite_and_lower
         from executorch_ggml.passes.replace_copy_ops_pass import ReplaceCopyOpsPass
         from executorch.extension.pybindings.portable_lib import (
             _load_for_executorch_from_buffer,
@@ -143,25 +31,48 @@ class TestQwen3WithSDPAPreservation:
 
         ep = torch.export.load("/tmp/qwen3_0_6b_ggml_export/qwen3_0_6b.pt2")
 
-        # Use to_edge_transform_and_lower which preserves SDPA via ops_to_not_decompose
+        # Eager reference
+        tokens = torch.tensor([[151644]], dtype=torch.long)
+        input_pos = torch.tensor([0], dtype=torch.long)
+        with torch.no_grad():
+            eager_logits = ep.module()(tokens, {"input_pos": input_pos})
+
+        # GGML backend
         edge_mgr = to_edge_transform_and_lower(
             ep,
             partitioner=[GgmlPartitioner()],
             transform_passes=[ReplaceCopyOpsPass()],
         )
-
         et_module = edge_mgr.to_executorch()
         pte_model = _load_for_executorch_from_buffer(et_module.buffer)
+        output = pte_model.forward((tokens, input_pos))
+        ggml_logits = output[0]
 
-        # Single token input
-        input_ids = torch.tensor([[151644]], dtype=torch.long)
-        output = pte_model.forward((input_ids,))
+        # Shape check
+        eager_flat = eager_logits.detach().view(-1)
+        ggml_flat = ggml_logits.detach().view(-1)
+        assert eager_flat.shape == ggml_flat.shape, (
+            f"Shape mismatch: eager={eager_flat.shape} ggml={ggml_flat.shape}"
+        )
 
-        # Should produce valid output
-        assert output[0].shape[0] == 1  # batch
-        assert output[0].shape[1] == 1  # seq_len
-        assert output[0].shape[2] > 0  # vocab_size
-        assert torch.isfinite(output[0]).all()
+        # Numerical checks
+        cos_sim = torch.nn.functional.cosine_similarity(
+            eager_flat.unsqueeze(0), ggml_flat.unsqueeze(0)
+        ).item()
+        max_diff = (eager_flat - ggml_flat).abs().max().item()
+        eager_argmax = eager_flat.argmax().item()
+        ggml_argmax = ggml_flat.argmax().item()
+
+        print(f"Cosine similarity: {cos_sim:.6f}")
+        print(f"Max |eager - ggml|: {max_diff:.6f}")
+        print(f"Eager argmax: {eager_argmax}, GGML argmax: {ggml_argmax}")
+
+        assert torch.isfinite(ggml_flat).all()
+        assert cos_sim > 0.99, f"Cosine similarity too low: {cos_sim:.4f}"
+        assert max_diff < 1.0, f"Max diff too large: {max_diff:.4f}"
+        assert eager_argmax == ggml_argmax, (
+            f"Argmax mismatch: eager={eager_argmax} ggml={ggml_argmax}"
+        )
 
 
 if __name__ == "__main__":

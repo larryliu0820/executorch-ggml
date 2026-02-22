@@ -235,10 +235,16 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     constant_data_size += n_elems * elem_size;
   }
 
+  // Estimate graph size: 4× the IR tensors to account for compound ops.
+  size_t est_graph_size = static_cast<size_t>(n_tensors) * 4;
+  if (est_graph_size < GGML_DEFAULT_GRAPH_SIZE) {
+    est_graph_size = GGML_DEFAULT_GRAPH_SIZE;
+  }
+
   size_t ctx_size =
       static_cast<size_t>(n_tensors) * ggml_tensor_overhead() +
       constant_data_size +
-      ggml_graph_overhead() +
+      ggml_graph_overhead_custom(est_graph_size, false) +
       4ull * 1024 * 1024 * 1024;  // 4GB headroom for intermediate op tensors and graph nodes
 
   struct ggml_init_params params = {
@@ -543,7 +549,10 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
               gt = ggml_repeat(ctx, b, a);
             } else {
               fprintf(stderr,
-                      "[executorch-ggml] REPEAT shape not repeatable: a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
+                      "[executorch-ggml] REPEAT shape not repeatable (tensor %d, srcs=[%d,%d]): a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
+                      (int)i,
+                      (int)(t->src_ids() && t->src_ids()->size() > 0 ? t->src_ids()->Get(0) : -1),
+                      (int)(t->src_ids() && t->src_ids()->size() > 1 ? t->src_ids()->Get(1) : -1),
                       (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
                       (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
               ggml_free(ctx);
@@ -1291,12 +1300,19 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           break;
 
         case ggml_ir::OpCode::BMM: {
-          // TODO: BMM implementation needs work - the tensor layout handling
-          // for batched matrix multiply is complex. For now, fall through to
-          // unsupported error so BMM ops stay on host.
-          fprintf(stderr, "[executorch-ggml] BMM op not yet implemented\n");
-          ggml_free(ctx);
-          return Error::NotSupported;
+          // Batch matrix multiply: bmm(a, b)
+          // PyTorch: a is [B, M, K], b is [B, K, N], result is [B, M, N]
+          // ggml ne format (reversed from PyTorch):
+          //   a: [K, M, B, 1], b: [N, K, B, 1], out: [N, M, B, 1]
+          // ggml_mul_mat(weight, input) requires weight->ne[0] == input->ne[0]
+          // But b has ne[0]=N, a has ne[0]=K, so we need to transpose b first.
+          struct ggml_tensor* a = srcs[0];  // [K, M, B, 1]
+          struct ggml_tensor* b = srcs[1];  // [N, K, B, 1]
+          
+          // Transpose b to get [K, N, B, 1] so ne[0]=K matches a->ne[0]=K
+          struct ggml_tensor* b_t = ggml_cont(ctx, ggml_transpose(ctx, b));
+          gt = ggml_mul_mat(ctx, b_t, a);  // result: [N, M, B, 1]
+          break;
         }
 
         case ggml_ir::OpCode::SIGMOID:
@@ -1783,8 +1799,8 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     }
   }
 
-  // Build compute graph
-  struct ggml_cgraph* graph = ggml_new_graph(ctx);
+  // Build compute graph using the same estimated size from above.
+  struct ggml_cgraph* graph = ggml_new_graph_custom(ctx, est_graph_size, false);
   for (auto* out : output_tensors) {
     ggml_build_forward_expand(graph, out);
   }
