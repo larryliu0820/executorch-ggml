@@ -43,51 +43,17 @@ GgmlBackendInterface       # C++ runtime: deserializes IR, builds ggml_cgraph,
 (init / execute / destroy)   executes via ggml_graph_compute
 ```
 
-## Currently Supported Ops
+## Supported Models
 
-| ATen Op | ggml Op | Notes |
-|---------|---------|-------|
-| `aten.addmm` | `MUL_MAT` + `ADD` | Linear layer with bias |
-| `aten.mm` | `MUL_MAT` | Linear layer without bias |
-| `aten.t` / `aten.permute_copy` | *(no-op)* | Looked through; ggml layout already matches |
-| `aten.leaky_relu` | `LEAKY_RELU` | With configurable negative slope |
-| `aten.convolution` / `aten.conv2d` | `CONV_2D` | regular conv |
-| `aten.convolution` / `aten.conv2d` | `CONV_2D_DW` | depthwise conv (groups>1) |
-| `aten.hardtanh` / `aten.clamp` | `HARDTANH` | used for ReLU6/clamp |
-| `aten.add.Tensor` | `ADD` | residual connections (alpha==1) |
-| `aten.mean.dim` | `MEAN` | supports MV2 global avg pool (mean over H,W) via `ggml_pool_2d(AVG, ...)` |
-| `aten.view` / `aten.reshape` | `VIEW` | reshape/view |
-| `aten.permute` / `aten.permute_copy` | `PERMUTE` | transpose dims |
-| `dim_order_ops._clone_dim_order` | *(no-op)* | look-through layout materialization |
+| Model | Status | Notes |
+|-------|--------|-------|
+| MobileNetV2 | Full | Requires `BatchNormFoldingRewritePass` to fold Conv+BN patterns |
+| Linear + ReLU | Full | Basic MLP architectures |
+| Custom CNNs | Partial | Conv2d, depthwise conv, pooling, activations supported |
 
-### MobileNetV2 status
+Models with BatchNorm layers require the `BatchNormFoldingRewritePass` to fold BN parameters into preceding convolutions before partitioning. Use `to_edge_rewrite_and_lower(..., ep_passes=[BatchNormFoldingRewritePass()])`.
 
-`torchvision.models.mobilenet_v2(weights=None)` can now be exported, lowered, and executed end-to-end
-on the ggml backend when you run BN folding rewrite before partitioning.
-
-Notes:
-- ggml conv (CPU im2col) has dtype contracts; we store conv weights as fp16 and keep runtime activations fp32.
-- conv outputs are cast back to fp32 to avoid mixed-type residual adds.
-
-### BatchNorm folding (Conv+BN)
-
-MobileNetV2-style graphs often contain the pattern:
-
-`conv -> batch_norm (inference) -> getitem(0)`
-
-To avoid BN’s tuple-return semantics inside delegated subgraphs, we provide an
-**ExportedProgram-level rewrite pass** that folds BN parameters into the upstream
-conv weights/bias and removes the BN/getitem nodes:
-
-- `executorch_ggml.passes.BatchNormFoldingRewritePass`
-
-This pass is intended to run **after** `to_edge(...)` and **before** partitioning.
-Use `executorch_ggml.to_edge_rewrite_and_lower(..., ep_passes=[...])` to compose
-these ExportedProgram rewrites into the standard ExecuTorch lowering pipeline.
-
-For MobileNetV2, you should include this pass in `ep_passes`.
-
-More ops can be added by extending the `OpCode` enum in `schema/ggml_ir.fbs`, the ATen→IR mapping in `ggml_backend.py`, and the ggml builder call in `ggml_backend.cpp`.
+Unsupported ops automatically fall back to ExecuTorch's CPU executor.
 
 ## Quick Start
 
@@ -121,24 +87,36 @@ These methods will install the latest `executorch` nightly version from PyTorch'
 
 ### Python (ahead-of-time compilation)
 
+**Simple model (no BatchNorm):**
 ```python
 import torch
-import torch.nn as nn
 from torch.export import export
+from executorch.exir import to_edge_transform_and_lower
+from executorch_ggml import GgmlPartitioner
+
+model = torch.nn.Sequential(
+    torch.nn.Linear(4, 8),
+    torch.nn.LeakyReLU(0.1),
+).eval()
+
+exported = export(model, (torch.randn(2, 4),))
+edge = to_edge_transform_and_lower(exported, partitioner=[GgmlPartitioner()])
+et_program = edge.to_executorch()
+
+with open("model.pte", "wb") as f:
+    f.write(et_program.buffer)
+```
+
+**MobileNetV2 (with BatchNorm folding):**
+```python
+import torch
+from torch.export import export
+from torchvision.models import mobilenet_v2
 from executorch_ggml import GgmlPartitioner, to_edge_rewrite_and_lower
 from executorch_ggml.passes import BatchNormFoldingRewritePass
 
-class MyModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.linear = nn.Linear(4, 8)
-        self.leaky_relu = nn.LeakyReLU(0.1)
-
-    def forward(self, x):
-        return self.leaky_relu(self.linear(x))
-
-model = MyModel().eval()
-exported = export(model, (torch.randn(2, 4),))
+model = mobilenet_v2(weights=None).eval()
+exported = export(model, (torch.randn(1, 3, 224, 224),))
 edge = to_edge_rewrite_and_lower(
     exported,
     ep_passes=[BatchNormFoldingRewritePass()],
@@ -146,7 +124,7 @@ edge = to_edge_rewrite_and_lower(
 )
 et_program = edge.to_executorch()
 
-with open("model.pte", "wb") as f:
+with open("mobilenet_v2.pte", "wb") as f:
     f.write(et_program.buffer)
 ```
 
