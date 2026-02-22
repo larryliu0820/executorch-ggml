@@ -1355,8 +1355,13 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     out_shape = list(fake_val.shape) if fake_val is not None else []
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
 
-                    # Make broadcasting explicit with OP_REPEAT where possible.
+                    # Make broadcasting explicit with OP_REPEAT where needed.
                     x_val = (
                         x_node.meta.get("val")
                         if isinstance(x_node, torch.fx.Node)
@@ -1374,17 +1379,12 @@ class GgmlBackend(BackendDetails):
                         list(getattr(y_val, "shape", [])) if y_val is not None else []
                     )
 
-                    def _n_non1(sh):
-                        return sum(1 for d in sh if int(d) != 1)
-
-                    def _numel(sh):
-                        n = 1
-                        for d in sh:
-                            n *= int(d)
-                        return n
-
-                    like_id = None
-                    if out_shape and x_shape and y_shape and (x_shape != y_shape):
+                    if (
+                        out_shape
+                        and x_shape
+                        and y_shape
+                        and (x_shape != out_shape or y_shape != out_shape)
+                    ):
                         # Check if ggml_repeat can handle the broadcast
                         x_ne = _pytorch_shape_to_ggml_ne(x_shape)
                         y_ne = _pytorch_shape_to_ggml_ne(y_shape)
@@ -1398,61 +1398,45 @@ class GgmlBackend(BackendDetails):
                         )
 
                         if not (x_can_repeat and y_can_repeat):
-                            # Can't handle this broadcast in ggml, fall back to host
                             raise RuntimeError(
                                 f"ADD broadcast not supported: x={x_shape} -> {x_ne}, "
                                 f"y={y_shape} -> {y_ne}, out={out_shape} -> {out_ne}"
                             )
 
+                        # Create "like" tensor for REPEAT target shape
                         like_id = alloc_id()
                         ir_tensors.append(
                             IrTensor(
                                 tensor_id=like_id,
-                                tensor_type=TYPE_F32,
-                                ne=_pytorch_shape_to_ggml_ne(out_shape),
+                                tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                                ne=out_ne,
                                 op=OP_NONE,
                                 is_input=False,
                             )
                         )
 
-                        # repeat the smaller/broadcasted side
-                        if (_n_non1(x_shape), _numel(x_shape)) < (
-                            _n_non1(y_shape),
-                            _numel(y_shape),
-                        ):
+                        # REPEAT x if it doesn't match output shape
+                        if x_shape != out_shape:
                             x_rep = alloc_id()
                             ir_tensors.append(
                                 IrTensor(
                                     tensor_id=x_rep,
-                                    tensor_type=TYPE_F32,
-                                    ne=_pytorch_shape_to_ggml_ne(out_shape),
+                                    tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                                    ne=out_ne,
                                     op=OP_REPEAT,
                                     src_ids=[x_id, like_id],
                                 )
                             )
                             x_id = x_rep
-                        elif (_n_non1(y_shape), _numel(y_shape)) < (
-                            _n_non1(x_shape),
-                            _numel(x_shape),
-                        ):
+
+                        # REPEAT y if it doesn't match output shape
+                        if y_shape != out_shape:
                             y_rep = alloc_id()
                             ir_tensors.append(
                                 IrTensor(
                                     tensor_id=y_rep,
-                                    tensor_type=TYPE_F32,
-                                    ne=_pytorch_shape_to_ggml_ne(out_shape),
-                                    op=OP_REPEAT,
-                                    src_ids=[y_id, like_id],
-                                )
-                            )
-                            y_id = y_rep
-                        else:
-                            y_rep = alloc_id()
-                            ir_tensors.append(
-                                IrTensor(
-                                    tensor_id=y_rep,
-                                    tensor_type=TYPE_F32,
-                                    ne=_pytorch_shape_to_ggml_ne(out_shape),
+                                    tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                                    ne=out_ne,
                                     op=OP_REPEAT,
                                     src_ids=[y_id, like_id],
                                 )
@@ -1463,7 +1447,7 @@ class GgmlBackend(BackendDetails):
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
-                            tensor_type=TYPE_F32,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
                             ne=_pytorch_shape_to_ggml_ne(out_shape),
                             op=OP_ADD,
                             src_ids=[x_id, y_id],
@@ -1473,10 +1457,34 @@ class GgmlBackend(BackendDetails):
 
                 elif "aten.type_as.default" in target_str:
                     # type_as(input, other) casts input to other's dtype.
-                    # In the Qwen3 graph both tensors are already f32→f32, so this
-                    # is a no-op.  Treat as an identity (look-through).
                     src_node = node.args[0]
-                    node_to_id[node] = node_to_id[src_node]
+                    other_node = node.args[1]
+                    src_id = node_to_id[src_node]
+
+                    src_val = src_node.meta.get("val") if hasattr(src_node, "meta") else None
+                    other_val = other_node.meta.get("val") if hasattr(other_node, "meta") else None
+                    src_dtype = getattr(src_val, "dtype", torch.float32) if src_val is not None else torch.float32
+                    target_dtype = getattr(other_val, "dtype", torch.float32) if other_val is not None else torch.float32
+
+                    if src_dtype == target_dtype:
+                        # No cast needed - use identity
+                        node_to_id[node] = src_id
+                    else:
+                        # Need to cast
+                        fake_val = node.meta.get("val")
+                        shape = list(fake_val.shape) if fake_val is not None else []
+                        tid = alloc_id()
+                        ir_tensors.append(
+                            IrTensor(
+                                tensor_id=tid,
+                                tensor_type=_torch_dtype_to_ir_type(target_dtype),
+                                ne=_pytorch_shape_to_ggml_ne(shape),
+                                op=OP_CAST,
+                                src_ids=[src_id],
+                                op_params=pack_cast_params(_torch_dtype_to_ir_type(target_dtype)),
+                            )
+                        )
+                        node_to_id[node] = tid
 
                 elif (
                     "aten.alias.default" in target_str
@@ -1896,18 +1904,6 @@ class GgmlBackend(BackendDetails):
                         )
                     )
                     node_to_id[node] = tid
-
-                elif "aten.item.default" in target_str:
-                    # item() - extracts scalar from 0-d or 1-element tensor
-                    # For delegation purposes, pass through the source tensor
-                    src_node = node.args[0]
-                    node_to_id[node] = node_to_id[src_node]
-
-                elif "aten.sym_size.int" in target_str:
-                    # sym_size.int returns a scalar (SymInt), not a tensor
-                    # This is used for dynamic shapes - skip in lowering
-                    # The shape info is already captured in tensor metadata
-                    pass
 
                 elif "aten.to.dtype" in target_str or "aten.to.dtype_layout" in target_str:
                     # Type casting - use CAST op
