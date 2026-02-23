@@ -30,8 +30,11 @@ _COPY_TO_ORIGINAL: Dict[
     ops.edge.aten.expand_copy.default: ops.edge.aten.expand.default,
     torch.ops.aten.alias_copy.default: torch.ops.aten.alias.default,
     ops.edge.aten.alias_copy.default: ops.edge.aten.alias.default,
-    torch.ops.aten.clone.default: torch.ops.aten.alias.default,
-    ops.edge.aten.clone.default: ops.edge.aten.alias.default,
+    # NOTE: clone -> alias is NOT safe in general because clone ensures contiguity
+    # which is required before view/reshape on expanded tensors.
+    # Uncomment only if you're sure the graph doesn't have expand->clone->view patterns.
+    # torch.ops.aten.clone.default: torch.ops.aten.alias.default,
+    # ops.edge.aten.clone.default: ops.edge.aten.alias.default,
 }
 
 

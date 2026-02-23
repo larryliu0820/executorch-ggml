@@ -32,16 +32,6 @@ class CMakeExtension(Extension):
 
 class CMakeBuild(build_ext):
     def run(self) -> None:
-        # IMPORTANT: pip build isolation environments typically won't have
-        # pybind11/executorch available. We only build the native extension
-        # when explicitly requested.
-        if os.environ.get("EXECUTORCH_GGML_BUILD_NATIVE", "0") not in {"1", "true", "True", "yes"}:
-            print(
-                "[executorch-ggml] Skipping native extension build. "
-                "Set EXECUTORCH_GGML_BUILD_NATIVE=1 to build _ggml_backend."
-            )
-            return
-
         for ext in self.extensions:
             self.build_extension(ext)
 

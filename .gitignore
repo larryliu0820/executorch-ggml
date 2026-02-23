@@ -1,6 +1,6 @@
 # Build
 build/
-cmake-build-*/
+cmake-out/
 
 # Python
 __pycache__/
@@ -13,6 +13,8 @@ dist/
 *_generated.h
 
 # Artifacts
+.cache/
+.claude/
 .venv/
 model*.pte
 python/executorch_ggml/*.so
