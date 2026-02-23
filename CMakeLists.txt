@@ -33,6 +33,24 @@ add_custom_target(ggml_ir_gen)
 # ---------------------------------------------------------------------------
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+# Metal backend option (defaults to ON on macOS)
+if(APPLE)
+  option(EXECUTORCH_GGML_BUILD_METAL "Build with Metal GPU acceleration" ON)
+else()
+  option(EXECUTORCH_GGML_BUILD_METAL "Build with Metal GPU acceleration" OFF)
+endif()
+
+# Enable Metal in ggml if requested
+if(EXECUTORCH_GGML_BUILD_METAL AND APPLE)
+  set(GGML_METAL ON CACHE BOOL "Enable Metal backend on macOS" FORCE)
+  set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "Embed Metal library" FORCE)
+  message(STATUS "Metal backend: ENABLED")
+else()
+  set(GGML_METAL OFF CACHE BOOL "Enable Metal backend on macOS" FORCE)
+  message(STATUS "Metal backend: DISABLED")
+endif()
+
 add_subdirectory("${LLAMA_CPP_DIR}/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
 
 # ---------------------------------------------------------------------------
@@ -138,6 +156,10 @@ target_link_libraries(executorch_ggml_backend_py PRIVATE
 )
 if(TARGET ggml-blas)
   target_link_libraries(executorch_ggml_backend_py PRIVATE ggml-blas)
+endif()
+if(TARGET ggml-metal)
+  target_link_libraries(executorch_ggml_backend_py PRIVATE ggml-metal)
+  target_compile_definitions(executorch_ggml_backend_py PRIVATE GGML_USE_METAL=1)
 endif()
 
 # ExecuTorch symbols are expected to resolve from the already-loaded

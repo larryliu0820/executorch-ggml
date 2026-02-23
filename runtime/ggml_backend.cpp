@@ -16,6 +16,11 @@
 
 #include <ggml.h>
 #include <ggml-cpu.h>
+#include <ggml-backend.h>
+
+#ifdef GGML_USE_METAL
+#include <ggml-metal.h>
+#endif
 
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/core/error.h>
@@ -182,6 +187,12 @@ struct GgmlDelegateHandle {
 
   // Separate compute context for graph_compute (needs its own memory)
   struct ggml_context* compute_ctx = nullptr;
+
+  // Backend handles for compute acceleration
+  ggml_backend_t backend_cpu = nullptr;
+#ifdef GGML_USE_METAL
+  ggml_backend_t backend_metal = nullptr;
+#endif
 };
 
 // ---------------------------------------------------------------------------
@@ -1889,6 +1900,17 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
   };
   handle->compute_ctx = ggml_init(compute_params);
 
+  // Initialize compute backends
+  // Try Metal first on macOS, fall back to CPU
+#ifdef GGML_USE_METAL
+  handle->backend_metal = ggml_backend_metal_init();
+  if (handle->backend_metal) {
+    // Metal backend initialized successfully
+  }
+#endif
+  // Always initialize CPU backend as fallback
+  handle->backend_cpu = ggml_backend_cpu_init();
+
   return handle;
 }
 
@@ -1943,10 +1965,22 @@ Error GgmlBackendInterface::execute(
     }
   }
 
-  // Execute the graph
-  int n_threads = 1;
+  // Execute the graph using the best available backend
   if (handle->graph) {
-    ggml_graph_compute_with_ctx(handle->ctx, handle->graph, n_threads);
+#ifdef GGML_USE_METAL
+    if (handle->backend_metal) {
+      // Use Metal backend for GPU acceleration
+      ggml_backend_graph_compute(handle->backend_metal, handle->graph);
+    } else
+#endif
+    if (handle->backend_cpu) {
+      // Use CPU backend
+      ggml_backend_graph_compute(handle->backend_cpu, handle->graph);
+    } else {
+      // Fallback to legacy CPU compute
+      int n_threads = 1;
+      ggml_graph_compute_with_ctx(handle->ctx, handle->graph, n_threads);
+    }
   }
 
   // Copy output data from ggml tensors → ExecuTorch output tensors
@@ -1975,6 +2009,16 @@ Error GgmlBackendInterface::execute(
 void GgmlBackendInterface::destroy(DelegateHandle* handle_raw) const {
   auto* handle = reinterpret_cast<GgmlDelegateHandle*>(handle_raw);
   if (handle) {
+    // Free backends
+#ifdef GGML_USE_METAL
+    if (handle->backend_metal) {
+      ggml_backend_free(handle->backend_metal);
+    }
+#endif
+    if (handle->backend_cpu) {
+      ggml_backend_free(handle->backend_cpu);
+    }
+
     if (handle->compute_ctx) {
       ggml_free(handle->compute_ctx);
     }

@@ -47,6 +47,12 @@ target_link_libraries(executorch_ggml_runtime PRIVATE
   ggml-cpu
 )
 
+# Link Metal backend on macOS
+if(TARGET ggml-metal)
+  target_link_libraries(executorch_ggml_runtime PRIVATE ggml-metal)
+  target_compile_definitions(executorch_ggml_runtime PRIVATE GGML_USE_METAL=1)
+endif()
+
 # ExecuTorch libraries (link order matters)
 find_library(EXECUTORCH_LIB executorch PATHS "${EXECUTORCH_DIR}/lib" NO_DEFAULT_PATH)
 if(EXECUTORCH_LIB)
