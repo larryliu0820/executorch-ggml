@@ -227,6 +227,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     size_t elem_size = 4; // default F32
     switch (static_cast<ggml_ir::TensorType>(t->type())) {
       case ggml_ir::TensorType::F16:  elem_size = 2; break;
+      case ggml_ir::TensorType::BF16: elem_size = 2; break;
       case ggml_ir::TensorType::I32:  elem_size = 4; break;
       case ggml_ir::TensorType::I64:  elem_size = 8; break;
       case ggml_ir::TensorType::BOOL: elem_size = 4; break; // stored as I32
@@ -313,6 +314,9 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           // Represent bool tensors as I32 in ggml to avoid unsupported ops on I8
           // (e.g. get_rows has limited support for I8).
           gtype = GGML_TYPE_I32;
+          break;
+        case ggml_ir::TensorType::BF16:
+          gtype = GGML_TYPE_BF16;
           break;
         case ggml_ir::TensorType::F32:
         default:

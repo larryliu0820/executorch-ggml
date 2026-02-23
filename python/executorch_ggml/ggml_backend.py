@@ -68,6 +68,7 @@ from executorch_ggml.serialize import (
     TYPE_I64,
     TYPE_I32,
     TYPE_BOOL,
+    TYPE_BF16,
     # Packers
     pack_float,
     pack_i32,
@@ -125,6 +126,8 @@ def _torch_dtype_to_ir_type(dtype: torch.dtype) -> int:
         return TYPE_F16
     if dtype == torch.float32:
         return TYPE_F32
+    if dtype == torch.bfloat16:
+        return TYPE_BF16
     if dtype == torch.int64:
         return TYPE_I64
     if dtype == torch.int32:

@@ -91,6 +91,7 @@ enum TensorType : int32 {
     I64 = 2,
     I32 = 3,
     BOOL = 4,
+    BF16 = 5,
 }
 
 table Tensor {

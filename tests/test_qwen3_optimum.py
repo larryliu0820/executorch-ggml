@@ -39,7 +39,7 @@ class TestQwen3OptimumExport(unittest.TestCase):
         eager_model = AutoModelForCausalLM.from_pretrained(
             model_id,
             device_map="cpu",
-            torch_dtype=torch.float32,
+            torch_dtype=torch.bfloat16,
             config=config,
             attn_implementation="sdpa",
             generation_config=GenerationConfig(
@@ -130,7 +130,7 @@ class TestQwen3OptimumExport(unittest.TestCase):
         eager_model = AutoModelForCausalLM.from_pretrained(
             model_id,
             device_map="cpu",
-            torch_dtype=torch.float32,
+            torch_dtype=torch.bfloat16,
             config=config,
             attn_implementation="sdpa",
             generation_config=GenerationConfig(
