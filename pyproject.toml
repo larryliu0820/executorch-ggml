@@ -9,13 +9,15 @@ description = "ExecuTorch backend delegating to ggml"
 readme = "README.md"
 license = "BSD-3-Clause"
 authors = [
-    {name = "Larry Liu"}
+    {name = "Mengwei Liu"}
 ]
 requires-python = ">=3.10"
 dependencies = [
     "flatbuffers>=24.3.25",
     "torch>=2.4.0",
     "executorch>=1.1.0",
+    "optimum-executorch",
+    "transformers",
 ]
 
 [project.optional-dependencies]

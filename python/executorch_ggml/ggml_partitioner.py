@@ -54,6 +54,8 @@ _SUPPORTED_OP_NAMES = {
     "aten.scalar_tensor.default",
     "aten._assert_tensor_metadata.default",
     "aten.full_like.default",
+    "aten.clone.default",
+    "aten._to_copy.default",
     # RoPE ops
     "aten.bmm.default",
     "aten.cos.default",

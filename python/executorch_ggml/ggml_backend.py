@@ -444,6 +444,10 @@ class GgmlBackend(BackendDetails):
                     node_to_id[node] = tid
 
                 elif "aten.mul.Tensor" in target_str:
+                    # mul(a, b)
+                    # NOTE: Broadcasting should be handled by BroadcastCanonicalizationPass
+                    # which inserts explicit expand_copy ops. This lowering expects inputs
+                    # to already have matching shapes.
                     a_node, b_node = node.args[0], node.args[1]
                     a_id = node_to_id[a_node]
                     b_id = node_to_id[b_node]
@@ -455,9 +459,8 @@ class GgmlBackend(BackendDetails):
                         else torch.float32
                     )
 
-                    # Make broadcasting explicit with OP_REPEAT where needed.
-                    # ggml_mul requires ggml_can_repeat(b, a) which fails for
-                    # cases like [1,3,1] * [1,1,64] where neither can repeat into other.
+                    # Strict shape check: inputs must match output shape
+                    # BroadcastCanonicalizationPass should have handled any broadcasting
                     a_val = (
                         a_node.meta.get("val")
                         if isinstance(a_node, torch.fx.Node)
@@ -475,74 +478,13 @@ class GgmlBackend(BackendDetails):
                         list(getattr(b_val, "shape", [])) if b_val is not None else []
                     )
 
-                    like_id = None
-                    if (
-                        out_shape
-                        and a_shape
-                        and b_shape
-                        and (a_shape != out_shape or b_shape != out_shape)
-                    ):
-                        # Check if ggml_repeat can handle the broadcast
-                        # Convert to ggml shapes for compatibility check
-                        a_ne = _pytorch_shape_to_ggml_ne(a_shape)
-                        b_ne = _pytorch_shape_to_ggml_ne(b_shape)
-                        out_ne = _pytorch_shape_to_ggml_ne(out_shape)
-
-                        # Check if a can repeat to output shape
-                        a_can_repeat = all(
-                            a_ne[i] == 1 or a_ne[i] == out_ne[i] for i in range(4)
-                        )
-                        # Check if b can repeat to output shape
-                        b_can_repeat = all(
-                            b_ne[i] == 1 or b_ne[i] == out_ne[i] for i in range(4)
-                        )
-
-                        if not (a_can_repeat and b_can_repeat):
-                            # Can't handle this broadcast in ggml, fall back to host
+                    if out_shape and a_shape and b_shape:
+                        if a_shape != out_shape or b_shape != out_shape:
                             raise RuntimeError(
-                                f"MUL broadcast not supported: a={a_shape} -> {a_ne}, "
-                                f"b={b_shape} -> {b_ne}, out={out_shape} -> {out_ne}"
+                                f"MUL requires inputs to match output shape. "
+                                f"Got a={a_shape}, b={b_shape}, out={out_shape}. "
+                                f"Run BroadcastCanonicalizationPass to make broadcasts explicit."
                             )
-
-                        # Create a "like" tensor for REPEAT target shape
-                        like_id = alloc_id()
-                        ir_tensors.append(
-                            IrTensor(
-                                tensor_id=like_id,
-                                tensor_type=_torch_dtype_to_ir_type(out_dtype),
-                                ne=out_ne,
-                                op=OP_NONE,
-                                is_input=False,
-                            )
-                        )
-
-                        # REPEAT a if it doesn't match output shape
-                        if a_shape != out_shape:
-                            a_rep = alloc_id()
-                            ir_tensors.append(
-                                IrTensor(
-                                    tensor_id=a_rep,
-                                    tensor_type=_torch_dtype_to_ir_type(out_dtype),
-                                    ne=out_ne,
-                                    op=OP_REPEAT,
-                                    src_ids=[a_id, like_id],
-                                )
-                            )
-                            a_id = a_rep
-
-                        # REPEAT b if it doesn't match output shape
-                        if b_shape != out_shape:
-                            b_rep = alloc_id()
-                            ir_tensors.append(
-                                IrTensor(
-                                    tensor_id=b_rep,
-                                    tensor_type=_torch_dtype_to_ir_type(out_dtype),
-                                    ne=out_ne,
-                                    op=OP_REPEAT,
-                                    src_ids=[b_id, like_id],
-                                )
-                            )
-                            b_id = b_rep
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1342,6 +1284,9 @@ class GgmlBackend(BackendDetails):
 
                 elif "aten.add.Tensor" in target_str:
                     # add(x, y, alpha=1)
+                    # NOTE: Broadcasting should be handled by BroadcastCanonicalizationPass
+                    # which inserts explicit expand_copy ops. This lowering expects inputs
+                    # to already have matching shapes.
                     x_node, y_node = node.args[0], node.args[1]
                     # Edge graphs usually pass alpha as a kwarg.
                     alpha = float(getattr(node, "kwargs", {}).get("alpha", 1))
@@ -1361,7 +1306,8 @@ class GgmlBackend(BackendDetails):
                         else torch.float32
                     )
 
-                    # Make broadcasting explicit with OP_REPEAT where needed.
+                    # Strict shape check: inputs must match output shape
+                    # BroadcastCanonicalizationPass should have handled any broadcasting
                     x_val = (
                         x_node.meta.get("val")
                         if isinstance(x_node, torch.fx.Node)
@@ -1379,69 +1325,13 @@ class GgmlBackend(BackendDetails):
                         list(getattr(y_val, "shape", [])) if y_val is not None else []
                     )
 
-                    if (
-                        out_shape
-                        and x_shape
-                        and y_shape
-                        and (x_shape != out_shape or y_shape != out_shape)
-                    ):
-                        # Check if ggml_repeat can handle the broadcast
-                        x_ne = _pytorch_shape_to_ggml_ne(x_shape)
-                        y_ne = _pytorch_shape_to_ggml_ne(y_shape)
-                        out_ne = _pytorch_shape_to_ggml_ne(out_shape)
-
-                        x_can_repeat = all(
-                            x_ne[i] == 1 or x_ne[i] == out_ne[i] for i in range(4)
-                        )
-                        y_can_repeat = all(
-                            y_ne[i] == 1 or y_ne[i] == out_ne[i] for i in range(4)
-                        )
-
-                        if not (x_can_repeat and y_can_repeat):
+                    if out_shape and x_shape and y_shape:
+                        if x_shape != out_shape or y_shape != out_shape:
                             raise RuntimeError(
-                                f"ADD broadcast not supported: x={x_shape} -> {x_ne}, "
-                                f"y={y_shape} -> {y_ne}, out={out_shape} -> {out_ne}"
+                                f"ADD requires inputs to match output shape. "
+                                f"Got x={x_shape}, y={y_shape}, out={out_shape}. "
+                                f"Run BroadcastCanonicalizationPass to make broadcasts explicit."
                             )
-
-                        # Create "like" tensor for REPEAT target shape
-                        like_id = alloc_id()
-                        ir_tensors.append(
-                            IrTensor(
-                                tensor_id=like_id,
-                                tensor_type=_torch_dtype_to_ir_type(out_dtype),
-                                ne=out_ne,
-                                op=OP_NONE,
-                                is_input=False,
-                            )
-                        )
-
-                        # REPEAT x if it doesn't match output shape
-                        if x_shape != out_shape:
-                            x_rep = alloc_id()
-                            ir_tensors.append(
-                                IrTensor(
-                                    tensor_id=x_rep,
-                                    tensor_type=_torch_dtype_to_ir_type(out_dtype),
-                                    ne=out_ne,
-                                    op=OP_REPEAT,
-                                    src_ids=[x_id, like_id],
-                                )
-                            )
-                            x_id = x_rep
-
-                        # REPEAT y if it doesn't match output shape
-                        if y_shape != out_shape:
-                            y_rep = alloc_id()
-                            ir_tensors.append(
-                                IrTensor(
-                                    tensor_id=y_rep,
-                                    tensor_type=_torch_dtype_to_ir_type(out_dtype),
-                                    ne=out_ne,
-                                    op=OP_REPEAT,
-                                    src_ids=[y_id, like_id],
-                                )
-                            )
-                            y_id = y_rep
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1492,6 +1382,41 @@ class GgmlBackend(BackendDetails):
                 ):
                     src_node = node.args[0]
                     node_to_id[node] = node_to_id[src_node]
+
+                elif "aten.clone.default" in target_str:
+                    # clone(x) - treat as identity for ggml (no explicit copy needed)
+                    src_node = node.args[0]
+                    node_to_id[node] = node_to_id[src_node]
+
+                elif "aten._to_copy.default" in target_str:
+                    # _to_copy(x, dtype=...) - dtype conversion with copy
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+
+                    src_val = src_node.meta.get("val") if hasattr(src_node, "meta") else None
+                    src_dtype = getattr(src_val, "dtype", torch.float32) if src_val is not None else torch.float32
+
+                    fake_val = node.meta.get("val")
+                    out_dtype = fake_val.dtype if fake_val is not None else torch.float32
+                    out_shape = list(fake_val.shape) if fake_val is not None else []
+
+                    if src_dtype == out_dtype:
+                        # No cast needed - use identity
+                        node_to_id[node] = src_id
+                    else:
+                        # Need to cast
+                        tid = alloc_id()
+                        ir_tensors.append(
+                            IrTensor(
+                                tensor_id=tid,
+                                tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                                ne=_pytorch_shape_to_ggml_ne(out_shape),
+                                op=OP_CAST,
+                                src_ids=[src_id],
+                                op_params=pack_cast_params(_torch_dtype_to_ir_type(out_dtype)),
+                            )
+                        )
+                        node_to_id[node] = tid
 
                 elif "dim_order_ops._clone_dim_order.default" in target_str:
                     # `_clone_dim_order` is a layout materialization op used by
@@ -1546,6 +1471,9 @@ class GgmlBackend(BackendDetails):
 
                 elif "aten.sub.Tensor" in target_str:
                     # sub(x, y, alpha=1)
+                    # NOTE: Broadcasting should be handled by BroadcastCanonicalizationPass
+                    # which inserts explicit expand_copy ops. This lowering expects inputs
+                    # to already have matching shapes.
                     x_node, y_node = node.args[0], node.args[1]
                     x_id = node_to_id[x_node]
                     y_id = node_to_id[y_node]
@@ -1557,6 +1485,32 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.float32
                     )
+
+                    # Strict shape check: inputs must match output shape
+                    x_val = (
+                        x_node.meta.get("val")
+                        if isinstance(x_node, torch.fx.Node)
+                        else None
+                    )
+                    y_val = (
+                        y_node.meta.get("val")
+                        if isinstance(y_node, torch.fx.Node)
+                        else None
+                    )
+                    x_shape = (
+                        list(getattr(x_val, "shape", [])) if x_val is not None else []
+                    )
+                    y_shape = (
+                        list(getattr(y_val, "shape", [])) if y_val is not None else []
+                    )
+
+                    if out_shape and x_shape and y_shape:
+                        if x_shape != out_shape or y_shape != out_shape:
+                            raise RuntimeError(
+                                f"SUB requires inputs to match output shape. "
+                                f"Got x={x_shape}, y={y_shape}, out={out_shape}. "
+                                f"Run BroadcastCanonicalizationPass to make broadcasts explicit."
+                            )
 
                     tid = alloc_id()
                     ir_tensors.append(

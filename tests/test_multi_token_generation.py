@@ -17,7 +17,7 @@ class TestMultiTokenGeneration:
     def test_simple_two_tokens(self):
         """Test 2 token generation using pre-exported model without custom KV cache."""
         from executorch_ggml import GgmlPartitioner
-        from executorch_ggml.passes import RemoveGraphAssertsPass
+        from executorch_ggml.passes import RemoveGraphAssertsPass, BroadcastCanonicalizationPass
         from executorch_ggml.passes.replace_copy_ops_pass import ReplaceCopyOpsPass
         from executorch.extension.pybindings.portable_lib import (
             _load_for_executorch_from_buffer,
@@ -47,6 +47,9 @@ class TestMultiTokenGeneration:
 
         print(f"  Ref1 shape: {ref1.shape}")
         print(f"  Ref2 shape: {ref2.shape}")
+
+        # Apply BroadcastCanonicalizationPass to make broadcasts explicit
+        ep = BroadcastCanonicalizationPass().run(ep)
 
         # Lower to ggml
         print("Lowering to ggml...")

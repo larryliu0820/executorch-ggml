@@ -136,6 +136,7 @@ class TestKVCacheIndexPut:
     def test_index_put_basic(self):
         """Test basic index_put operation."""
         from executorch_ggml import GgmlPartitioner
+        from executorch_ggml.passes import BroadcastCanonicalizationPass
         from executorch.extension.pybindings.portable_lib import (
             _load_for_executorch_from_buffer,
         )
@@ -175,6 +176,9 @@ class TestKVCacheIndexPut:
         assert "index_put" in graph_str.lower(), "Expected index_put in graph"
         print("Found index_put in exported graph")
 
+        # Apply BroadcastCanonicalizationPass to make broadcasts explicit
+        ep = BroadcastCanonicalizationPass().run(ep)
+
         # Lower to ggml
         edge = to_edge_transform_and_lower(
             ep,
@@ -202,6 +206,7 @@ class TestKVCacheMultiToken:
     def test_two_token_generation(self):
         """Test generating 2 tokens with KV cache."""
         from executorch_ggml import GgmlPartitioner
+        from executorch_ggml.passes import BroadcastCanonicalizationPass
         from executorch.extension.pybindings.portable_lib import (
             _load_for_executorch_from_buffer,
         )
@@ -250,6 +255,9 @@ class TestKVCacheMultiToken:
         for node in ep.graph.nodes:
             if node.op == "call_function":
                 print(f"  {node.target}")
+
+        # Apply BroadcastCanonicalizationPass to make broadcasts explicit
+        ep = BroadcastCanonicalizationPass().run(ep)
 
         # Lower to ggml
         edge = to_edge_transform_and_lower(
