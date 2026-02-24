@@ -76,6 +76,8 @@ class TestQwen3OptimumExport(unittest.TestCase):
         # Apply BroadcastCanonicalizationPass to make broadcasts explicit
         ep = BroadcastCanonicalizationPass().run(ep)
 
+        print(f"Metadata: {exportable.metadata}")
+
         print("Lowering to edge with GgmlPartitioner...")
         edge_manager = to_edge_transform_and_lower(
             ep,
@@ -85,6 +87,7 @@ class TestQwen3OptimumExport(unittest.TestCase):
                 _skip_dim_order=True,
             ),
             transform_passes=[ReplaceCopyOpsPass(), RemoveGraphAssertsPass()],
+            constant_methods=exportable.metadata,
         )
 
         # Check delegation

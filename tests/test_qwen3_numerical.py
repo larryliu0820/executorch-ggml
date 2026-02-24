@@ -22,9 +22,11 @@ class TestQwen3WithSDPAPreservation:
 
     def test_single_token_with_sdpa_preserved(self):
         """Test 1-token forward with SDPA preserved and verify numerical accuracy."""
+        # Import executorch_ggml first to register the native backend with RTLD_GLOBAL
+        # before optimum loads _portable_lib without global symbol visibility.
+        from executorch_ggml import GgmlPartitioner
         from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
         from optimum.exporters.executorch.integrations import CausalLMExportableModule
-        from executorch_ggml import GgmlPartitioner
         from executorch_ggml.passes.replace_copy_ops_pass import ReplaceCopyOpsPass
         from executorch_ggml.passes import RemoveGraphAssertsPass, BroadcastCanonicalizationPass
         from executorch.extension.pybindings.portable_lib import (
