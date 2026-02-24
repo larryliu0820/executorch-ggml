@@ -44,6 +44,7 @@ target_include_directories(executorch_ggml_runtime PRIVATE
 
 target_link_libraries(executorch_ggml_runtime PRIVATE
   ggml
+  ggml-base
   ggml-cpu
 )
 

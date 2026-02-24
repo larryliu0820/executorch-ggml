@@ -7,16 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---------------------------------------------------------------------------
 # Required external paths
 # ---------------------------------------------------------------------------
-set(LLAMA_CPP_DIR "" CACHE PATH "Path to llama.cpp source tree (contains ggml/)")
-set(EXECUTORCH_DIR "" CACHE PATH "Path to ExecuTorch source/install tree")
+set(LLAMA_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third-party/llama.cpp" CACHE PATH "Path to llama.cpp source tree (contains ggml/)")
+set(EXECUTORCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third-party/executorch" CACHE PATH "Path to ExecuTorch source/install tree")
 
-if(NOT LLAMA_CPP_DIR)
-  message(FATAL_ERROR "LLAMA_CPP_DIR must be set (path to llama.cpp root)")
-endif()
+message("LLAMA_CPP_DIR being set to ${LLAMA_CPP_DIR}")
 
-if(NOT EXECUTORCH_DIR)
-  message(FATAL_ERROR "EXECUTORCH_DIR must be set (path to ExecuTorch root)")
-endif()
+message("EXECUTORCH_DIR being set to ${EXECUTORCH_DIR}")
 
 # ---------------------------------------------------------------------------
 # FlatBuffers – C++ header from schema
@@ -49,6 +45,17 @@ if(EXECUTORCH_GGML_BUILD_METAL AND APPLE)
 else()
   set(GGML_METAL OFF CACHE BOOL "Enable Metal backend on macOS" FORCE)
   message(STATUS "Metal backend: DISABLED")
+endif()
+
+# Auto-detect CUDA and enable ggml-cuda when available.
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+  enable_language(CUDA)
+  set(GGML_CUDA ON CACHE BOOL "ggml: use CUDA" FORCE)
+  message(STATUS "CUDA detected (${CMAKE_CUDA_COMPILER}) – enabling ggml-cuda")
+else()
+  message(STATUS "CUDA not found – ggml-cuda disabled")
 endif()
 
 add_subdirectory("${LLAMA_CPP_DIR}/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
@@ -101,6 +108,12 @@ if(TARGET ggml-blas)
 endif()
 if(TARGET ggml-metal)
   set_target_properties(ggml-metal PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${GGML_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY "${GGML_OUTPUT_DIR}"
+  )
+endif()
+if(TARGET ggml-cuda)
+  set_target_properties(ggml-cuda PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${GGML_OUTPUT_DIR}"
     RUNTIME_OUTPUT_DIRECTORY "${GGML_OUTPUT_DIR}"
   )
@@ -161,6 +174,9 @@ if(TARGET ggml-metal)
   target_link_libraries(executorch_ggml_backend_py PRIVATE ggml-metal)
   target_compile_definitions(executorch_ggml_backend_py PRIVATE GGML_USE_METAL=1)
 endif()
+if(TARGET ggml-cuda)
+  target_link_libraries(executorch_ggml_backend_py PRIVATE ggml-cuda)
+endif()
 
 # ExecuTorch symbols are expected to resolve from the already-loaded
 # portable runtime extension (dynamic lookup).
@@ -169,3 +185,36 @@ if(APPLE)
 else()
   target_link_options(executorch_ggml_backend_py PRIVATE "-Wl,--allow-shlib-undefined")
 endif()
+
+# ---------------------------------------------------------------------------
+# ExecuTorch (as subdirectory, for llama runner)
+# ---------------------------------------------------------------------------
+option(EXECUTORCH_GGML_BUILD_LLAMA_RUNNER
+       "Build llm_main by compiling ExecuTorch and the llama runner from source"
+       OFF)
+
+if(EXECUTORCH_GGML_BUILD_LLAMA_RUNNER)
+  if(CMAKE_VERSION VERSION_LESS "3.29")
+    message(FATAL_ERROR
+      "EXECUTORCH_GGML_BUILD_LLAMA_RUNNER requires CMake >= 3.29 "
+      "(needed by ExecuTorch). Found ${CMAKE_VERSION}.")
+  endif()
+
+  # Use the LLM preset to enable all options needed by the llama runner:
+  #   EXTENSION_LLM_RUNNER, EXTENSION_MODULE, EXTENSION_TENSOR,
+  #   EXTENSION_FLAT_TENSOR, EXTENSION_DATA_LOADER, EXTENSION_NAMED_DATA_MAP,
+  #   KERNELS_OPTIMIZED, KERNELS_QUANTIZED, XNNPACK, etc.
+  set(EXECUTORCH_BUILD_PRESET_FILE
+      "${EXECUTORCH_DIR}/tools/cmake/preset/llm.cmake")
+
+  # Disable targets we don't need.
+  set(EXECUTORCH_BUILD_EXECUTOR_RUNNER OFF)
+  set(EXECUTORCH_BUILD_TESTS OFF)
+
+  add_subdirectory("${EXECUTORCH_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/executorch")
+endif()
+
+# ---------------------------------------------------------------------------
+# Runner executables
+# ---------------------------------------------------------------------------
+add_subdirectory(runner)

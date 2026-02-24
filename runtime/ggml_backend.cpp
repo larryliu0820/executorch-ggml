@@ -8,13 +8,19 @@
 #include "ggml_backend.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "ggml_ir_generated.h"  // flatc-generated header (checked in under schema/)
 
 #include <ggml.h>
+#include <ggml-backend.h>
+#include <ggml-alloc.h>
 #include <ggml-cpu.h>
 #include <ggml-backend.h>
 
@@ -166,6 +172,63 @@ void ggml_custom_index_multi(
   }
 }
 
+// Eager integer casts on the CPU context.  ggml's CPU backend doesn't support
+// GGML_OP_CPY for I64 or I32↔I64, so we must perform these conversions at
+// graph-build time (data is available because we use no_alloc=false).
+// Returns a new tensor with op=GGML_OP_NONE (treated as a constant leaf).
+struct ggml_tensor* eager_cast_i64_to_i32(
+    struct ggml_context* ctx,
+    struct ggml_tensor* src) {
+  struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_I32, GGML_MAX_DIMS, src->ne);
+  dst->op = GGML_OP_NONE;
+  if (src->data && dst->data) {
+    const size_t n = ggml_nelements(src);
+    const int64_t* s = static_cast<const int64_t*>(src->data);
+    int32_t* d = static_cast<int32_t*>(dst->data);
+    for (size_t i = 0; i < n; ++i) d[i] = static_cast<int32_t>(s[i]);
+  }
+  return dst;
+}
+
+struct ggml_tensor* eager_cast_i32_to_i64(
+    struct ggml_context* ctx,
+    struct ggml_tensor* src) {
+  struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_I64, GGML_MAX_DIMS, src->ne);
+  dst->op = GGML_OP_NONE;
+  if (src->data && dst->data) {
+    const size_t n = ggml_nelements(src);
+    const int32_t* s = static_cast<const int32_t*>(src->data);
+    int64_t* d = static_cast<int64_t*>(dst->data);
+    for (size_t i = 0; i < n; ++i) d[i] = static_cast<int64_t>(s[i]);
+  }
+  return dst;
+}
+
+// Safe cast that avoids ggml_cast combos the CPU backend can't handle.
+// Supported natively: F16↔{F16,BF16,F32}, BF16↔{F16,BF16,F32}, F32↔{F16,BF16,F32,I32}, I32→F32.
+// Everything else routes through F32 as intermediate or uses eager helpers.
+struct ggml_tensor* safe_ggml_cast(
+    struct ggml_context* ctx,
+    struct ggml_tensor* src,
+    ggml_type target) {
+  if (src->type == target) return src;
+  // I64 source: eager CPU conversion
+  if (src->type == GGML_TYPE_I64 && target == GGML_TYPE_I32) return eager_cast_i64_to_i32(ctx, src);
+  if (src->type == GGML_TYPE_I64) {
+    // I64 → F32 eager, then F32 → target via ggml_cast
+    auto* i32 = eager_cast_i64_to_i32(ctx, src);
+    return (target == GGML_TYPE_F32) ? safe_ggml_cast(ctx, i32, GGML_TYPE_F32)
+                                     : safe_ggml_cast(ctx, safe_ggml_cast(ctx, i32, GGML_TYPE_F32), target);
+  }
+  // I32 source: only I32→F32 is native in ggml_cast
+  if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_I64) return eager_cast_i32_to_i64(ctx, src);
+  if (src->type == GGML_TYPE_I32 && target != GGML_TYPE_F32) {
+    return safe_ggml_cast(ctx, safe_ggml_cast(ctx, src, GGML_TYPE_F32), target);
+  }
+  // Everything else (F16/BF16/F32 inter-conversions) is natively supported
+  return ggml_cast(ctx, src, target);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -185,14 +248,10 @@ struct GgmlDelegateHandle {
   // Each pair is (src_i64_tensor, dst_i32_tensor).
   std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>> deferred_i64_to_i32;
 
-  // Separate compute context for graph_compute (needs its own memory)
-  struct ggml_context* compute_ctx = nullptr;
-
-  // Backend handles for compute acceleration
-  ggml_backend_t backend_cpu = nullptr;
-#ifdef GGML_USE_METAL
-  ggml_backend_t backend_metal = nullptr;
-#endif
+  // Backend compute resources (CPU, CUDA, or Metal)
+  ggml_backend_t backend = nullptr;
+  ggml_gallocr_t galloc = nullptr;
+  int n_threads = 1;
 };
 
 // ---------------------------------------------------------------------------
@@ -407,8 +466,8 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             ggml_type tgt = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32)
                                 ? GGML_TYPE_F32
                                 : a->type;
-            if (a->type != tgt) a = ggml_cast(ctx, a, tgt);
-            if (b->type != tgt) b = ggml_cast(ctx, b, tgt);
+            if (a->type != tgt) a = safe_ggml_cast(ctx, a, tgt);
+            if (b->type != tgt) b = safe_ggml_cast(ctx, b, tgt);
           }
 
           // Handle broadcast by repeating the smaller tensor to match the larger.
@@ -634,8 +693,10 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           // src_ids: [weight, indices]
           struct ggml_tensor* w = srcs[0];
           struct ggml_tensor* idx = srcs[1];
-          if (idx->type != GGML_TYPE_I32) {
-            idx = ggml_cast(ctx, idx, GGML_TYPE_I32);
+          if (idx->type == GGML_TYPE_I64) {
+            idx = eager_cast_i64_to_i32(ctx, idx);
+          } else if (idx->type != GGML_TYPE_I32) {
+            idx = safe_ggml_cast(ctx, idx, GGML_TYPE_I32);
           }
           gt = ggml_get_rows(ctx, w, idx);
           break;
@@ -699,7 +760,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           // Cast conv output to f32 to keep the rest of the graph in f32 and
           // avoid mixed-type binary ops (e.g. residual adds).
           if (gt && gt->type == GGML_TYPE_F16) {
-            gt = ggml_cast(ctx, gt, GGML_TYPE_F32);
+            gt = safe_ggml_cast(ctx, gt, GGML_TYPE_F32);
           }
 
           // Add bias if present.
@@ -718,7 +779,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             }
             struct ggml_tensor* bias_rep = ggml_repeat(ctx, bias4, gt);
             if (bias_rep->type == GGML_TYPE_F16) {
-              bias_rep = ggml_cast(ctx, bias_rep, GGML_TYPE_F32);
+              bias_rep = safe_ggml_cast(ctx, bias_rep, GGML_TYPE_F32);
             }
             gt = ggml_add(ctx, gt, bias_rep);
           }
@@ -999,12 +1060,14 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           }
           struct ggml_tensor* x = srcs[0];
           struct ggml_tensor* idx = srcs[1];
-          if (idx->type != GGML_TYPE_I32) {
-            idx = ggml_cast(ctx, idx, GGML_TYPE_I32);
+          if (idx->type == GGML_TYPE_I64) {
+            idx = eager_cast_i64_to_i32(ctx, idx);
+          } else if (idx->type != GGML_TYPE_I32) {
+            idx = safe_ggml_cast(ctx, idx, GGML_TYPE_I32);
           }
           // ggml_get_rows supports src0 types F32/I32/F16/... but not I8.
           if (x->type == GGML_TYPE_I8) {
-            x = ggml_cast(ctx, x, GGML_TYPE_I32);
+            x = safe_ggml_cast(ctx, x, GGML_TYPE_I32);
           }
           // ggml_get_rows selects rows by indices.
           gt = ggml_get_rows(ctx, x, idx);
@@ -1057,7 +1120,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           }
 
           if (src_x->type != out_type) {
-            src_x = ggml_cast(ctx, src_x, out_type);
+            src_x = safe_ggml_cast(ctx, src_x, out_type);
           }
 
           std::vector<struct ggml_tensor*> custom_args;
@@ -1065,8 +1128,10 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           custom_args.push_back(src_x);
           for (int i = 0; i < ndims; ++i) {
             struct ggml_tensor* idx = srcs[1 + i];
-            if (idx->type != GGML_TYPE_I32 && idx->type != GGML_TYPE_I64) {
-              idx = ggml_cast(ctx, idx, GGML_TYPE_I64);
+            if (idx->type == GGML_TYPE_I32) {
+              idx = eager_cast_i32_to_i64(ctx, idx);
+            } else if (idx->type != GGML_TYPE_I64) {
+              idx = eager_cast_i32_to_i64(ctx, safe_ggml_cast(ctx, idx, GGML_TYPE_I32));
             }
             custom_args.push_back(idx);
           }
@@ -1134,8 +1199,10 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           struct ggml_tensor* idx = srcs[1];
 
           // ggml_set_rows expects indices tensor type I64.
-          if (idx->type != GGML_TYPE_I64) {
-            idx = ggml_cast(ctx, idx, GGML_TYPE_I64);
+          if (idx->type == GGML_TYPE_I32) {
+            idx = eager_cast_i32_to_i64(ctx, idx);
+          } else if (idx->type != GGML_TYPE_I64) {
+            idx = eager_cast_i32_to_i64(ctx, safe_ggml_cast(ctx, idx, GGML_TYPE_I32));
           }
 
           // Ensure val has shape compatible with dst for set_rows:
@@ -1145,6 +1212,14 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           if (val->ne[0] != dst->ne[0]) {
             // attempt to cast/reshape; if incompatible, fail
             // (most Qwen3 K/V values already match)
+          }
+
+          // ggml_set_rows requires val (b) to be F32.
+          if (val->type != GGML_TYPE_F32) {
+            val = safe_ggml_cast(ctx, val, GGML_TYPE_F32);
+          }
+          if (dst->type != GGML_TYPE_F32) {
+            dst = safe_ggml_cast(ctx, dst, GGML_TYPE_F32);
           }
 
           gt = ggml_set_rows(ctx, dst, val, idx);
@@ -1176,12 +1251,13 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             break;
           }
 
-          // Create output tensor with target type.
-          gt = ggml_new_tensor(ctx, target_type, GGML_MAX_DIMS, src->ne);
+          // ggml CPU doesn't support GGML_OP_CPY from I64 to any other type,
+          // so I64-source casts must be done eagerly on the CPU.
+          if (src->type == GGML_TYPE_I64) {
+            // Create output tensor for eager conversion.
+            gt = ggml_new_tensor(ctx, target_type, GGML_MAX_DIMS, src->ne);
 
-          // I64 → I32 conversion: check if source is an input (defer to execute).
-          if (src->type == GGML_TYPE_I64 && target_type == GGML_TYPE_I32) {
-            // Check if src is an input tensor (will have data at execute time).
+            // Check if src is an input tensor (data only available at execute time).
             bool is_input_src = false;
             for (const auto& [idx, inp_tensor] : input_pairs) {
               if (inp_tensor == src) {
@@ -1190,23 +1266,26 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
               }
             }
 
-            if (is_input_src) {
-              // Defer conversion to execute() - record the pair.
+            if (is_input_src && target_type == GGML_TYPE_I32) {
+              // Defer I64→I32 conversion to execute().
               deferred_i64_to_i32.emplace_back(src, gt);
-            } else {
+            } else if (src->data && gt->data) {
               // Constant source: convert now.
               const size_t nelem = ggml_nelements(src);
               const int64_t* src_data = static_cast<const int64_t*>(src->data);
-              int32_t* dst_data = static_cast<int32_t*>(gt->data);
-              for (size_t i = 0; i < nelem; ++i) {
-                dst_data[i] = static_cast<int32_t>(src_data[i]);
+              if (target_type == GGML_TYPE_I32) {
+                int32_t* dst_data = static_cast<int32_t*>(gt->data);
+                for (size_t i = 0; i < nelem; ++i) dst_data[i] = static_cast<int32_t>(src_data[i]);
+              } else if (target_type == GGML_TYPE_F32) {
+                float* dst_data = static_cast<float*>(gt->data);
+                for (size_t i = 0; i < nelem; ++i) dst_data[i] = static_cast<float>(src_data[i]);
               }
             }
             gt->op = GGML_OP_NONE;  // Treated as constant in compute graph.
           } else {
-            // For other conversions, try ggml_cast (may fail at compute time
-            // if unsupported, but many combos like F32→F16 work).
-            gt = ggml_cast(ctx, src, target_type);
+            // All other casts go through safe_ggml_cast which handles
+            // I32→F32, I32→other (via F32), and F16/BF16/F32 conversions.
+            gt = safe_ggml_cast(ctx, src, target_type);
           }
           break;
         }
@@ -1222,9 +1301,10 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           struct ggml_tensor* k = srcs[1];
           struct ggml_tensor* v = srcs[2];
 
-          // Note: flash_attn expects k/v in f16 for the fast path.
-          if (k->type == GGML_TYPE_F32) k = ggml_cast(ctx, k, GGML_TYPE_F16);
-          if (v->type == GGML_TYPE_F32) v = ggml_cast(ctx, v, GGML_TYPE_F16);
+          // flash_attn_ext dispatches via type traits (vec_dot / to_float),
+          // so it supports F16, BF16, and F32 K/V natively.  Do NOT force
+          // F16 — BF16 values that exceed F16 max (~65504) would overflow to
+          // Inf, producing +Inf in the dot product accumulation.
 
           // Optional attention mask.  ggml_flash_attn_ext requires it to be:
           //   - F16 (the CPU kernel reads it as additive logit bias in FP16)
@@ -1237,7 +1317,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             mask = srcs[3];
             // Ensure F16 (bool mask should already be converted at store time, but guard).
             if (mask->type != GGML_TYPE_F16) {
-              mask = ggml_cast(ctx, mask, GGML_TYPE_F16);
+              mask = safe_ggml_cast(ctx, mask, GGML_TYPE_F16);
             }
             // Ensure contiguous (get_rows result may not be contiguous).
             if (!ggml_is_contiguous(mask)) {
@@ -1382,7 +1462,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
 
           // Cast condition to float if needed
           if (cond->type != GGML_TYPE_F32) {
-            cond = ggml_cast(ctx, cond, GGML_TYPE_F32);
+            cond = safe_ggml_cast(ctx, cond, GGML_TYPE_F32);
           }
 
           // Ensure cond is broadcastable to x/y shape
@@ -1852,6 +1932,14 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             idx_data[i] = start_pos + i;
           }
 
+          // ggml_set_rows requires value (b) and cache (a) to be F32.
+          if (value->type != GGML_TYPE_F32) {
+            value = safe_ggml_cast(ctx, value, GGML_TYPE_F32);
+          }
+          if (cache->type != GGML_TYPE_F32) {
+            cache = safe_ggml_cast(ctx, cache, GGML_TYPE_F32);
+          }
+
           // Use ggml_set_rows to scatter values into cache
           gt = ggml_set_rows(ctx, cache, value, indices);
           break;
@@ -1881,35 +1969,131 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
   std::sort(input_pairs.begin(), input_pairs.end(),
             [](const auto& a, const auto& b) { return a.first < b.first; });
 
+  // Collect ordered input tensor list.
+  std::vector<struct ggml_tensor*> ordered_inputs;
+  for (auto& [idx, tensor] : input_pairs) {
+    ordered_inputs.push_back(tensor);
+  }
+
+  // -------------------------------------------------------------------
+  // Allocate the graph on a compute backend (CUDA if available, else CPU)
+  // -------------------------------------------------------------------
+
+  // 1. Mark input / output tensors so the graph allocator keeps them live.
+  std::unordered_set<struct ggml_tensor*> input_set(
+      ordered_inputs.begin(), ordered_inputs.end());
+  std::unordered_set<struct ggml_tensor*> deferred_dst_set;
+  for (auto& [src, dst] : deferred_i64_to_i32) {
+    deferred_dst_set.insert(dst);
+  }
+  for (auto* inp : ordered_inputs) {
+    ggml_set_input(inp);
+  }
+  for (auto* dst : deferred_dst_set) {
+    ggml_set_input(dst);  // receives data during execute
+  }
+  for (auto* out : output_tensors) {
+    ggml_set_output(out);
+  }
+
+  // 2. Save constant data from every tensor in the context that is NOT an
+  //    input or a deferred-cast destination (those get their data at execute
+  //    time).  We iterate the full context (not just id_to_tensor) because
+  //    helper tensors created by ggml ops (e.g. ggml_new_f32 for scalars)
+  //    also need their data preserved.
+  //    Also mark them as inputs so gallocr doesn't reuse their memory
+  //    (constants like the scalar 1.0 in RSQRT are read by multiple layers).
+  struct SavedTensor {
+    struct ggml_tensor* tensor;
+    std::vector<uint8_t> data;
+  };
+  std::vector<SavedTensor> saved_constants;
+  for (struct ggml_tensor* gt = ggml_get_first_tensor(ctx);
+       gt != nullptr;
+       gt = ggml_get_next_tensor(ctx, gt)) {
+    if (!gt->data) continue;
+    if (input_set.count(gt)) continue;
+    if (deferred_dst_set.count(gt)) continue;
+    // Only save leaf tensors (constants / pre-computed values).
+    // Graph op nodes will be recomputed by the backend.
+    if (gt->op != GGML_OP_NONE) continue;
+    ggml_set_input(gt);  // prevent gallocr from reusing this memory
+    size_t nbytes = ggml_nbytes(gt);
+    saved_constants.push_back({gt, std::vector<uint8_t>(
+        static_cast<uint8_t*>(gt->data),
+        static_cast<uint8_t*>(gt->data) + nbytes)});
+  }
+
+  // 2b. Clear all tensor data pointers so gallocr allocates everything
+  //     on the backend. Without this, gallocr skips tensors that already
+  //     have data (from no_alloc=false) and they never get a backend buffer,
+  //     causing "tensor buffer not set" asserts on CUDA.
+  for (struct ggml_tensor* t = ggml_get_first_tensor(ctx);
+       t != nullptr;
+       t = ggml_get_next_tensor(ctx, t)) {
+    t->data = nullptr;
+  }
+
+  // 3. Create the compute backend: prefer GPU, fall back to CPU.
+  //    Set GGML_BACKEND_DEVICE=cpu to force CPU.
+  ggml_backend_t backend = nullptr;
+  const char* device_env = std::getenv("GGML_BACKEND_DEVICE");
+  bool force_cpu = device_env && std::string(device_env) == "cpu";
+  if (!force_cpu) {
+    ggml_backend_dev_t gpu_dev =
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_dev) {
+      backend = ggml_backend_dev_init(gpu_dev, nullptr);
+      if (backend) {
+        fprintf(stderr, "[ggml_backend] Using GPU backend: %s\n",
+                ggml_backend_name(backend));
+      }
+    }
+  }
+  if (!backend) {
+    backend = ggml_backend_cpu_init();
+    int cpu_threads = n_threads;
+    // Allow env override; fall back to std::thread::hardware_concurrency().
+    const char* threads_env = std::getenv("GGML_CPU_THREADS");
+    if (threads_env) {
+      cpu_threads = std::atoi(threads_env);
+    } else if (cpu_threads <= 1) {
+      cpu_threads = static_cast<int>(std::thread::hardware_concurrency());
+      if (cpu_threads <= 0) cpu_threads = 4;
+    }
+    ggml_backend_cpu_set_n_threads(backend, cpu_threads);
+    fprintf(stderr, "[ggml_backend] Using CPU backend (%d threads)\n",
+            cpu_threads);
+  }
+
+  // 4. Allocate all graph tensors on the backend.
+  ggml_gallocr_t galloc =
+      ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+  if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+    fprintf(stderr, "[ggml_backend] ERROR: graph allocation failed\n");
+    ggml_gallocr_free(galloc);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+    return Error::MemoryAllocationFailed;
+  }
+
+  // 5. Restore constant data into backend buffers.
+  //    Skip tensors not reachable from the graph (gallocr leaves them unallocated).
+  for (auto& sc : saved_constants) {
+    if (sc.tensor->buffer == nullptr) continue;
+    ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
+  }
+
   // Create handle
   auto* handle = new GgmlDelegateHandle();
   handle->ctx = ctx;
   handle->graph = graph;
-  for (auto& [idx, tensor] : input_pairs) {
-    handle->inputs.push_back(tensor);
-  }
+  handle->inputs = std::move(ordered_inputs);
   handle->outputs = std::move(output_tensors);
   handle->deferred_i64_to_i32 = std::move(deferred_i64_to_i32);
-
-  // Allocate a separate context for compute
-  size_t compute_size = ggml_graph_overhead() + 1024 * 1024;
-  struct ggml_init_params compute_params = {
-      /* .mem_size   = */ compute_size,
-      /* .mem_buffer = */ nullptr,
-      /* .no_alloc   = */ true,
-  };
-  handle->compute_ctx = ggml_init(compute_params);
-
-  // Initialize compute backends
-  // Try Metal first on macOS, fall back to CPU
-#ifdef GGML_USE_METAL
-  handle->backend_metal = ggml_backend_metal_init();
-  if (handle->backend_metal) {
-    // Metal backend initialized successfully
-  }
-#endif
-  // Always initialize CPU backend as fallback
-  handle->backend_cpu = ggml_backend_cpu_init();
+  handle->backend = backend;
+  handle->galloc = galloc;
+  handle->n_threads = n_threads;
 
   return handle;
 }
@@ -1921,85 +2105,112 @@ Error GgmlBackendInterface::execute(
 
   auto* handle = reinterpret_cast<GgmlDelegateHandle*>(handle_raw);
 
-  // Copy input data from ExecuTorch tensors → ggml tensors
+  // Copy input data from ExecuTorch tensors → backend tensors
   size_t n_inputs = handle->inputs.size();
   for (size_t i = 0; i < n_inputs; ++i) {
-    const auto& et_tensor = args[i]->toTensor();
     struct ggml_tensor* gt = handle->inputs[i];
+
+    // Skip inputs that aren't part of the ggml graph (gallocr didn't
+    // allocate them, e.g. unused position/start_pos placeholders).
+    if (gt->buffer == nullptr) continue;
+
+    if (!args[i]->isTensor()) {
+      fprintf(stderr, "[ggml_backend] ERROR: input args[%zu] is not a Tensor (isTensor=%d, isNone=%d), n_inputs=%zu, args.size=%zu\n",
+              i, args[i]->isTensor(), args[i]->isNone(), n_inputs, (size_t)args.size());
+      return Error::InvalidArgument;
+    }
+    const auto& et_tensor = args[i]->toTensor();
 
     const size_t nelem = ggml_nelements(gt);
 
-    if (gt->type == GGML_TYPE_F16) {
-      // If a model ends up with fp16 runtime inputs, convert from fp32.
+    if (gt->type == GGML_TYPE_F16 && et_tensor.scalar_type() == executorch::aten::ScalarType::Float) {
+      // Convert fp32 → fp16 on host, then copy to backend.
+      std::vector<ggml_fp16_t> tmp(nelem);
       const float* src = static_cast<const float*>(et_tensor.const_data_ptr());
-      ggml_fp16_t* dst = static_cast<ggml_fp16_t*>(gt->data);
-      ggml_fp32_to_fp16_row(src, dst, (int64_t) nelem);
+      ggml_fp32_to_fp16_row(src, tmp.data(), (int64_t) nelem);
+      ggml_backend_tensor_set(gt, tmp.data(), 0, nelem * sizeof(ggml_fp16_t));
+    } else if (gt->type == GGML_TYPE_BF16 && et_tensor.scalar_type() == executorch::aten::ScalarType::Float) {
+      // Convert fp32 → bf16 on host, then copy to backend.
+      std::vector<ggml_bf16_t> tmp(nelem);
+      const float* src = static_cast<const float*>(et_tensor.const_data_ptr());
+      for (size_t j = 0; j < nelem; ++j) {
+        tmp[j] = ggml_fp32_to_bf16(src[j]);
+      }
+      ggml_backend_tensor_set(gt, tmp.data(), 0, nelem * sizeof(ggml_bf16_t));
+    } else if (gt->type == GGML_TYPE_BF16 && et_tensor.scalar_type() == executorch::aten::ScalarType::BFloat16) {
+      // BF16 → BF16 direct copy.
+      ggml_backend_tensor_set(gt, et_tensor.const_data_ptr(), 0, ggml_nbytes(gt));
     } else if (gt->type == GGML_TYPE_I32 && et_tensor.scalar_type() == executorch::aten::ScalarType::Bool) {
-      // Avoid over-reading bool buffers when our ggml tensor stores masks as I32.
+      std::vector<int32_t> tmp(nelem);
       const bool* src = static_cast<const bool*>(et_tensor.const_data_ptr());
-      int32_t* dst = static_cast<int32_t*>(gt->data);
       for (size_t j = 0; j < nelem; ++j) {
-        dst[j] = src[j] ? 1 : 0;
+        tmp[j] = src[j] ? 1 : 0;
       }
+      ggml_backend_tensor_set(gt, tmp.data(), 0, nelem * sizeof(int32_t));
     } else if (gt->type == GGML_TYPE_I32 && et_tensor.scalar_type() == executorch::aten::ScalarType::Long) {
-      // Common for start_pos etc.
+      std::vector<int32_t> tmp(nelem);
       const int64_t* src = static_cast<const int64_t*>(et_tensor.const_data_ptr());
-      int32_t* dst = static_cast<int32_t*>(gt->data);
       for (size_t j = 0; j < nelem; ++j) {
-        dst[j] = (int32_t) src[j];
+        tmp[j] = (int32_t) src[j];
       }
+      ggml_backend_tensor_set(gt, tmp.data(), 0, nelem * sizeof(int32_t));
     } else {
-      // Default memcpy when storage types match.
-      size_t nbytes = ggml_nbytes(gt);
-      memcpy(gt->data, et_tensor.const_data_ptr(), nbytes);
+      ggml_backend_tensor_set(gt, et_tensor.const_data_ptr(), 0, ggml_nbytes(gt));
     }
   }
 
-  // Run deferred I64→I32 casts (now that input data is available).
+  // Run deferred I64→I32 casts (now that input data is on the backend).
   for (const auto& [src_i64, dst_i32] : handle->deferred_i64_to_i32) {
+    if (src_i64->buffer == nullptr || dst_i32->buffer == nullptr) continue;
     const size_t nelem = ggml_nelements(src_i64);
-    const int64_t* src_data = static_cast<const int64_t*>(src_i64->data);
-    int32_t* dst_data = static_cast<int32_t*>(dst_i32->data);
-    for (size_t i = 0; i < nelem; ++i) {
-      dst_data[i] = static_cast<int32_t>(src_data[i]);
+    std::vector<int64_t> src_buf(nelem);
+    ggml_backend_tensor_get(src_i64, src_buf.data(), 0, nelem * sizeof(int64_t));
+    std::vector<int32_t> dst_buf(nelem);
+    for (size_t j = 0; j < nelem; ++j) {
+      dst_buf[j] = static_cast<int32_t>(src_buf[j]);
     }
+    ggml_backend_tensor_set(dst_i32, dst_buf.data(), 0, nelem * sizeof(int32_t));
   }
 
-  // Execute the graph using the best available backend
-  if (handle->graph) {
-#ifdef GGML_USE_METAL
-    if (handle->backend_metal) {
-      // Use Metal backend for GPU acceleration
-      ggml_backend_graph_compute(handle->backend_metal, handle->graph);
-    } else
-#endif
-    if (handle->backend_cpu) {
-      // Use CPU backend
-      ggml_backend_graph_compute(handle->backend_cpu, handle->graph);
-    } else {
-      // Fallback to legacy CPU compute
-      int n_threads = 1;
-      ggml_graph_compute_with_ctx(handle->ctx, handle->graph, n_threads);
-    }
-  }
+  // Execute the graph on the backend
+  ggml_backend_graph_compute(handle->backend, handle->graph);
 
-  // Copy output data from ggml tensors → ExecuTorch output tensors
+  // Copy output data from backend tensors → ExecuTorch output tensors
   size_t n_outputs = handle->outputs.size();
   for (size_t i = 0; i < n_outputs; ++i) {
     size_t out_idx = n_inputs + i;
+    if (out_idx >= (size_t)args.size() || !args[out_idx]->isTensor()) {
+      fprintf(stderr, "[ggml_backend] ERROR: args[%zu] is not a Tensor (out_idx=%zu, args.size=%zu)\n",
+              out_idx, out_idx, (size_t)args.size());
+      return Error::InvalidArgument;
+    }
     auto& et_tensor = args[out_idx]->toTensor();
     struct ggml_tensor* gt = handle->outputs[i];
 
     const size_t nelem = ggml_nelements(gt);
 
-    if (gt->type == GGML_TYPE_F16) {
-      // Convert fp16 output to fp32.
-      const ggml_fp16_t* src = static_cast<const ggml_fp16_t*>(gt->data);
+    if (gt->type == GGML_TYPE_F16 && et_tensor.scalar_type() == executorch::aten::ScalarType::Float) {
+      // Read fp16 from backend, convert to fp32.
+      std::vector<ggml_fp16_t> tmp(nelem);
+      ggml_backend_tensor_get(gt, tmp.data(), 0, nelem * sizeof(ggml_fp16_t));
       float* dst = static_cast<float*>(et_tensor.mutable_data_ptr());
-      ggml_fp16_to_fp32_row(src, dst, (int64_t) nelem);
+      ggml_fp16_to_fp32_row(tmp.data(), dst, (int64_t) nelem);
+    } else if (gt->type == GGML_TYPE_F32 && et_tensor.scalar_type() == executorch::aten::ScalarType::BFloat16) {
+      // ggml output is F32 (e.g. ggml_set_rows requires F32) but ET expects BF16.
+      std::vector<float> tmp(nelem);
+      ggml_backend_tensor_get(gt, tmp.data(), 0, nelem * sizeof(float));
+      ggml_bf16_t* dst = static_cast<ggml_bf16_t*>(et_tensor.mutable_data_ptr());
+      for (size_t j = 0; j < nelem; ++j) {
+        dst[j] = ggml_fp32_to_bf16(tmp[j]);
+      }
+    } else if (gt->type == GGML_TYPE_F32 && et_tensor.scalar_type() == executorch::aten::ScalarType::Float) {
+      ggml_backend_tensor_get(gt, et_tensor.mutable_data_ptr(), 0, ggml_nbytes(gt));
+    } else if (gt->type == GGML_TYPE_BF16 && et_tensor.scalar_type() == executorch::aten::ScalarType::BFloat16) {
+      ggml_backend_tensor_get(gt, et_tensor.mutable_data_ptr(), 0, ggml_nbytes(gt));
     } else {
-      size_t nbytes = ggml_nbytes(gt);
-      memcpy(et_tensor.mutable_data_ptr(), gt->data, nbytes);
+      // Fallback: copy min of both sizes to avoid buffer overflow.
+      size_t copy_size = std::min(ggml_nbytes(gt), (size_t)et_tensor.nbytes());
+      ggml_backend_tensor_get(gt, et_tensor.mutable_data_ptr(), 0, copy_size);
     }
   }
 
@@ -2009,18 +2220,11 @@ Error GgmlBackendInterface::execute(
 void GgmlBackendInterface::destroy(DelegateHandle* handle_raw) const {
   auto* handle = reinterpret_cast<GgmlDelegateHandle*>(handle_raw);
   if (handle) {
-    // Free backends
-#ifdef GGML_USE_METAL
-    if (handle->backend_metal) {
-      ggml_backend_free(handle->backend_metal);
+    if (handle->galloc) {
+      ggml_gallocr_free(handle->galloc);
     }
-#endif
-    if (handle->backend_cpu) {
-      ggml_backend_free(handle->backend_cpu);
-    }
-
-    if (handle->compute_ctx) {
-      ggml_free(handle->compute_ctx);
+    if (handle->backend) {
+      ggml_backend_free(handle->backend);
     }
     if (handle->ctx) {
       ggml_free(handle->ctx);
