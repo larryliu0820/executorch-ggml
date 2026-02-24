@@ -103,6 +103,10 @@ class TestQwen3OptimumExport(unittest.TestCase):
         et_program = edge_manager.to_executorch()
         print(f"Serialized .pte size: {len(et_program.buffer)} bytes")
 
+        with open("qwen3_dynamic_export.pte", "wb") as f:
+            f.write(et_program.buffer)
+        print("Saved to qwen3_dynamic_export.pte")
+
         print("\nDynamic shape export test PASSED!")
 
     def test_qwen3_static_shape_export(self):

@@ -117,6 +117,7 @@ class IrTensor:
         "is_input",
         "is_output",
         "input_index",
+        "dynamic_dims",
     )
 
     def __init__(
@@ -131,6 +132,7 @@ class IrTensor:
         is_input: bool = False,
         is_output: bool = False,
         input_index: int = -1,
+        dynamic_dims: Optional[List[bool]] = None,
     ):
         self.id = tensor_id
         self.tensor_type = tensor_type
@@ -142,6 +144,7 @@ class IrTensor:
         self.is_input = is_input
         self.is_output = is_output
         self.input_index = input_index
+        self.dynamic_dims = dynamic_dims or []
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +192,14 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
         else:
             data_key_off = None
 
+        if t.dynamic_dims and any(t.dynamic_dims):
+            dyn_vec = _create_bool_vector(builder, t.dynamic_dims)
+        else:
+            dyn_vec = None
+
         # Build the Tensor table
-        # Start table with the right number of fields (10 fields)
-        builder.StartObject(10)
+        # Start table with the right number of fields (11 fields)
+        builder.StartObject(11)
 
         builder.PrependInt32Slot(0, t.id, 0)           # id
         builder.PrependInt32Slot(1, t.tensor_type, 0)  # type
@@ -207,6 +215,8 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
         builder.PrependBoolSlot(7, t.is_input, False)    # is_input
         builder.PrependBoolSlot(8, t.is_output, False)   # is_output
         builder.PrependInt32Slot(9, t.input_index, -1)   # input_index
+        if dyn_vec is not None:
+            builder.PrependUOffsetTRelativeSlot(10, dyn_vec, 0)  # dynamic_dims
 
         tensor_offsets.append(builder.EndObject())
 
@@ -264,6 +274,13 @@ def _create_uint8_vector(builder: flatbuffers.Builder, data: bytes):
     builder.StartVector(1, len(data), 1)
     for b in reversed(data):
         builder.PrependByte(b)
+    return builder.EndVector()
+
+
+def _create_bool_vector(builder: flatbuffers.Builder, values: List[bool]):
+    builder.StartVector(1, len(values), 1)
+    for v in reversed(values):
+        builder.PrependBool(v)
     return builder.EndVector()
 
 

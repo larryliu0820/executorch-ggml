@@ -119,6 +119,18 @@ def _resolve_shape(fake_val) -> List[int]:
     return [_concrete_int(s) for s in fake_val.shape]
 
 
+def _detect_dynamic_dims(fake_val) -> List[bool]:
+    """Return a list of bools indicating which dims of fake_val are symbolic.
+
+    The result is in **PyTorch** dim order (outermost first), matching the
+    shape returned by _resolve_shape.  The caller is responsible for reversing
+    to ggml ne order when serializing into the IR.
+    """
+    if fake_val is None or not hasattr(fake_val, "shape"):
+        return []
+    return [isinstance(s, torch.SymInt) for s in fake_val.shape]
+
+
 def _pytorch_shape_to_ggml_ne(shape: List[int]) -> List[int]:
     """PyTorch [d0, d1, ..., dn] → ggml ne [dn, ..., d1, d0], padded/collapsed to 4D.
 
@@ -284,6 +296,15 @@ class GgmlBackend(BackendDetails):
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
 
+                    # Detect which dimensions are symbolic (dynamic at runtime).
+                    # _detect_dynamic_dims returns PyTorch dim order; we reverse
+                    # to match ggml ne order (innermost first), then pad to 4D.
+                    pt_dyn = _detect_dynamic_dims(fake_val)
+                    ggml_dyn = list(reversed(pt_dyn))
+                    while len(ggml_dyn) < 4:
+                        ggml_dyn.append(False)
+                    ggml_dyn = ggml_dyn[:4]
+
                     tid = alloc_id()
                     # Runtime input dtype based on FakeTensor meta when available.
                     in_dtype = (
@@ -299,6 +320,7 @@ class GgmlBackend(BackendDetails):
                             op=OP_NONE,
                             is_input=True,
                             input_index=runtime_input_idx,
+                            dynamic_dims=ggml_dyn if any(ggml_dyn) else None,
                         )
                     )
                     node_to_id[node] = tid

@@ -110,6 +110,12 @@ table Tensor {
     is_input:bool = false;
     is_output:bool = false;
     input_index:int32 = -1; // index into the runtime input list (-1 if not an input)
+
+    // For dynamic-shape models: which ne[] dimensions are symbolic/dynamic.
+    // If dynamic_dims[i] is true, the runtime reads the actual tensor size
+    // for that dimension from the ExecuTorch input tensor instead of using
+    // the serialized ne[i] (which stores the trace-time upper bound).
+    dynamic_dims:[bool];
 }
 
 table GgmlGraph {
