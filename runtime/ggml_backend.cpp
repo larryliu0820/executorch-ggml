@@ -13,6 +13,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -31,6 +32,7 @@
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/core/error.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
+#include <executorch/runtime/core/exec_aten/util/tensor_util.h>
 
 namespace executorch_ggml {
 
@@ -235,6 +237,12 @@ struct ggml_tensor* safe_ggml_cast(
 // Delegate handle — owns the ggml context, graph, and tensor bookkeeping
 // ---------------------------------------------------------------------------
 
+// Constant tensor data saved during init(), keyed by IR tensor id.
+struct SavedConstant {
+  int ir_tensor_id;
+  std::vector<uint8_t> data;
+};
+
 struct GgmlDelegateHandle {
   struct ggml_context* ctx = nullptr;
   struct ggml_cgraph* graph = nullptr;
@@ -252,31 +260,74 @@ struct GgmlDelegateHandle {
   ggml_backend_t backend = nullptr;
   ggml_gallocr_t galloc = nullptr;
   int n_threads = 1;
+
+  // --- Fields for graph rebuild ---
+
+  // Copy of the serialized IR FlatBuffer so build_graph() can re-parse it
+  // without needing the original `processed` buffer.
+  std::vector<uint8_t> ir_copy;
+
+  // Constant data extracted from NamedDataMap during init().
+  // build_graph() restores these into the ggml context on each rebuild.
+  std::vector<SavedConstant> constant_data;
+
+  // True if any input has dynamic_dims (enables shape-change detection).
+  bool has_dynamic = false;
+
+  // Per-input dynamic_dims flags (ggml ne order, padded to 4).
+  // input_dynamic_dims[i] has 4 bools for input i.
+  std::vector<std::vector<bool>> input_dynamic_dims;
+
+  // Last-seen input shapes (ggml ne order, 4 values per input, flattened).
+  // Used to detect when a rebuild is needed.
+  std::vector<int64_t> last_input_ne;
 };
 
 // ---------------------------------------------------------------------------
-// BackendInterface implementation
+// build_graph() — (re)build ggml context + compute graph from IR
 // ---------------------------------------------------------------------------
 
-bool GgmlBackendInterface::is_available() const {
-  return true;
-}
+// Rebuild the ggml compute graph from the serialized IR in handle->ir_copy.
+//
+// On success, updates:
+//   handle->ctx, graph, inputs, outputs, deferred_i64_to_i32, galloc
+//
+// Frees any previously existing ctx/galloc (safe to call on first build too,
+// since those start as nullptr).
+//
+// input_ne_overrides: nullptr on first call (use serialized shapes).
+//   In M2+ this will carry runtime shapes for dynamic dims.
+// n_overrides: number of int64_t values (n_inputs × 4).
+static Error build_graph(
+    GgmlDelegateHandle* handle,
+    const int64_t* input_ne_overrides,
+    size_t n_overrides) {
 
-Result<DelegateHandle*> GgmlBackendInterface::init(
-    BackendInitContext& context,
-    FreeableBuffer* processed,
-    ArrayRef<CompileSpec> compile_specs) const {
+  (void)n_overrides;  // used only for debug assertions
 
-  // Parse FlatBuffer
-  const auto* fb_graph = ggml_ir::GetGgmlGraph(processed->data());
+  // --- Tear down previous graph (no-op on first call) ---
+  if (handle->galloc) {
+    ggml_gallocr_free(handle->galloc);
+    handle->galloc = nullptr;
+  }
+  if (handle->ctx) {
+    ggml_free(handle->ctx);
+    handle->ctx = nullptr;
+  }
+  handle->graph = nullptr;
+  handle->inputs.clear();
+  handle->outputs.clear();
+  handle->deferred_i64_to_i32.clear();
+
+  // --- Parse IR from the saved copy ---
+  const auto* fb_graph = ggml_ir::GetGgmlGraph(handle->ir_copy.data());
   if (!fb_graph || !fb_graph->tensors()) {
     return Error::InvalidArgument;
   }
-
   const auto* fb_tensors = fb_graph->tensors();
   const int n_tensors = static_cast<int>(fb_tensors->size());
-  const int n_threads = fb_graph->n_threads();
 
+  // === Phase A: calculate ctx size, create ggml context ===
   // Calculate memory needed for ggml context.
   // Sum up actual constant tensor sizes from the IR so we allocate exactly
   // what is needed, plus a fixed overhead for graph bookkeeping.
@@ -329,6 +380,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     return Error::MemoryAllocationFailed;
   }
 
+  // === Phase B: tensor creation loop + op switch ===
   // Map from IR tensor id → ggml_tensor*
   std::vector<struct ggml_tensor*> id_to_tensor(n_tensors, nullptr);
 
@@ -338,16 +390,62 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
   // Deferred I64→I32 casts (for input tensors).
   std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>> deferred_i64_to_i32;
 
+  // Build dynamic size mapping: trace-time ne value → runtime ne value.
+  // Used to fix output shapes of ops that bake in trace-time sizes
+  // (ARANGE, FULL, comparison ops, etc.).
+  std::unordered_map<int64_t, int64_t> dynamic_size_map;
+  if (input_ne_overrides) {
+    for (int i = 0; i < n_tensors; ++i) {
+      const auto* ti = fb_tensors->Get(i);
+      if (!ti->is_input() || !ti->dynamic_dims() || !ti->ne()) continue;
+      int input_idx = ti->input_index();
+      for (size_t d = 0; d < ti->dynamic_dims()->size() && d < 4; ++d) {
+        if (ti->dynamic_dims()->Get(d)) {
+          int64_t trace_val = ti->ne()->Get(d);
+          int64_t runtime_val = input_ne_overrides[input_idx * 4 + d];
+          if (trace_val != runtime_val) {
+            dynamic_size_map[trace_val] = runtime_val;
+          }
+        }
+      }
+    }
+  }
+
   // Walk tensors in topological order
   for (int i = 0; i < n_tensors; ++i) {
     const auto* t = fb_tensors->Get(i);
     const int tid = t->id();
+    const auto op = static_cast<ggml_ir::OpCode>(t->op());
 
     // Read shape (ne)
     int64_t ne[4] = {1, 1, 1, 1};
     if (t->ne() && t->ne()->size() > 0) {
       for (size_t d = 0; d < t->ne()->size() && d < 4; ++d) {
         ne[d] = t->ne()->Get(d);
+      }
+    }
+
+    // Override dynamic dims with runtime shapes for input tensors (M2).
+    if (input_ne_overrides && t->is_input() && t->dynamic_dims()) {
+      int input_idx = t->input_index();
+      for (size_t d = 0; d < t->dynamic_dims()->size() && d < 4; ++d) {
+        if (t->dynamic_dims()->Get(d)) {
+          ne[d] = input_ne_overrides[input_idx * 4 + d];
+        }
+      }
+    }
+
+    // For op tensors, replace any dim matching a known dynamic trace-time
+    // size with its runtime value. This handles ARANGE, FULL, comparison
+    // ops, UNSQUEEZE, SLICE, etc. that bake output shapes from trace-time
+    // values. For ops that auto-infer shapes from sources (ADD, MUL_MAT,
+    // etc.), ne[] is not used in the op switch, so this is harmless.
+    if (!dynamic_size_map.empty() && op != ggml_ir::OpCode::NONE) {
+      for (int d = 0; d < 4; ++d) {
+        auto it = dynamic_size_map.find(ne[d]);
+        if (it != dynamic_size_map.end()) {
+          ne[d] = it->second;
+        }
       }
     }
 
@@ -361,8 +459,6 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       }
     }
     if (n_dims == 0) n_dims = 1;
-
-    const auto op = static_cast<ggml_ir::OpCode>(t->op());
 
     if (op == ggml_ir::OpCode::NONE) {
       // Leaf tensor: input or constant
@@ -409,32 +505,15 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           break;
       }
 
-      // Load constant data from NamedDataMap if present.
+      // Load constant data from handle->constant_data (populated by init()).
       if (t->data_key() && t->data_key()->c_str() && std::strlen(t->data_key()->c_str()) > 0) {
-        const auto* ndm = context.get_named_data_map();
-        if (ndm == nullptr) {
-          ggml_free(ctx);
-          return Error::InvalidArgument;
-        }
-
-        const char* key = t->data_key()->c_str();
         const size_t nbytes = ggml_nbytes(gt);
-
-        // Prefer get_data() for maximum compatibility: some NamedDataMap
-        // implementations may not implement load_data_into().
-        auto fb = ndm->get_data(key);
-        if (!fb.ok()) {
-          ggml_free(ctx);
-          return fb.error();
+        for (const auto& sc : handle->constant_data) {
+          if (sc.ir_tensor_id == tid) {
+            memcpy(gt->data, sc.data.data(), nbytes);
+            break;
+          }
         }
-        auto buf = std::move(fb.get());
-        if (buf.size() < nbytes) {
-          buf.Free();
-          ggml_free(ctx);
-          return Error::InvalidExternalData;
-        }
-        memcpy(gt->data, buf.data(), nbytes);
-        buf.Free();
       }
 
       if (t->is_input()) {
@@ -610,15 +689,55 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           gt = ggml_mul_mat(ctx, srcs[0], srcs[1]);
           break;
 
-        case ggml_ir::OpCode::MUL:
-          gt = ggml_mul(ctx, srcs[0], srcs[1]);
-          break;
-
-        case ggml_ir::OpCode::REPEAT: {
+        case ggml_ir::OpCode::MUL: {
+          // ggml_mul(a, b) requires ggml_can_repeat(b, a) — b broadcasts to a.
+          // Swap if needed so the larger tensor is first.
           struct ggml_tensor* a = srcs[0];
           struct ggml_tensor* b = srcs[1];
+          if (ggml_nelements(a) < ggml_nelements(b)) {
+            std::swap(a, b);
+          }
+          gt = ggml_mul(ctx, a, b);
+          break;
+        }
+
+        case ggml_ir::OpCode::REPEAT: {
+          // REPEAT(src, like): tile src to like's shape.
+          // The "like" tensor (srcs[1]) may be a static shape-only tensor
+          // from export time.  When ggml auto-computes upstream shapes
+          // differently (e.g. after permute), the src shape may not match
+          // the like shape.  Rebuild the like tensor from the src shape +
+          // the expansion ratios from the IR ne.
+          struct ggml_tensor* a = srcs[0];  // source data
+          struct ggml_tensor* b = srcs[1];  // target shape ("like")
+
+          // If shapes already match, this is a no-op.
+          if (ggml_are_same_shape(a, b)) {
+            gt = a;
+            id_to_tensor[tid] = gt;
+            break;
+          }
+
+          // Try to derive the correct target shape by computing the
+          // expansion ratio from the IR ne and applying it to the source.
           if (!ggml_can_repeat(a, b)) {
-            // Try swapping: repeat b to match a instead
+            // Compute ratio from IR: for each dim where src is 1 and
+            // target is >1, the ratio is target/1.  Use source's actual
+            // shape as the base and apply the ratio.
+            int64_t target_ne[4];
+            for (int d = 0; d < 4; ++d) {
+              if (a->ne[d] == 1 && b->ne[d] > 1) {
+                // This dim was expanded from 1 — keep the target.
+                target_ne[d] = b->ne[d];
+              } else {
+                // Use source's actual shape for this dim.
+                target_ne[d] = a->ne[d];
+              }
+            }
+            b = ggml_new_tensor_4d(ctx, a->type, target_ne[0], target_ne[1], target_ne[2], target_ne[3]);
+          }
+
+          if (!ggml_can_repeat(a, b)) {
             if (ggml_can_repeat(b, a)) {
               gt = ggml_repeat(ctx, b, a);
             } else {
@@ -866,8 +985,37 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             memcpy(&new_ne[i], data + 4 + i * 8, sizeof(int64_t));
           }
 
+          // Apply dynamic_size_map to the VIEW target shape.
+          // The op_params store trace-time dims that may include dynamic
+          // values (e.g. seq_len).  Replace them with runtime values.
+          if (!dynamic_size_map.empty()) {
+            for (int d = 0; d < 4; ++d) {
+              auto it = dynamic_size_map.find(new_ne[d]);
+              if (it != dynamic_size_map.end()) {
+                new_ne[d] = it->second;
+              }
+            }
+          }
+
+          // If source numel differs from the baked-in view shape (dynamic
+          // shapes changed an upstream dim), infer the one mismatched dim.
+          int64_t src_numel = ggml_nelements(srcs[0]);
+          int64_t view_numel = new_ne[0] * new_ne[1] * new_ne[2] * new_ne[3];
+          if (src_numel != view_numel && view_numel > 0) {
+            for (int d = 0; d < 4; ++d) {
+              if (new_ne[d] <= 1) continue;
+              int64_t others = view_numel / new_ne[d];
+              if (others > 0 && src_numel % others == 0) {
+                int64_t inferred = src_numel / others;
+                if (inferred != new_ne[d]) {
+                  new_ne[d] = inferred;
+                  break;
+                }
+              }
+            }
+          }
+
           gt = ggml_reshape_4d(ctx, srcs[0], new_ne[0], new_ne[1], new_ne[2], new_ne[3]);
-          // Always make contiguous to avoid issues with nested views (e.g., view->permute).
           gt = ggml_cont(ctx, gt);
           break;
         }
@@ -926,10 +1074,31 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         }
 
         case ggml_ir::OpCode::UNSQUEEZE: {
-          // Represent as reshape to the output shape stored in IR.
-          // (op_params has dim, but shape is authoritative here)
+          // Unsqueeze adds a dim of size 1, total elements don't change.
+          // Use the source tensor's actual shape rather than the IR's ne
+          // (which may have stale trace-time dims after dynamic_size_map).
           struct ggml_tensor* a = srcs[0];
-          gt = ggml_reshape_4d(ctx, a, ne[0], ne[1], ne[2], ne[3]);
+          int64_t uns_ne[4] = {a->ne[0], a->ne[1], a->ne[2], a->ne[3]};
+          // Read which PyTorch dim to unsqueeze from op_params.
+          int32_t pt_dim = 0;
+          if (t->op_params() && t->op_params()->size() >= 4) {
+            memcpy(&pt_dim, t->op_params()->data(), sizeof(int32_t));
+          }
+          // In ggml order (reversed from PyTorch), unsqueezing pt_dim D
+          // means inserting 1 at ggml axis (ndim - D).  For a 3D→4D
+          // unsqueeze, shift dims above the insertion point up by one.
+          // Simpler: just use IR ne but ensure numel matches source.
+          int64_t src_numel = ggml_nelements(a);
+          int64_t ir_numel = ne[0] * ne[1] * ne[2] * ne[3];
+          if (src_numel == ir_numel) {
+            gt = ggml_reshape_4d(ctx, a, ne[0], ne[1], ne[2], ne[3]);
+          } else {
+            // IR ne is stale — reconstruct from source shape by inserting
+            // a 1 dim.  Since we don't know which ggml axis corresponds to
+            // the PyTorch dim, just preserve the source shape (unsqueeze
+            // only adds a trailing 1 which ggml 4D already has).
+            gt = ggml_reshape_4d(ctx, a, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+          }
           break;
         }
 
@@ -961,6 +1130,12 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           }
           struct ggml_tensor* a = srcs[0];
           int ax = (int(nd) - 1) - dim;
+
+          // Clamp end to actual source dim (handles "slice to end" when
+          // source shape changed due to dynamic dims).
+          int64_t actual_dim = a->ne[ax];
+          if (end > actual_dim) end = actual_dim;
+          ne[ax] = end - start;
 
           size_t offset = static_cast<size_t>(start) * a->nb[ax];
           gt = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3],
@@ -1465,9 +1640,21 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             cond = safe_ggml_cast(ctx, cond, GGML_TYPE_F32);
           }
 
-          // Ensure cond is broadcastable to x/y shape
-          if (!ggml_can_repeat(cond, x)) {
-            cond = ggml_repeat(ctx, cond, x);
+          // Ensure all three tensors have the same shape for the
+          // element-wise arithmetic that implements WHERE.
+          // Find the "largest" shape (most elements) and repeat others to it.
+          struct ggml_tensor* target = x;
+          if (ggml_nelements(y) > ggml_nelements(target)) target = y;
+          if (ggml_nelements(cond) > ggml_nelements(target)) target = cond;
+
+          if (!ggml_are_same_shape(cond, target) && ggml_can_repeat(cond, target)) {
+            cond = ggml_repeat(ctx, cond, target);
+          }
+          if (!ggml_are_same_shape(x, target) && ggml_can_repeat(x, target)) {
+            x = ggml_repeat(ctx, x, target);
+          }
+          if (!ggml_are_same_shape(y, target) && ggml_can_repeat(y, target)) {
+            y = ggml_repeat(ctx, y, target);
           }
 
           // result = cond * x + (1 - cond) * y
@@ -1475,8 +1662,9 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           struct ggml_tensor* one_rep = ggml_repeat(ctx, one, cond);
           struct ggml_tensor* not_cond = ggml_sub(ctx, one_rep, cond);
 
-          struct ggml_tensor* x_part = ggml_mul(ctx, cond, x);
-          struct ggml_tensor* y_part = ggml_mul(ctx, not_cond, y);
+          // ggml_mul(a, b) requires b repeatable to a — put bigger first.
+          struct ggml_tensor* x_part = ggml_mul(ctx, x, cond);
+          struct ggml_tensor* y_part = ggml_mul(ctx, y, not_cond);
           gt = ggml_add(ctx, x_part, y_part);
           break;
         }
@@ -1958,7 +2146,23 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       output_tensors.push_back(id_to_tensor[tid]);
     }
   }
+  //
+  // KEY CHANGE for constants:
+  //   Instead of reading from NamedDataMap (context.get_named_data_map()),
+  //   find matching entry in handle->constant_data by IR tensor id:
+  //
+  //     for (auto& sc : handle->constant_data) {
+  //       if (sc.ir_tensor_id == tid) {
+  //         memcpy(gt->data, sc.data.data(), nbytes);
+  //         break;
+  //       }
+  //     }
+  //
+  // KEY CHANGE (M2+ only, skip for M1):
+  //   For input tensors with dynamic_dims, override ne[d] from
+  //   input_ne_overrides when input_ne_overrides != nullptr.
 
+  // === Build compute graph ===
   // Build compute graph using the same estimated size from above.
   struct ggml_cgraph* graph = ggml_new_graph_custom(ctx, est_graph_size, false);
   for (auto* out : output_tensors) {
@@ -1975,6 +2179,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     ordered_inputs.push_back(tensor);
   }
 
+  // === Phase C: allocate graph on backend ===
   // -------------------------------------------------------------------
   // Allocate the graph on a compute backend (CUDA if available, else CPU)
   // -------------------------------------------------------------------
@@ -2034,45 +2239,12 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     t->data = nullptr;
   }
 
-  // 3. Create the compute backend: prefer GPU, fall back to CPU.
-  //    Set GGML_BACKEND_DEVICE=cpu to force CPU.
-  ggml_backend_t backend = nullptr;
-  const char* device_env = std::getenv("GGML_BACKEND_DEVICE");
-  bool force_cpu = device_env && std::string(device_env) == "cpu";
-  if (!force_cpu) {
-    ggml_backend_dev_t gpu_dev =
-        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-    if (gpu_dev) {
-      backend = ggml_backend_dev_init(gpu_dev, nullptr);
-      if (backend) {
-        fprintf(stderr, "[ggml_backend] Using GPU backend: %s\n",
-                ggml_backend_name(backend));
-      }
-    }
-  }
-  if (!backend) {
-    backend = ggml_backend_cpu_init();
-    int cpu_threads = n_threads;
-    // Allow env override; fall back to std::thread::hardware_concurrency().
-    const char* threads_env = std::getenv("GGML_CPU_THREADS");
-    if (threads_env) {
-      cpu_threads = std::atoi(threads_env);
-    } else if (cpu_threads <= 1) {
-      cpu_threads = static_cast<int>(std::thread::hardware_concurrency());
-      if (cpu_threads <= 0) cpu_threads = 4;
-    }
-    ggml_backend_cpu_set_n_threads(backend, cpu_threads);
-    fprintf(stderr, "[ggml_backend] Using CPU backend (%d threads)\n",
-            cpu_threads);
-  }
-
   // 4. Allocate all graph tensors on the backend.
   ggml_gallocr_t galloc =
-      ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+      ggml_gallocr_new(ggml_backend_get_default_buffer_type(handle->backend));
   if (!ggml_gallocr_alloc_graph(galloc, graph)) {
     fprintf(stderr, "[ggml_backend] ERROR: graph allocation failed\n");
     ggml_gallocr_free(galloc);
-    ggml_backend_free(backend);
     ggml_free(ctx);
     return Error::MemoryAllocationFailed;
   }
@@ -2084,16 +2256,183 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
   }
 
-  // Create handle
-  auto* handle = new GgmlDelegateHandle();
+  // === Update handle ===
   handle->ctx = ctx;
   handle->graph = graph;
   handle->inputs = std::move(ordered_inputs);
   handle->outputs = std::move(output_tensors);
   handle->deferred_i64_to_i32 = std::move(deferred_i64_to_i32);
-  handle->backend = backend;
   handle->galloc = galloc;
-  handle->n_threads = n_threads;
+
+  return Error::Ok;
+}
+
+// ---------------------------------------------------------------------------
+// BackendInterface implementation
+// ---------------------------------------------------------------------------
+
+bool GgmlBackendInterface::is_available() const {
+  return true;
+}
+
+Result<DelegateHandle*> GgmlBackendInterface::init(
+    BackendInitContext& context,
+    FreeableBuffer* processed,
+    ArrayRef<CompileSpec> compile_specs) const {
+
+  // --- 1. Copy IR buffer for later rebuilds ---
+  auto* handle = new GgmlDelegateHandle();
+  handle->ir_copy.assign(
+      static_cast<const uint8_t*>(processed->data()),
+      static_cast<const uint8_t*>(processed->data()) + processed->size());
+
+  // --- 2. Parse FlatBuffer to read metadata ---
+  const auto* fb_graph = ggml_ir::GetGgmlGraph(handle->ir_copy.data());
+  if (!fb_graph || !fb_graph->tensors()) {
+    delete handle;
+    return Error::InvalidArgument;
+  }
+  const auto* fb_tensors = fb_graph->tensors();
+  const int n_tensors = static_cast<int>(fb_tensors->size());
+  handle->n_threads = fb_graph->n_threads();
+
+  // --- 3. Create backend (one-time) ---
+  const char* device_env = std::getenv("GGML_BACKEND_DEVICE");
+  bool force_cpu = device_env && std::string(device_env) == "cpu";
+  if (!force_cpu) {
+    ggml_backend_dev_t gpu_dev =
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_dev) {
+      handle->backend = ggml_backend_dev_init(gpu_dev, nullptr);
+      if (handle->backend) {
+        fprintf(stderr, "[ggml_backend] Using GPU backend: %s\n",
+                ggml_backend_name(handle->backend));
+      }
+    }
+  }
+  if (!handle->backend) {
+    handle->backend = ggml_backend_cpu_init();
+    int cpu_threads = handle->n_threads;
+    const char* threads_env = std::getenv("GGML_CPU_THREADS");
+    if (threads_env) {
+      cpu_threads = std::atoi(threads_env);
+    } else if (cpu_threads <= 1) {
+      cpu_threads = static_cast<int>(std::thread::hardware_concurrency());
+      if (cpu_threads <= 0) cpu_threads = 4;
+    }
+    ggml_backend_cpu_set_n_threads(handle->backend, cpu_threads);
+    fprintf(stderr, "[ggml_backend] Using CPU backend (%d threads)\n",
+            cpu_threads);
+  }
+
+  // --- 4. Load ALL constants from NamedDataMap → handle->constant_data ---
+  // This is the ONLY place NamedDataMap is touched.
+  // After this, build_graph() reads from handle->constant_data.
+  for (int i = 0; i < n_tensors; ++i) {
+    const auto* t = fb_tensors->Get(i);
+    if (static_cast<ggml_ir::OpCode>(t->op()) != ggml_ir::OpCode::NONE) continue;
+    if (!t->data_key() || std::strlen(t->data_key()->c_str()) == 0) continue;
+
+    const auto* ndm = context.get_named_data_map();
+    if (ndm == nullptr) {
+      ggml_backend_free(handle->backend);
+      delete handle;
+      return Error::InvalidArgument;
+    }
+
+    const char* key = t->data_key()->c_str();
+
+    // Compute byte size from IR shape + type.
+    size_t n_elems = 1;
+    if (t->ne()) {
+      for (size_t d = 0; d < t->ne()->size(); ++d) {
+        n_elems *= static_cast<size_t>(t->ne()->Get(d));
+      }
+    }
+    size_t elem_size = 4;
+    switch (static_cast<ggml_ir::TensorType>(t->type())) {
+      case ggml_ir::TensorType::F16:  elem_size = 2; break;
+      case ggml_ir::TensorType::BF16: elem_size = 2; break;
+      case ggml_ir::TensorType::I32:  elem_size = 4; break;
+      case ggml_ir::TensorType::I64:  elem_size = 8; break;
+      case ggml_ir::TensorType::BOOL: elem_size = 4; break;
+      default:                        elem_size = 4; break;
+    }
+    size_t nbytes = n_elems * elem_size;
+
+    auto fb = ndm->get_data(key);
+    if (!fb.ok()) {
+      ggml_backend_free(handle->backend);
+      delete handle;
+      return fb.error();
+    }
+    auto buf = std::move(fb.get());
+    if (buf.size() < nbytes) {
+      buf.Free();
+      ggml_backend_free(handle->backend);
+      delete handle;
+      return Error::InvalidExternalData;
+    }
+
+    SavedConstant sc;
+    sc.ir_tensor_id = t->id();
+    sc.data.assign(
+        static_cast<const uint8_t*>(buf.data()),
+        static_cast<const uint8_t*>(buf.data()) + nbytes);
+    buf.Free();
+    handle->constant_data.push_back(std::move(sc));
+  }
+
+  // --- 5. Read dynamic_dims from IR for each input ---
+  for (int i = 0; i < n_tensors; ++i) {
+    const auto* t = fb_tensors->Get(i);
+    if (!t->is_input()) continue;
+
+    std::vector<bool> dd(4, false);
+    fprintf(stderr, "[ggml_backend] input[%d] has_dynamic_dims=%d ne=(%lld,%lld,%lld,%lld)\n",
+            t->input_index(), t->dynamic_dims() != nullptr,
+            t->ne() ? (long long)t->ne()->Get(0) : -1,
+            t->ne() && t->ne()->size() > 1 ? (long long)t->ne()->Get(1) : -1,
+            t->ne() && t->ne()->size() > 2 ? (long long)t->ne()->Get(2) : -1,
+            t->ne() && t->ne()->size() > 3 ? (long long)t->ne()->Get(3) : -1);
+    if (t->dynamic_dims()) {
+      for (size_t d = 0; d < t->dynamic_dims()->size() && d < 4; ++d) {
+        dd[d] = t->dynamic_dims()->Get(d);
+      }
+      fprintf(stderr, "[ggml_backend]   dynamic_dims=(%d,%d,%d,%d)\n",
+              (int)dd[0], (int)dd[1], (int)dd[2], (int)dd[3]);
+    }
+    if (std::any_of(dd.begin(), dd.end(), [](bool v) { return v; })) {
+      handle->has_dynamic = true;
+    }
+    // Store in input_index order (may be sparse; resize as needed).
+    int idx = t->input_index();
+    if (idx >= 0 && static_cast<size_t>(idx) >= handle->input_dynamic_dims.size()) {
+      handle->input_dynamic_dims.resize(idx + 1);
+    }
+    if (idx >= 0) {
+      handle->input_dynamic_dims[idx] = std::move(dd);
+    }
+  }
+
+  // --- 6. Build initial graph with serialized shapes ---
+  Error err = build_graph(handle, nullptr, 0);
+  if (err != Error::Ok) {
+    if (handle->backend) ggml_backend_free(handle->backend);
+    delete handle;
+    return err;
+  }
+
+  // --- 7. Initialize last_input_ne from the initial graph's input shapes ---
+  if (handle->has_dynamic) {
+    size_t n_inp = handle->inputs.size();
+    handle->last_input_ne.resize(n_inp * 4, 1);
+    for (size_t i = 0; i < n_inp; ++i) {
+      for (int d = 0; d < 4; ++d) {
+        handle->last_input_ne[i * 4 + d] = handle->inputs[i]->ne[d];
+      }
+    }
+  }
 
   return handle;
 }
@@ -2105,21 +2444,90 @@ Error GgmlBackendInterface::execute(
 
   auto* handle = reinterpret_cast<GgmlDelegateHandle*>(handle_raw);
 
-  // Copy input data from ExecuTorch tensors → backend tensors
   size_t n_inputs = handle->inputs.size();
-  for (size_t i = 0; i < n_inputs; ++i) {
-    struct ggml_tensor* gt = handle->inputs[i];
+  size_t n_outputs = handle->outputs.size();
+
+  // --- Build mapping from ggml input index → args index ---
+  // With dynamic shapes, ExecuTorch passes non-tensor args (sym_size ints)
+  // alongside tensor inputs.  The args layout is:
+  //   [input_0, input_1, ..., (possibly sym_size ints), output_0, output_1, ...]
+  // Outputs are always the last n_outputs entries.
+  //
+  // Some IR "inputs" may correspond to sym_size scalars that were serialized
+  // as placeholder tensors but don't have matching tensor args at runtime.
+  // We build a 1:1 mapping: ggml_input_i → args[i], but only for tensor args.
+  // Non-tensor args (sym_size) and IR inputs without matching tensor args
+  // are skipped during data copy.
+  size_t n_non_output_args = args.size() >= n_outputs ? args.size() - n_outputs : 0;
+
+
+  // --- Shape-change detection: rebuild graph if dynamic dims changed ---
+  if (handle->has_dynamic) {
+    // Build current input shapes from ET tensors (ggml ne order).
+    // Map: for each non-output arg that is a tensor, assign it to the next
+    // ggml input index.  Non-tensor args (sym_size ints) are skipped.
+    std::vector<int64_t> current_ne(n_inputs * 4, 1);
+    size_t ggml_idx = 0;
+    for (size_t a = 0; a < n_non_output_args && ggml_idx < n_inputs; ++a) {
+      if (!args[a]->isTensor()) continue;
+      const auto& et = args[a]->toTensor();
+      int ndim = et.dim();
+      for (int d = 0; d < ndim && d < 4; ++d) {
+        current_ne[ggml_idx * 4 + d] = et.size(ndim - 1 - d);
+      }
+      ++ggml_idx;
+    }
+
+    // Compare only dynamic dims with last-seen shapes.
+    bool shapes_changed = false;
+    for (size_t i = 0; i < n_inputs && !shapes_changed; ++i) {
+      if (i >= handle->input_dynamic_dims.size()) continue;
+      const auto& dd = handle->input_dynamic_dims[i];
+      for (size_t d = 0; d < dd.size() && d < 4; ++d) {
+        if (dd[d] && current_ne[i * 4 + d] != handle->last_input_ne[i * 4 + d]) {
+          shapes_changed = true;
+          break;
+        }
+      }
+    }
+
+    if (shapes_changed) {
+      fprintf(stderr, "[ggml_backend] Dynamic shapes changed, rebuilding graph...\n");
+      for (size_t i = 0; i < n_inputs; ++i) {
+        fprintf(stderr, "  input[%zu]: last=(%lld,%lld,%lld,%lld) cur=(%lld,%lld,%lld,%lld)\n",
+                i,
+                (long long)handle->last_input_ne[i*4], (long long)handle->last_input_ne[i*4+1],
+                (long long)handle->last_input_ne[i*4+2], (long long)handle->last_input_ne[i*4+3],
+                (long long)current_ne[i*4], (long long)current_ne[i*4+1],
+                (long long)current_ne[i*4+2], (long long)current_ne[i*4+3]);
+      }
+      Error err = build_graph(handle, current_ne.data(), current_ne.size());
+      if (err != Error::Ok) return err;
+      handle->last_input_ne = current_ne;
+      n_inputs = handle->inputs.size();
+      fprintf(stderr, "[ggml_backend] Rebuild complete. %zu inputs, %zu outputs\n",
+              handle->inputs.size(), handle->outputs.size());
+    }
+  }
+
+  // Copy input data from ExecuTorch tensors → backend tensors.
+  // Walk non-output args in order; each tensor arg maps to the next ggml input.
+  // Non-tensor args (sym_size ints from dynamic shapes) are skipped.
+  // IR inputs that don't have a matching tensor arg (e.g. sym_size placeholders
+  // that were serialized as dummy [1,1,1,1] tensors) are also skipped.
+  {
+  size_t ggml_idx = 0;
+  for (size_t a = 0; a < n_non_output_args && ggml_idx < n_inputs; ++a) {
+    if (!args[a]->isTensor()) continue;
+
+    struct ggml_tensor* gt = handle->inputs[ggml_idx];
+    ++ggml_idx;
 
     // Skip inputs that aren't part of the ggml graph (gallocr didn't
     // allocate them, e.g. unused position/start_pos placeholders).
     if (gt->buffer == nullptr) continue;
 
-    if (!args[i]->isTensor()) {
-      fprintf(stderr, "[ggml_backend] ERROR: input args[%zu] is not a Tensor (isTensor=%d, isNone=%d), n_inputs=%zu, args.size=%zu\n",
-              i, args[i]->isTensor(), args[i]->isNone(), n_inputs, (size_t)args.size());
-      return Error::InvalidArgument;
-    }
-    const auto& et_tensor = args[i]->toTensor();
+    const auto& et_tensor = args[a]->toTensor();
 
     const size_t nelem = ggml_nelements(gt);
 
@@ -2158,6 +2566,7 @@ Error GgmlBackendInterface::execute(
       ggml_backend_tensor_set(gt, et_tensor.const_data_ptr(), 0, ggml_nbytes(gt));
     }
   }
+  }  // end input copy block
 
   // Run deferred I64→I32 casts (now that input data is on the backend).
   for (const auto& [src_i64, dst_i32] : handle->deferred_i64_to_i32) {
@@ -2176,16 +2585,40 @@ Error GgmlBackendInterface::execute(
   ggml_backend_graph_compute(handle->backend, handle->graph);
 
   // Copy output data from backend tensors → ExecuTorch output tensors
-  size_t n_outputs = handle->outputs.size();
+  // Outputs are always the last n_outputs entries in the args span.
   for (size_t i = 0; i < n_outputs; ++i) {
-    size_t out_idx = n_inputs + i;
+    size_t out_idx = args.size() - n_outputs + i;
     if (out_idx >= (size_t)args.size() || !args[out_idx]->isTensor()) {
-      fprintf(stderr, "[ggml_backend] ERROR: args[%zu] is not a Tensor (out_idx=%zu, args.size=%zu)\n",
-              out_idx, out_idx, (size_t)args.size());
+      fprintf(stderr, "[ggml_backend] ERROR: output args[%zu] is not a Tensor "
+              "(n_outputs=%zu, args.size=%zu)\n",
+              out_idx, n_outputs, (size_t)args.size());
       return Error::InvalidArgument;
     }
     auto& et_tensor = args[out_idx]->toTensor();
     struct ggml_tensor* gt = handle->outputs[i];
+
+    // Resize ET output tensor to match actual ggml output shape (see below).
+
+    // Resize ET output tensor to match actual ggml output shape.
+    // ExecuTorch may have allocated it at the upper-bound shape for dynamic
+    // dims.  Convert ggml ne order (innermost first) to PyTorch order
+    // (outermost first) and resize.
+    {
+      int et_ndim = et_tensor.dim();
+      // Build ggml shape in PyTorch order: reverse the ne array, trim to ndim.
+      // ggml ne = [ne0, ne1, ne2, ne3], PyTorch = [ne_{ndim-1}, ..., ne0]
+      std::vector<executorch::aten::SizesType> new_sizes(et_ndim);
+      for (int d = 0; d < et_ndim; ++d) {
+        new_sizes[d] = static_cast<executorch::aten::SizesType>(
+            gt->ne[et_ndim - 1 - d]);
+      }
+      Error resize_err = executorch::ET_RUNTIME_NAMESPACE::resize_tensor(
+          et_tensor, {new_sizes.data(), new_sizes.size()});
+      if (resize_err != Error::Ok) {
+        fprintf(stderr, "[ggml_backend] WARNING: resize_tensor failed for "
+                "output %zu\n", i);
+      }
+    }
 
     const size_t nelem = ggml_nelements(gt);
 

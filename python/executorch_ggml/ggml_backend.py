@@ -294,6 +294,14 @@ class GgmlBackend(BackendDetails):
                 else:
                     # Runtime input
                     fake_val = node.meta.get("val")
+
+                    # Skip non-tensor placeholders (e.g. SymInt from
+                    # dynamic shapes).  These are passed by ExecuTorch
+                    # for output-shape bookkeeping but are not real
+                    # tensor inputs to the ggml graph.
+                    if fake_val is None or not hasattr(fake_val, "shape"):
+                        continue
+
                     shape = _resolve_shape(fake_val)
 
                     # Detect which dimensions are symbolic (dynamic at runtime).
@@ -499,33 +507,8 @@ class GgmlBackend(BackendDetails):
                         else torch.float32
                     )
 
-                    # Strict shape check: inputs must match output shape
-                    # BroadcastCanonicalizationPass should have handled any broadcasting
-                    a_val = (
-                        a_node.meta.get("val")
-                        if isinstance(a_node, torch.fx.Node)
-                        else None
-                    )
-                    b_val = (
-                        b_node.meta.get("val")
-                        if isinstance(b_node, torch.fx.Node)
-                        else None
-                    )
-                    a_shape = (
-                        _resolve_shape(a_val)
-                    )
-                    b_shape = (
-                        _resolve_shape(b_val)
-                    )
-
-                    if out_shape and a_shape and b_shape:
-                        if a_shape != out_shape or b_shape != out_shape:
-                            raise RuntimeError(
-                                f"MUL requires inputs to match output shape. "
-                                f"Got a={a_shape}, b={b_shape}, out={out_shape}. "
-                                f"Run BroadcastCanonicalizationPass to make broadcasts explicit."
-                            )
-
+                    # Broadcasting is handled natively by the C++ ggml backend
+                    # (ggml_mul supports ggml_can_repeat(b, a)).
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -1228,8 +1211,9 @@ class GgmlBackend(BackendDetails):
                     "aten.expand.default" in target_str
                     or "aten.expand_copy.default" in target_str
                 ):
-                    # expand is a broadcast. Lower as ggml_repeat(x, like) if compatible,
-                    # otherwise just use the source (let consumer handle broadcast).
+                    # expand is a broadcast.  If ggml_repeat can handle the
+                    # shape at trace time, emit REPEAT; otherwise pass through
+                    # the source and rely on consumer ops for broadcast.
                     src_node = node.args[0]
                     src_id = node_to_id[src_node]
                     fake_val = node.meta.get("val")
@@ -1245,15 +1229,13 @@ class GgmlBackend(BackendDetails):
                     )
                     src_shape = _resolve_shape(src_fake)
 
-                    # Check if ggml_repeat can handle this broadcast
-                    # ggml_repeat requires each dim of src to be 1 or equal to target dim
                     src_ne = _pytorch_shape_to_ggml_ne(src_shape)
                     dst_ne = _pytorch_shape_to_ggml_ne(shape)
                     can_repeat = all(
                         src_ne[i] == 1 or src_ne[i] == dst_ne[i] for i in range(4)
                     )
 
-                    if can_repeat:
+                    if can_repeat and src_ne != dst_ne:
                         # Create a shape-only "like" tensor.
                         like_id = alloc_id()
                         ir_tensors.append(
@@ -1278,7 +1260,7 @@ class GgmlBackend(BackendDetails):
                         )
                         node_to_id[node] = tid
                     else:
-                        # Just use source tensor - consumer ops have broadcasting
+                        # Same shape or not repeatable — pass through.
                         node_to_id[node] = src_id
 
                 elif (
@@ -1342,33 +1324,8 @@ class GgmlBackend(BackendDetails):
                         else torch.float32
                     )
 
-                    # Strict shape check: inputs must match output shape
-                    # BroadcastCanonicalizationPass should have handled any broadcasting
-                    x_val = (
-                        x_node.meta.get("val")
-                        if isinstance(x_node, torch.fx.Node)
-                        else None
-                    )
-                    y_val = (
-                        y_node.meta.get("val")
-                        if isinstance(y_node, torch.fx.Node)
-                        else None
-                    )
-                    x_shape = (
-                        _resolve_shape(x_val)
-                    )
-                    y_shape = (
-                        _resolve_shape(y_val)
-                    )
-
-                    if out_shape and x_shape and y_shape:
-                        if x_shape != out_shape or y_shape != out_shape:
-                            raise RuntimeError(
-                                f"ADD requires inputs to match output shape. "
-                                f"Got x={x_shape}, y={y_shape}, out={out_shape}. "
-                                f"Run BroadcastCanonicalizationPass to make broadcasts explicit."
-                            )
-
+                    # Broadcasting is handled natively by the C++ ggml backend
+                    # (ggml_add supports broadcast via ggml_can_repeat).
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -1522,32 +1479,7 @@ class GgmlBackend(BackendDetails):
                         else torch.float32
                     )
 
-                    # Strict shape check: inputs must match output shape
-                    x_val = (
-                        x_node.meta.get("val")
-                        if isinstance(x_node, torch.fx.Node)
-                        else None
-                    )
-                    y_val = (
-                        y_node.meta.get("val")
-                        if isinstance(y_node, torch.fx.Node)
-                        else None
-                    )
-                    x_shape = (
-                        _resolve_shape(x_val)
-                    )
-                    y_shape = (
-                        _resolve_shape(y_val)
-                    )
-
-                    if out_shape and x_shape and y_shape:
-                        if x_shape != out_shape or y_shape != out_shape:
-                            raise RuntimeError(
-                                f"SUB requires inputs to match output shape. "
-                                f"Got x={x_shape}, y={y_shape}, out={out_shape}. "
-                                f"Run BroadcastCanonicalizationPass to make broadcasts explicit."
-                            )
-
+                    # Broadcasting is handled natively by ggml_sub.
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(

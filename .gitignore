@@ -13,6 +13,8 @@ dist/
 *_generated.h
 
 # Artifacts
+.build/
+.build-*/
 .cache/
 .claude/
 .venv/
