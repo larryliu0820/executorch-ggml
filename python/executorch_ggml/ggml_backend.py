@@ -210,11 +210,16 @@ class GgmlBackend(BackendDetails):
         sig = edge_program.graph_signature
         param_map = dict(sig.inputs_to_parameters)  # node_name → param FQN
         buffer_map = dict(sig.inputs_to_buffers)  # node_name → buffer FQN
+        lifted_const_map = dict(
+            getattr(sig, "inputs_to_lifted_tensor_constants", {}) or {}
+        )  # node_name → constant FQN
 
         # ep.constants holds tensor constants (like attention masks and RoPE freqs)
         # that are not in ep.state_dict but are still compile-time constants.
         # We need both sources when resolving constant data.
+        # ep.tensor_constants is the same pool under a different accessor.
         ep_constants = getattr(edge_program, "constants", {}) or {}
+        ep_tensor_constants = getattr(edge_program, "tensor_constants", {}) or {}
 
         # Track runtime input index (for inputs that are NOT params/buffers)
         runtime_input_idx = 0
@@ -234,24 +239,32 @@ class GgmlBackend(BackendDetails):
         for node in graph.nodes:
             if node.op == "placeholder":
                 node_name = node.name
-                # Some placeholders map to parameters/buffers.  There are two
-                # sources for constant tensor data:
+                # Some placeholders map to parameters, buffers, or lifted
+                # tensor constants.  There are three sources:
                 #   1) ep.state_dict  – parameters and mutable buffers (KV caches)
                 #   2) ep.constants   – non-mutable tensor constants (attention
                 #                       masks, RoPE freqs_cos/sin, etc.)
-                # We check both so that attention masks and RoPE frequency tables
-                # are treated as compile-time constants rather than runtime inputs.
-                fqn = param_map.get(node_name) or buffer_map.get(node_name)
+                #   3) lifted_tensor_constants – scalar/tensor constants lifted
+                #      by torch.export (e.g. scaling factors); these live in
+                #      ep.constants or ep.tensor_constants.
+                # We check all three so that every compile-time constant is
+                # handled as an IR constant rather than a runtime input.
+                fqn = (param_map.get(node_name)
+                       or buffer_map.get(node_name)
+                       or lifted_const_map.get(node_name))
                 tensor_from_state = fqn is not None and fqn in edge_program.state_dict
-                tensor_from_constants = fqn is not None and fqn in ep_constants
+                tensor_from_constants = fqn is not None and (
+                    fqn in ep_constants or fqn in ep_tensor_constants
+                )
                 is_constant = tensor_from_state or tensor_from_constants
 
                 if is_constant:
-                    tensor = (
-                        edge_program.state_dict[fqn]
-                        if tensor_from_state
-                        else ep_constants[fqn]
-                    )
+                    if tensor_from_state:
+                        tensor = edge_program.state_dict[fqn]
+                    elif fqn in ep_constants:
+                        tensor = ep_constants[fqn]
+                    else:
+                        tensor = ep_tensor_constants[fqn]
                     shape = list(tensor.shape)
 
                     # Store the tensor bytes in NamedDataStore (dedup handled).
@@ -320,6 +333,13 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None and hasattr(fake_val, "dtype")
                         else torch.float32
                     )
+                    # Declare int64 inputs as int32 in the IR.  ggml ops
+                    # (get_rows, set_rows) work with I32 indices, and the
+                    # C++ execute() already converts ET int64 → ggml I32
+                    # during input copy.  This avoids the need for deferred
+                    # I64→I32 casts and handles VIEW→CAST chains correctly.
+                    if in_dtype == torch.int64:
+                        in_dtype = torch.int32
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
@@ -2235,17 +2255,21 @@ class GgmlBackend(BackendDetails):
                     )
 
             elif node.op == "output":
-                # Mark output tensors
+                # Mark output tensors with their position in the return
+                # tuple.  ExecuTorch passes output args in this same order,
+                # so we store the index in input_index (reused for outputs)
+                # and sort by it in the C++ build_graph.
                 output_args = node.args[0]
                 if not isinstance(output_args, (list, tuple)):
                     output_args = [output_args]
-                for out_node in output_args:
+                for out_idx, out_node in enumerate(output_args):
                     if out_node in node_to_id:
                         tid = node_to_id[out_node]
                         # Find the IrTensor and mark it as output
                         for ir_t in ir_tensors:
                             if ir_t.id == tid:
                                 ir_t.is_output = True
+                                ir_t.input_index = out_idx  # output ordering
                                 break
 
         # Serialize to FlatBuffer

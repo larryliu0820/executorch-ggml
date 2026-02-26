@@ -90,6 +90,92 @@ inline int64_t read_index_value(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Custom op callbacks for comparison / bitwise / logical ops.
+//
+// These run at graph-compute time (not build time) because their source
+// tensors may be ggml graph ops whose data is only available after upstream
+// ops have executed.  ggml custom ops always run on CPU — data is
+// automatically transferred by the backend scheduler.
+// ---------------------------------------------------------------------------
+
+// Helper: read a contiguous float64 value from an I32/I64/F32 tensor.
+static inline double _read_f64(const void* data, ggml_type type, size_t i) {
+  switch (type) {
+    case GGML_TYPE_I32: return (double)((const int32_t*)data)[i];
+    case GGML_TYPE_I64: return (double)((const int64_t*)data)[i];
+    case GGML_TYPE_F32: return (double)((const float*)data)[i];
+    default: return 0.0;
+  }
+}
+
+#define DEFINE_CMP_CUSTOM_OP(name, op_expr)                                  \
+  void ggml_custom_##name(                                                   \
+      struct ggml_tensor* dst, int ith, int nth, void* /*ud*/) {             \
+    const struct ggml_tensor* a = dst->src[0];                               \
+    const struct ggml_tensor* b = dst->src[1];                               \
+    if (!a || !b || !a->data || !b->data || !dst->data) return;              \
+    const int64_t n = ggml_nelements(dst);                                   \
+    const int64_t dr = (n + nth - 1) / nth;                                  \
+    const int64_t i0 = dr * ith;                                             \
+    const int64_t i1 = std::min<int64_t>(i0 + dr, n);                       \
+    int32_t* out = (int32_t*)dst->data;                                      \
+    for (int64_t i = i0; i < i1; ++i) {                                      \
+      double va = _read_f64(a->data, a->type, i);                           \
+      double vb = _read_f64(b->data, b->type, i);                           \
+      out[i] = (op_expr) ? 1 : 0;                                           \
+    }                                                                        \
+  }
+
+DEFINE_CMP_CUSTOM_OP(le, va <= vb)
+DEFINE_CMP_CUSTOM_OP(lt, va <  vb)
+DEFINE_CMP_CUSTOM_OP(gt, va >  vb)
+DEFINE_CMP_CUSTOM_OP(ge, va >= vb)
+DEFINE_CMP_CUSTOM_OP(eq, va == vb)
+DEFINE_CMP_CUSTOM_OP(ne_op, va != vb)
+
+#undef DEFINE_CMP_CUSTOM_OP
+
+void ggml_custom_bitwise_and(
+    struct ggml_tensor* dst, int ith, int nth, void* /*ud*/) {
+  const struct ggml_tensor* a = dst->src[0];
+  const struct ggml_tensor* b = dst->src[1];
+  if (!a || !b || !a->data || !b->data || !dst->data) return;
+  const int64_t n = ggml_nelements(dst);
+  const int64_t dr = (n + nth - 1) / nth;
+  const int64_t i0 = dr * ith, i1 = std::min<int64_t>(i0 + dr, n);
+  const int32_t* ad = (const int32_t*)a->data;
+  const int32_t* bd = (const int32_t*)b->data;
+  int32_t* out = (int32_t*)dst->data;
+  for (int64_t i = i0; i < i1; ++i) out[i] = ad[i] & bd[i];
+}
+
+void ggml_custom_bitwise_or(
+    struct ggml_tensor* dst, int ith, int nth, void* /*ud*/) {
+  const struct ggml_tensor* a = dst->src[0];
+  const struct ggml_tensor* b = dst->src[1];
+  if (!a || !b || !a->data || !b->data || !dst->data) return;
+  const int64_t n = ggml_nelements(dst);
+  const int64_t dr = (n + nth - 1) / nth;
+  const int64_t i0 = dr * ith, i1 = std::min<int64_t>(i0 + dr, n);
+  const int32_t* ad = (const int32_t*)a->data;
+  const int32_t* bd = (const int32_t*)b->data;
+  int32_t* out = (int32_t*)dst->data;
+  for (int64_t i = i0; i < i1; ++i) out[i] = ad[i] | bd[i];
+}
+
+void ggml_custom_logical_not(
+    struct ggml_tensor* dst, int ith, int nth, void* /*ud*/) {
+  const struct ggml_tensor* a = dst->src[0];
+  if (!a || !a->data || !dst->data) return;
+  const int64_t n = ggml_nelements(dst);
+  const int64_t dr = (n + nth - 1) / nth;
+  const int64_t i0 = dr * ith, i1 = std::min<int64_t>(i0 + dr, n);
+  const int32_t* ad = (const int32_t*)a->data;
+  int32_t* out = (int32_t*)dst->data;
+  for (int64_t i = i0; i < i1; ++i) out[i] = (ad[i] == 0) ? 1 : 0;
+}
+
 // Custom runtime gather for multi-index advanced indexing:
 //   out = src[idx0, idx1, ...]
 // where dst->src[0] is src and dst->src[1..] are index tensors.
@@ -287,6 +373,15 @@ struct GgmlDelegateHandle {
 // build_graph() — (re)build ggml context + compute graph from IR
 // ---------------------------------------------------------------------------
 
+// Per-input data blob for pre-populating input tensors during rebuild.
+// When provided, eager ops (comparison, bitwise, etc.) that read from
+// upstream tensors will see correct input data instead of uninitialized memory.
+struct InputDataOverride {
+  const void* data;
+  size_t nbytes;
+  int et_scalar_type;  // executorch::aten::ScalarType enum value
+};
+
 // Rebuild the ggml compute graph from the serialized IR in handle->ir_copy.
 //
 // On success, updates:
@@ -298,10 +393,13 @@ struct GgmlDelegateHandle {
 // input_ne_overrides: nullptr on first call (use serialized shapes).
 //   In M2+ this will carry runtime shapes for dynamic dims.
 // n_overrides: number of int64_t values (n_inputs × 4).
+// input_data: optional per-input data for pre-populating input tensors.
+//   When non-null, eager ops get correct values instead of uninitialized memory.
 static Error build_graph(
     GgmlDelegateHandle* handle,
     const int64_t* input_ne_overrides,
-    size_t n_overrides) {
+    size_t n_overrides,
+    const std::vector<InputDataOverride>* input_data = nullptr) {
 
   (void)n_overrides;  // used only for debug assertions
 
@@ -386,7 +484,7 @@ static Error build_graph(
 
   // Track inputs and outputs
   std::vector<std::pair<int, struct ggml_tensor*>> input_pairs;  // (index, tensor)
-  std::vector<struct ggml_tensor*> output_tensors;
+  std::vector<std::pair<int, struct ggml_tensor*>> output_pairs; // (index, tensor)
   // Deferred I64→I32 casts (for input tensors).
   std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>> deferred_i64_to_i32;
 
@@ -408,6 +506,37 @@ static Error build_graph(
           }
         }
       }
+    }
+  }
+
+  // Dump IR graph summary for debugging.
+  if (input_ne_overrides) {
+    fprintf(stderr, "[build_graph] IR graph: %d tensors, dynamic_size_map={", n_tensors);
+    for (const auto& [k, v] : dynamic_size_map) {
+      fprintf(stderr, " %lld->%lld", (long long)k, (long long)v);
+    }
+    fprintf(stderr, " }\n");
+    for (int i = 0; i < n_tensors; ++i) {
+      const auto* t = fb_tensors->Get(i);
+      const char* kind = "";
+      if (t->is_input()) kind = " [INPUT]";
+      else if (t->is_output()) kind = " [OUTPUT]";
+      else if (t->data_key() && strlen(t->data_key()->c_str()) > 0) kind = " [CONST]";
+      fprintf(stderr, "  t%d: op=%d ne=(%lld,%lld,%lld,%lld)%s",
+              t->id(), (int)t->op(),
+              t->ne() ? (long long)t->ne()->Get(0) : 1,
+              t->ne() && t->ne()->size() > 1 ? (long long)t->ne()->Get(1) : 1,
+              t->ne() && t->ne()->size() > 2 ? (long long)t->ne()->Get(2) : 1,
+              t->ne() && t->ne()->size() > 3 ? (long long)t->ne()->Get(3) : 1,
+              kind);
+      if (t->src_ids() && t->src_ids()->size() > 0) {
+        fprintf(stderr, " srcs=[");
+        for (size_t s = 0; s < t->src_ids()->size(); ++s) {
+          fprintf(stderr, "%s%d", s > 0 ? "," : "", t->src_ids()->Get(s));
+        }
+        fprintf(stderr, "]");
+      }
+      fprintf(stderr, "\n");
     }
   }
 
@@ -435,19 +564,11 @@ static Error build_graph(
       }
     }
 
-    // For op tensors, replace any dim matching a known dynamic trace-time
-    // size with its runtime value. This handles ARANGE, FULL, comparison
-    // ops, UNSQUEEZE, SLICE, etc. that bake output shapes from trace-time
-    // values. For ops that auto-infer shapes from sources (ADD, MUL_MAT,
-    // etc.), ne[] is not used in the op switch, so this is harmless.
-    if (!dynamic_size_map.empty() && op != ggml_ir::OpCode::NONE) {
-      for (int d = 0; d < 4; ++d) {
-        auto it = dynamic_size_map.find(ne[d]);
-        if (it != dynamic_size_map.end()) {
-          ne[d] = it->second;
-        }
-      }
-    }
+    // NOTE: dynamic_size_map is NOT applied globally to op ne[] because
+    // value-based remapping causes collisions (e.g. max_cache_len-1 ==
+    // trace_seq_len).  Instead, each op that bakes trace-time sizes into
+    // its output shape applies the map locally (ARANGE, FULL) or derives
+    // its output shape from input tensors (comparison ops, SLICE, etc.).
 
     // Determine n_dims from ne (count trailing 1s)
     int n_dims = 4;
@@ -518,6 +639,31 @@ static Error build_graph(
 
       if (t->is_input()) {
         input_pairs.emplace_back(t->input_index(), gt);
+
+        // Pre-populate input tensor data so eager ops downstream
+        // (comparisons, bitwise, etc.) read correct values during build.
+        if (input_data && t->input_index() >= 0 &&
+            static_cast<size_t>(t->input_index()) < input_data->size()) {
+          const auto& ido = (*input_data)[t->input_index()];
+          if (ido.data && gt->data) {
+            const size_t nelem = ggml_nelements(gt);
+            // Handle type conversion: ET may pass I64, ggml tensor may be I32.
+            if (gt->type == GGML_TYPE_I32 && ido.et_scalar_type == 4 /* Long */) {
+              const int64_t* src = static_cast<const int64_t*>(ido.data);
+              int32_t* dst = static_cast<int32_t*>(gt->data);
+              for (size_t j = 0; j < nelem; ++j) dst[j] = static_cast<int32_t>(src[j]);
+            } else if (gt->type == GGML_TYPE_F32 && ido.et_scalar_type == 6 /* Float */) {
+              memcpy(gt->data, ido.data, std::min(ido.nbytes, ggml_nbytes(gt)));
+            } else if (gt->type == GGML_TYPE_I32 && ido.et_scalar_type == 11 /* Bool */) {
+              const bool* src = static_cast<const bool*>(ido.data);
+              int32_t* dst = static_cast<int32_t*>(gt->data);
+              for (size_t j = 0; j < nelem; ++j) dst[j] = src[j] ? 1 : 0;
+            } else {
+              // Best-effort: direct copy (matching types).
+              memcpy(gt->data, ido.data, std::min(ido.nbytes, ggml_nbytes(gt)));
+            }
+          }
+        }
       }
 
       id_to_tensor[tid] = gt;
@@ -985,31 +1131,62 @@ static Error build_graph(
             memcpy(&new_ne[i], data + 4 + i * 8, sizeof(int64_t));
           }
 
-          // Apply dynamic_size_map to the VIEW target shape.
-          // The op_params store trace-time dims that may include dynamic
-          // values (e.g. seq_len).  Replace them with runtime values.
-          if (!dynamic_size_map.empty()) {
+          // Fix VIEW target shape for dynamic dims.  The baked-in new_ne[]
+          // may contain trace-time values that need updating.
+          //
+          // Strategy: use dynamic_size_map entries as candidates, but try
+          // ONE dim at a time (outer-to-inner) and accept the first remap
+          // that makes view_numel == src_numel.  This avoids the collision
+          // problem where multiple dims share the same trace-time value
+          // (e.g. seq_len=4 and n_heads=4) — only the outermost matching
+          // dim (seq_len in ggml ne order) gets remapped.
+          int64_t src_numel = ggml_nelements(srcs[0]);
+          int64_t view_numel = new_ne[0] * new_ne[1] * new_ne[2] * new_ne[3];
+
+          // Fix VIEW target shape for dynamic dims.
+          //
+          // Apply dynamic_size_map to ALL matching dims simultaneously.
+          // This handles cases where multiple dims are dynamic (e.g. BMM
+          // output [T_q, T_kv, n_heads, B] where both T_q and T_kv are
+          // dynamic).  After applying all, verify numel matches.  If not,
+          // fall back to single-dim inference (outer-to-inner).
+          if (src_numel != view_numel && !dynamic_size_map.empty()) {
+            // First try: remap ALL dims that appear in the map.
+            int64_t try_ne[4] = {new_ne[0], new_ne[1], new_ne[2], new_ne[3]};
             for (int d = 0; d < 4; ++d) {
-              auto it = dynamic_size_map.find(new_ne[d]);
+              auto it = dynamic_size_map.find(try_ne[d]);
               if (it != dynamic_size_map.end()) {
+                try_ne[d] = it->second;
+              }
+            }
+            if (try_ne[0]*try_ne[1]*try_ne[2]*try_ne[3] == src_numel) {
+              // All-at-once remap matched — use it.
+              for (int d = 0; d < 4; ++d) new_ne[d] = try_ne[d];
+            } else {
+              // All-at-once didn't match (collision: a non-dynamic dim
+              // shares the same value).  Try one-at-a-time, outer-to-inner.
+              for (int d = 3; d >= 0; --d) {
+                auto it = dynamic_size_map.find(new_ne[d]);
+                if (it == dynamic_size_map.end()) continue;
+                int64_t old = new_ne[d];
                 new_ne[d] = it->second;
+                if (new_ne[0]*new_ne[1]*new_ne[2]*new_ne[3] == src_numel) break;
+                new_ne[d] = old;
               }
             }
           }
-
-          // If source numel differs from the baked-in view shape (dynamic
-          // shapes changed an upstream dim), infer the one mismatched dim.
-          int64_t src_numel = ggml_nelements(srcs[0]);
-          int64_t view_numel = new_ne[0] * new_ne[1] * new_ne[2] * new_ne[3];
+          // Fallback: if dynamic_size_map didn't fully resolve, infer from numel.
+          view_numel = new_ne[0] * new_ne[1] * new_ne[2] * new_ne[3];
           if (src_numel != view_numel && view_numel > 0) {
-            for (int d = 0; d < 4; ++d) {
+            for (int d = 3; d >= 0; --d) {
               if (new_ne[d] <= 1) continue;
               int64_t others = view_numel / new_ne[d];
               if (others > 0 && src_numel % others == 0) {
                 int64_t inferred = src_numel / others;
                 if (inferred != new_ne[d]) {
                   new_ne[d] = inferred;
-                  break;
+                  view_numel = new_ne[0] * new_ne[1] * new_ne[2] * new_ne[3];
+                  if (view_numel == src_numel) break;
                 }
               }
             }
@@ -1130,6 +1307,9 @@ static Error build_graph(
           }
           struct ggml_tensor* a = srcs[0];
           int ax = (int(nd) - 1) - dim;
+
+          // Use source tensor shape for non-sliced dims (not stale IR ne[]).
+          for (int d = 0; d < 4; ++d) ne[d] = a->ne[d];
 
           // Clamp end to actual source dim (handles "slice to end" when
           // source shape changed due to dynamic dims).
@@ -1688,6 +1868,16 @@ static Error build_graph(
             default: out_type = GGML_TYPE_I64; break;
           }
 
+          // ARANGE has no input tensors — apply dynamic_size_map locally.
+          if (!dynamic_size_map.empty()) {
+            for (int d = 0; d < 4; ++d) {
+              auto it = dynamic_size_map.find(ne[d]);
+              if (it != dynamic_size_map.end()) {
+                ne[d] = it->second;
+              }
+            }
+          }
+
           gt = ggml_new_tensor_4d(ctx, out_type, ne[0], ne[1], ne[2], ne[3]);
           const size_t nelem = ggml_nelements(gt);
 
@@ -1729,6 +1919,16 @@ static Error build_graph(
             default: out_type = GGML_TYPE_F32; break;
           }
 
+          // FULL has no input tensors — apply dynamic_size_map locally.
+          if (!dynamic_size_map.empty()) {
+            for (int d = 0; d < 4; ++d) {
+              auto it = dynamic_size_map.find(ne[d]);
+              if (it != dynamic_size_map.end()) {
+                ne[d] = it->second;
+              }
+            }
+          }
+
           gt = ggml_new_tensor_4d(ctx, out_type, ne[0], ne[1], ne[2], ne[3]);
           const size_t nelem = ggml_nelements(gt);
 
@@ -1760,7 +1960,8 @@ static Error build_graph(
           struct ggml_tensor* src = srcs[0];
           ggml_type out_type = src->type;
 
-          gt = ggml_new_tensor_4d(ctx, out_type, ne[0], ne[1], ne[2], ne[3]);
+          // CUMSUM output shape = input shape (use input, not stale IR ne[]).
+          gt = ggml_new_tensor_4d(ctx, out_type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
 
           // Convert PyTorch dim to ggml axis
           int ggml_axis = (ndim - 1) - dim;
@@ -1813,238 +2014,125 @@ static Error build_graph(
 
         case ggml_ir::OpCode::EQ: {
           // eq(a, b) or eq(a, scalar)
-          // op_params: float64 scalar, int32 is_scalar
           double scalar = 0.0;
           int32_t is_scalar = 0;
           if (t->op_params() && t->op_params()->size() >= 12) {
             memcpy(&scalar, t->op_params()->data(), 8);
             memcpy(&is_scalar, t->op_params()->data() + 8, 4);
           }
-
           struct ggml_tensor* a = srcs[0];
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
-          const size_t nelem = ggml_nelements(gt);
-          int32_t* out_data = static_cast<int32_t*>(gt->data);
-
+          struct ggml_tensor* b;
           if (is_scalar) {
-            if (a->type == GGML_TYPE_I64) {
-              const int64_t* in_data = static_cast<const int64_t*>(a->data);
-              int64_t s = static_cast<int64_t>(scalar);
-              for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] == s) ? 1 : 0;
-            } else if (a->type == GGML_TYPE_I32) {
-              const int32_t* in_data = static_cast<const int32_t*>(a->data);
-              int32_t s = static_cast<int32_t>(scalar);
-              for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] == s) ? 1 : 0;
-            } else {
-              const float* in_data = static_cast<const float*>(a->data);
-              float s = static_cast<float>(scalar);
-              for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] == s) ? 1 : 0;
-            }
+            // Create a scalar-filled constant tensor as the second argument.
+            b = ggml_new_tensor_4d(ctx, a->type, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+            const size_t n = ggml_nelements(b);
+            if (a->type == GGML_TYPE_I64)      { auto* d=(int64_t*)b->data; for(size_t j=0;j<n;++j) d[j]=(int64_t)scalar; }
+            else if (a->type == GGML_TYPE_I32)  { auto* d=(int32_t*)b->data; for(size_t j=0;j<n;++j) d[j]=(int32_t)scalar; }
+            else                                { auto* d=(float*)b->data;   for(size_t j=0;j<n;++j) d[j]=(float)scalar;   }
           } else {
-            struct ggml_tensor* b = srcs[1];
-            if (a->type == GGML_TYPE_I64) {
-              const int64_t* a_data = static_cast<const int64_t*>(a->data);
-              const int64_t* b_data = static_cast<const int64_t*>(b->data);
-              for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] == b_data[i]) ? 1 : 0;
-            } else if (a->type == GGML_TYPE_I32) {
-              const int32_t* a_data = static_cast<const int32_t*>(a->data);
-              const int32_t* b_data = static_cast<const int32_t*>(b->data);
-              for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] == b_data[i]) ? 1 : 0;
-            } else {
-              const float* a_data = static_cast<const float*>(a->data);
-              const float* b_data = static_cast<const float*>(b->data);
-              for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] == b_data[i]) ? 1 : 0;
-            }
+            b = srcs[1];
           }
+          struct ggml_tensor* args[2] = {a, b};
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+              args, 2, ggml_custom_eq, GGML_N_TASKS_MAX, nullptr);
           break;
         }
 
         case ggml_ir::OpCode::NE: {
-          // ne(a, scalar) - not equal
+          // ne(a, scalar)
           double scalar = 0.0;
           int32_t is_scalar = 1;
           if (t->op_params() && t->op_params()->size() >= 12) {
             memcpy(&scalar, t->op_params()->data(), 8);
             memcpy(&is_scalar, t->op_params()->data() + 8, 4);
           }
-
           struct ggml_tensor* a = srcs[0];
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
-          const size_t nelem = ggml_nelements(gt);
-          int32_t* out_data = static_cast<int32_t*>(gt->data);
-
-          if (a->type == GGML_TYPE_I64) {
-            const int64_t* in_data = static_cast<const int64_t*>(a->data);
-            int64_t s = static_cast<int64_t>(scalar);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] != s) ? 1 : 0;
-          } else if (a->type == GGML_TYPE_I32) {
-            const int32_t* in_data = static_cast<const int32_t*>(a->data);
-            int32_t s = static_cast<int32_t>(scalar);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] != s) ? 1 : 0;
-          } else {
-            const float* in_data = static_cast<const float*>(a->data);
-            float s = static_cast<float>(scalar);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] != s) ? 1 : 0;
-          }
+          struct ggml_tensor* b = ggml_new_tensor_4d(ctx, a->type, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+          const size_t n = ggml_nelements(b);
+          if (a->type == GGML_TYPE_I64)      { auto* d=(int64_t*)b->data; for(size_t j=0;j<n;++j) d[j]=(int64_t)scalar; }
+          else if (a->type == GGML_TYPE_I32)  { auto* d=(int32_t*)b->data; for(size_t j=0;j<n;++j) d[j]=(int32_t)scalar; }
+          else                                { auto* d=(float*)b->data;   for(size_t j=0;j<n;++j) d[j]=(float)scalar;   }
+          struct ggml_tensor* args[2] = {a, b};
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+              args, 2, ggml_custom_ne_op, GGML_N_TASKS_MAX, nullptr);
           break;
         }
+
+        // ---- Comparison / bitwise / logical ops ----
+        // All implemented as ggml custom ops so they execute at graph-compute
+        // time.  This is critical when sources are ggml graph ops (e.g.
+        // softmax output) whose data isn't available during build_graph().
 
         case ggml_ir::OpCode::LE: {
-          // le(a, b) - less than or equal
-          struct ggml_tensor* a = srcs[0];
-          struct ggml_tensor* b = srcs[1];
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
-          const size_t nelem = ggml_nelements(gt);
-          int32_t* out_data = static_cast<int32_t*>(gt->data);
-
-          if (a->type == GGML_TYPE_I64) {
-            const int64_t* a_data = static_cast<const int64_t*>(a->data);
-            const int64_t* b_data = static_cast<const int64_t*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] <= b_data[i]) ? 1 : 0;
-          } else if (a->type == GGML_TYPE_I32) {
-            const int32_t* a_data = static_cast<const int32_t*>(a->data);
-            const int32_t* b_data = static_cast<const int32_t*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] <= b_data[i]) ? 1 : 0;
-          } else {
-            const float* a_data = static_cast<const float*>(a->data);
-            const float* b_data = static_cast<const float*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] <= b_data[i]) ? 1 : 0;
-          }
+          struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
+          struct ggml_tensor* args[2] = {a, b};
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+              args, 2, ggml_custom_le, GGML_N_TASKS_MAX, nullptr);
           break;
         }
-
         case ggml_ir::OpCode::LT: {
-          // lt(a, b) - less than
-          struct ggml_tensor* a = srcs[0];
-          struct ggml_tensor* b = srcs[1];
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
-          const size_t nelem = ggml_nelements(gt);
-          int32_t* out_data = static_cast<int32_t*>(gt->data);
-
-          if (a->type == GGML_TYPE_I64) {
-            const int64_t* a_data = static_cast<const int64_t*>(a->data);
-            const int64_t* b_data = static_cast<const int64_t*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] < b_data[i]) ? 1 : 0;
-          } else if (a->type == GGML_TYPE_I32) {
-            const int32_t* a_data = static_cast<const int32_t*>(a->data);
-            const int32_t* b_data = static_cast<const int32_t*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] < b_data[i]) ? 1 : 0;
-          } else {
-            const float* a_data = static_cast<const float*>(a->data);
-            const float* b_data = static_cast<const float*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] < b_data[i]) ? 1 : 0;
-          }
+          struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
+          struct ggml_tensor* args[2] = {a, b};
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+              args, 2, ggml_custom_lt, GGML_N_TASKS_MAX, nullptr);
           break;
         }
-
         case ggml_ir::OpCode::GT: {
-          // gt(a, b) - greater than
-          struct ggml_tensor* a = srcs[0];
-          struct ggml_tensor* b = srcs[1];
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
-          const size_t nelem = ggml_nelements(gt);
-          int32_t* out_data = static_cast<int32_t*>(gt->data);
-
-          if (a->type == GGML_TYPE_I64) {
-            const int64_t* a_data = static_cast<const int64_t*>(a->data);
-            const int64_t* b_data = static_cast<const int64_t*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] > b_data[i]) ? 1 : 0;
-          } else if (a->type == GGML_TYPE_I32) {
-            const int32_t* a_data = static_cast<const int32_t*>(a->data);
-            const int32_t* b_data = static_cast<const int32_t*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] > b_data[i]) ? 1 : 0;
-          } else {
-            const float* a_data = static_cast<const float*>(a->data);
-            const float* b_data = static_cast<const float*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] > b_data[i]) ? 1 : 0;
-          }
+          struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
+          struct ggml_tensor* args[2] = {a, b};
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+              args, 2, ggml_custom_gt, GGML_N_TASKS_MAX, nullptr);
           break;
         }
-
         case ggml_ir::OpCode::GE: {
-          // ge(a, b) - greater than or equal
-          struct ggml_tensor* a = srcs[0];
-          struct ggml_tensor* b = srcs[1];
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
-          const size_t nelem = ggml_nelements(gt);
-          int32_t* out_data = static_cast<int32_t*>(gt->data);
-
-          if (a->type == GGML_TYPE_I64) {
-            const int64_t* a_data = static_cast<const int64_t*>(a->data);
-            const int64_t* b_data = static_cast<const int64_t*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] >= b_data[i]) ? 1 : 0;
-          } else if (a->type == GGML_TYPE_I32) {
-            const int32_t* a_data = static_cast<const int32_t*>(a->data);
-            const int32_t* b_data = static_cast<const int32_t*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] >= b_data[i]) ? 1 : 0;
-          } else {
-            const float* a_data = static_cast<const float*>(a->data);
-            const float* b_data = static_cast<const float*>(b->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = (a_data[i] >= b_data[i]) ? 1 : 0;
-          }
+          struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
+          struct ggml_tensor* args[2] = {a, b};
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+              args, 2, ggml_custom_ge, GGML_N_TASKS_MAX, nullptr);
           break;
         }
-
         case ggml_ir::OpCode::BITWISE_AND: {
-          // bitwise_and(a, b)
-          struct ggml_tensor* a = srcs[0];
-          struct ggml_tensor* b = srcs[1];
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
-          const size_t nelem = ggml_nelements(gt);
-          int32_t* out_data = static_cast<int32_t*>(gt->data);
-
-          const int32_t* a_data = static_cast<const int32_t*>(a->data);
-          const int32_t* b_data = static_cast<const int32_t*>(b->data);
-          for (size_t i = 0; i < nelem; ++i) out_data[i] = a_data[i] & b_data[i];
+          struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
+          struct ggml_tensor* args[2] = {a, b};
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+              args, 2, ggml_custom_bitwise_and, GGML_N_TASKS_MAX, nullptr);
           break;
         }
-
         case ggml_ir::OpCode::BITWISE_OR: {
-          // bitwise_or(a, b)
-          struct ggml_tensor* a = srcs[0];
-          struct ggml_tensor* b = srcs[1];
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
-          const size_t nelem = ggml_nelements(gt);
-          int32_t* out_data = static_cast<int32_t*>(gt->data);
-
-          const int32_t* a_data = static_cast<const int32_t*>(a->data);
-          const int32_t* b_data = static_cast<const int32_t*>(b->data);
-          for (size_t i = 0; i < nelem; ++i) out_data[i] = a_data[i] | b_data[i];
+          struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
+          struct ggml_tensor* args[2] = {a, b};
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+              args, 2, ggml_custom_bitwise_or, GGML_N_TASKS_MAX, nullptr);
           break;
         }
-
         case ggml_ir::OpCode::LOGICAL_NOT: {
-          // logical_not(x)
           struct ggml_tensor* x = srcs[0];
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
-          const size_t nelem = ggml_nelements(gt);
-          int32_t* out_data = static_cast<int32_t*>(gt->data);
-
-          const int32_t* in_data = static_cast<const int32_t*>(x->data);
-          for (size_t i = 0; i < nelem; ++i) out_data[i] = (in_data[i] == 0) ? 1 : 0;
+          struct ggml_tensor* args[1] = {x};
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, x->ne[0], x->ne[1], x->ne[2], x->ne[3],
+              args, 1, ggml_custom_logical_not, GGML_N_TASKS_MAX, nullptr);
           break;
         }
 
         case ggml_ir::OpCode::ANY: {
           // any(x, dim) - reduce any along dimension
-          // op_params: int32 dim, int32 ndim
+          // Kept as eager since ANY is rare and its sources in practice
+          // are leaf-like (comparison results that are now custom ops).
           int32_t dim = 0, ndim = 4;
           if (t->op_params() && t->op_params()->size() >= 8) {
             memcpy(&dim, t->op_params()->data(), 4);
             memcpy(&ndim, t->op_params()->data() + 4, 4);
           }
-
           struct ggml_tensor* src = srcs[0];
-          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ne[0], ne[1], ne[2], ne[3]);
-
-          // Convert PyTorch dim to ggml axis
           int ggml_axis = (ndim - 1) - dim;
+
+          int64_t any_ne[4] = {src->ne[0], src->ne[1], src->ne[2], src->ne[3]};
+          any_ne[ggml_axis] = 1;
+          gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, any_ne[0], any_ne[1], any_ne[2], any_ne[3]);
           const size_t nelem_out = ggml_nelements(gt);
 
           const int32_t* in_data = static_cast<const int32_t*>(src->data);
           int32_t* out_data = static_cast<int32_t*>(gt->data);
 
-          // Simple reduction: for now assume output shape is source shape with dim reduced
           int64_t stride = 1;
           for (int ax = 0; ax < ggml_axis; ++ax) stride *= src->ne[ax];
           int64_t dim_size = src->ne[ggml_axis];
@@ -2056,13 +2144,9 @@ static Error build_graph(
               int32_t any_true = 0;
               for (int64_t d = 0; d < dim_size; ++d) {
                 int64_t in_idx = outer * dim_size * stride + d * stride + inner;
-                if (in_data[in_idx] != 0) {
-                  any_true = 1;
-                  break;
-                }
+                if (in_data[in_idx] != 0) { any_true = 1; break; }
               }
-              int64_t out_idx = outer * stride + inner;
-              out_data[out_idx] = any_true;
+              out_data[outer * stride + inner] = any_true;
             }
           }
           break;
@@ -2143,7 +2227,8 @@ static Error build_graph(
     }
 
     if (t->is_output()) {
-      output_tensors.push_back(id_to_tensor[tid]);
+      int out_idx = t->input_index();  // reused for output ordering
+      output_pairs.emplace_back(out_idx >= 0 ? out_idx : (int)output_pairs.size(), id_to_tensor[tid]);
     }
   }
   //
@@ -2162,16 +2247,41 @@ static Error build_graph(
   //   For input tensors with dynamic_dims, override ne[d] from
   //   input_ne_overrides when input_ne_overrides != nullptr.
 
+  // Sort outputs by output_index (stored in input_index field for outputs)
+  // to match the order ExecuTorch expects in the output args span.
+  std::sort(output_pairs.begin(), output_pairs.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+  std::vector<struct ggml_tensor*> output_tensors;
+  for (auto& [idx, tensor] : output_pairs) {
+    output_tensors.push_back(tensor);
+  }
+
   // === Build compute graph ===
   // Build compute graph using the same estimated size from above.
   struct ggml_cgraph* graph = ggml_new_graph_custom(ctx, est_graph_size, false);
   for (auto* out : output_tensors) {
     ggml_build_forward_expand(graph, out);
   }
+  // (graph debug removed — ggml_cgraph is opaque)
 
   // Sort inputs by input_index
   std::sort(input_pairs.begin(), input_pairs.end(),
             [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  // Replace I64 inputs with their I32 deferred-cast destinations.
+  // The I64 tensor is NOT part of the ggml compute graph (the cast is
+  // deferred to the host), so gallocr won't allocate it.  By swapping
+  // the I32 destination into the input list, execute() can copy ET int64
+  // data directly into the I32 tensor via the existing I32+Long path.
+  for (auto& [idx, tensor] : input_pairs) {
+    for (auto& [src_i64, dst_i32] : deferred_i64_to_i32) {
+      if (tensor == src_i64) {
+        tensor = dst_i32;
+        break;
+      }
+    }
+  }
+  deferred_i64_to_i32.clear();  // no longer needed
 
   // Collect ordered input tensor list.
   std::vector<struct ggml_tensor*> ordered_inputs;
@@ -2461,12 +2571,16 @@ Error GgmlBackendInterface::execute(
   size_t n_non_output_args = args.size() >= n_outputs ? args.size() - n_outputs : 0;
 
 
-  // --- Shape-change detection: rebuild graph if dynamic dims changed ---
+  // --- Always rebuild graph for dynamic models ---
+  // The graph must be rebuilt on every step because eager ops (comparison,
+  // bitwise, etc.) compute data at build time. Their results depend on
+  // input DATA (e.g. cache_position), not just input shapes. Without
+  // rebuilding, these ops produce stale values from the previous step.
   if (handle->has_dynamic) {
     // Build current input shapes from ET tensors (ggml ne order).
-    // Map: for each non-output arg that is a tensor, assign it to the next
-    // ggml input index.  Non-tensor args (sym_size ints) are skipped.
     std::vector<int64_t> current_ne(n_inputs * 4, 1);
+    // Also collect input data pointers for pre-population.
+    std::vector<InputDataOverride> input_data_vec(n_inputs);
     size_t ggml_idx = 0;
     for (size_t a = 0; a < n_non_output_args && ggml_idx < n_inputs; ++a) {
       if (!args[a]->isTensor()) continue;
@@ -2475,39 +2589,18 @@ Error GgmlBackendInterface::execute(
       for (int d = 0; d < ndim && d < 4; ++d) {
         current_ne[ggml_idx * 4 + d] = et.size(ndim - 1 - d);
       }
+      input_data_vec[ggml_idx] = {
+        et.const_data_ptr(),
+        static_cast<size_t>(et.nbytes()),
+        static_cast<int>(et.scalar_type())
+      };
       ++ggml_idx;
     }
 
-    // Compare only dynamic dims with last-seen shapes.
-    bool shapes_changed = false;
-    for (size_t i = 0; i < n_inputs && !shapes_changed; ++i) {
-      if (i >= handle->input_dynamic_dims.size()) continue;
-      const auto& dd = handle->input_dynamic_dims[i];
-      for (size_t d = 0; d < dd.size() && d < 4; ++d) {
-        if (dd[d] && current_ne[i * 4 + d] != handle->last_input_ne[i * 4 + d]) {
-          shapes_changed = true;
-          break;
-        }
-      }
-    }
-
-    if (shapes_changed) {
-      fprintf(stderr, "[ggml_backend] Dynamic shapes changed, rebuilding graph...\n");
-      for (size_t i = 0; i < n_inputs; ++i) {
-        fprintf(stderr, "  input[%zu]: last=(%lld,%lld,%lld,%lld) cur=(%lld,%lld,%lld,%lld)\n",
-                i,
-                (long long)handle->last_input_ne[i*4], (long long)handle->last_input_ne[i*4+1],
-                (long long)handle->last_input_ne[i*4+2], (long long)handle->last_input_ne[i*4+3],
-                (long long)current_ne[i*4], (long long)current_ne[i*4+1],
-                (long long)current_ne[i*4+2], (long long)current_ne[i*4+3]);
-      }
-      Error err = build_graph(handle, current_ne.data(), current_ne.size());
-      if (err != Error::Ok) return err;
-      handle->last_input_ne = current_ne;
-      n_inputs = handle->inputs.size();
-      fprintf(stderr, "[ggml_backend] Rebuild complete. %zu inputs, %zu outputs\n",
-              handle->inputs.size(), handle->outputs.size());
-    }
+    Error err = build_graph(handle, current_ne.data(), current_ne.size(), &input_data_vec);
+    if (err != Error::Ok) return err;
+    handle->last_input_ne = current_ne;
+    n_inputs = handle->inputs.size();
   }
 
   // Copy input data from ExecuTorch tensors → backend tensors.
