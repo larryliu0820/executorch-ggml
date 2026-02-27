@@ -1,6 +1,6 @@
 # Dynamic Shape Rebuild — Progress
 
-## Status: FFN + GQA both passing (CPU). SDPA test added. IR deserializer tool added.
+## Status: FFN exact, GQA step 0 exact / step 1 within flash_attn tolerance (CPU).
 
 ---
 
@@ -35,11 +35,21 @@ Core dynamic shape infrastructure: `build_graph()` extraction, shape overrides, 
 3. After creating input tensors, copy ET input data into ggml tensor memory before the eager ops run
 4. This gives eager ops correct input values at build time
 
-### M10: Custom ops for comparison/logical ops (in progress)
+### M10: Custom ops for comparison/logical ops ✓
 
 Converting eager ops (LE, LT, GT, GE, EQ, NE, BITWISE_AND/OR, LOGICAL_NOT) to `ggml_custom_4d` so they execute during `ggml_backend_graph_compute()` instead of at build time. This is needed for the decomposed SDPA path (BareSDPA test) where these ops read from upstream graph ops like softmax output.
 
 ANY remains eager (reduction op, rare, and its sources are now custom ops).
+
+### M13: Fix causal mask for flash_attn_ext ✓
+
+**Problem 1 — Broadcasting bug**: Comparison custom ops (LE, LT, GT, GE) read `a[i]` and `b[i]` linearly, but `a` and `b` may have different shapes due to broadcasting. When LE compares `kv_positions(32,1,1,1)` <= `cache_position(1,1,1,1)`, elements `b[1]..b[31]` read out-of-bounds garbage.
+
+**Fix**: Decompose flat index `i` into multi-dimensional `(d0,d1,d2,d3)`, then compute `ai` and `bi` using modular indexing to handle broadcast: `d_k % a->ne[k]`. Also set output shape to broadcast dimensions (`max(a->ne[k], b->ne[k])`).
+
+**Problem 2 — Boolean-to-additive mask conversion**: The LE comparison produces I32 0/1 (boolean), but `ggml_flash_attn_ext` expects F16 additive mask (0.0 = attend, -inf = don't attend). The old code just cast I32→F16, giving 0.0/1.0 — completely wrong.
+
+**Fix**: Added `ggml_custom_bool_to_additive_mask` callback that converts I32 boolean (1=attend, 0=don't) to F16 additive (0.0/-inf). The LLAMA_ATTENTION handler detects I32/I64 mask types and applies this conversion before passing to `ggml_flash_attn_ext`.
 
 ### M11: IR deserializer tool ✓
 
@@ -60,15 +70,16 @@ Changed from `"eager"` to `"sdpa"` so the exported graph contains `aten.scaled_d
 ### test_dynamic_shapes_ffn — ALL PASS ✓
 
 Gated SiLU MLP + residual with dynamic `seq_len`:
-- Tested at seq_lens `[4, 1, 8, 1, 16, 4]` — all pass with `max_abs_diff < 0.001`
+- Tested at seq_lens `[4, 1, 8, 1, 16, 4]` — all exact matches (max_abs_diff = 0.000000)
 
 ### test_dynamic_shapes_gqa — PASS (CPU) ✓
 
 Qwen3 GQA via optimum-executorch (tiny: dim=64, 4 heads, 2 KV heads, 2 layers):
-- **Step 0**: max_abs_diff ≈ 0.3–0.5 (PASS, threshold 1.0)
-- **Step 1**: max_abs_diff ≈ 0.4–0.5 (PASS, threshold 1.0)
-- No more NaN
-- Diff comes from `ggml_flash_attn_ext` vs PyTorch SDPA (different accumulation order)
+- **Step 0**: max_abs_diff = **0.000000** (EXACT MATCH, threshold 0.5)
+- **Step 1**: max_abs_diff ≈ 0.1–0.44 (PASS, threshold 0.5)
+- Argmax always matches between eager and ggml
+- Step 0 is exact because 1 attended KV position → no accumulation order difference
+- Step 1 diff is from `ggml_flash_attn_ext` vs PyTorch math SDPA (~0.02 at attention level, amplified ~16x through projections with random weights)
 
 ### test_dynamic_shapes_sdpa — WIP
 
@@ -117,8 +128,8 @@ pip install -e . --no-build-isolation
 # or direct cmake (reuse existing build dir):
 cmake --build /tmp/tmp*.build-temp --target executorch_ggml_backend_py -j$(nproc)
 
-# Test
-LD_LIBRARY_PATH=python/executorch_ggml pytest tests/test_dynamic_shapes.py -v -s
+# Test (CPU)
+GGML_BACKEND_DEVICE=cpu LD_LIBRARY_PATH=python/executorch_ggml pytest tests/test_dynamic_shapes.py -v -s
 
 # Dump IR from .pte
 python -m executorch_ggml.dump_ir model.pte

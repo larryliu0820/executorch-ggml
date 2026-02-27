@@ -121,8 +121,20 @@ static inline double _read_f64(const void* data, ggml_type type, size_t i) {
     const int64_t i1 = std::min<int64_t>(i0 + dr, n);                       \
     int32_t* out = (int32_t*)dst->data;                                      \
     for (int64_t i = i0; i < i1; ++i) {                                      \
-      double va = _read_f64(a->data, a->type, i);                           \
-      double vb = _read_f64(b->data, b->type, i);                           \
+      int64_t d0 = i % dst->ne[0];                                          \
+      int64_t d1 = (i / dst->ne[0]) % dst->ne[1];                           \
+      int64_t d2 = (i / (dst->ne[0]*dst->ne[1])) % dst->ne[2];             \
+      int64_t d3 = i / (dst->ne[0]*dst->ne[1]*dst->ne[2]);                  \
+      int64_t ai = (d0 % a->ne[0])                                          \
+                 + (d1 % a->ne[1]) * a->ne[0]                               \
+                 + (d2 % a->ne[2]) * a->ne[0]*a->ne[1]                      \
+                 + (d3 % a->ne[3]) * a->ne[0]*a->ne[1]*a->ne[2];            \
+      int64_t bi = (d0 % b->ne[0])                                          \
+                 + (d1 % b->ne[1]) * b->ne[0]                               \
+                 + (d2 % b->ne[2]) * b->ne[0]*b->ne[1]                      \
+                 + (d3 % b->ne[3]) * b->ne[0]*b->ne[1]*b->ne[2];            \
+      double va = _read_f64(a->data, a->type, ai);                          \
+      double vb = _read_f64(b->data, b->type, bi);                          \
       out[i] = (op_expr) ? 1 : 0;                                           \
     }                                                                        \
   }
@@ -135,6 +147,25 @@ DEFINE_CMP_CUSTOM_OP(eq, va == vb)
 DEFINE_CMP_CUSTOM_OP(ne_op, va != vb)
 
 #undef DEFINE_CMP_CUSTOM_OP
+
+// Convert I32 boolean mask (1=attend, 0=don't attend) to F16 additive mask
+// (0.0=attend, -inf=don't attend) as required by ggml_flash_attn_ext.
+void ggml_custom_bool_to_additive_mask(
+    struct ggml_tensor* dst, int ith, int nth, void* /*ud*/) {
+  const struct ggml_tensor* src = dst->src[0];
+  if (!src || !src->data || !dst->data) return;
+  const int64_t n = ggml_nelements(dst);
+  const int64_t dr = (n + nth - 1) / nth;
+  const int64_t i0 = dr * ith;
+  const int64_t i1 = std::min<int64_t>(i0 + dr, n);
+  ggml_fp16_t* out = (ggml_fp16_t*)dst->data;
+  const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+  const ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-INFINITY);
+  for (int64_t i = i0; i < i1; ++i) {
+    double v = _read_f64(src->data, src->type, i);
+    out[i] = (v != 0.0) ? zero_f16 : neg_inf_f16;
+  }
+}
 
 void ggml_custom_bitwise_and(
     struct ggml_tensor* dst, int ith, int nth, void* /*ud*/) {
@@ -1662,19 +1693,24 @@ static Error build_graph(
           // Inf, producing +Inf in the dot product accumulation.
 
           // Optional attention mask.  ggml_flash_attn_ext requires it to be:
-          //   - F16 (the CPU kernel reads it as additive logit bias in FP16)
+          //   - F16 additive logit bias (0.0=attend, -inf=don't attend)
           //   - contiguous
-          // The Python lowering stores the causal mask as F16 (True→0.0, False→-inf)
-          // and aten.index.Tensor selects the right row via ggml_get_rows, giving
-          // shape [kv_seq_len, 1, 1, 1] in ggml order.
+          // The mask may arrive as:
+          //   (a) I32 boolean from LE/comparison ops (1=attend, 0=don't)
+          //   (b) F16/F32 already in additive format
           struct ggml_tensor* mask = nullptr;
           if (srcs.size() > 3 && srcs[3] != nullptr) {
             mask = srcs[3];
-            // Ensure F16 (bool mask should already be converted at store time, but guard).
-            if (mask->type != GGML_TYPE_F16) {
+            if (mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64) {
+              // Boolean mask → additive F16 via custom op (runs at compute time)
+              struct ggml_tensor* args[1] = {mask};
+              mask = ggml_custom_4d(ctx, GGML_TYPE_F16,
+                  mask->ne[0], mask->ne[1], mask->ne[2], mask->ne[3],
+                  args, 1, ggml_custom_bool_to_additive_mask,
+                  GGML_N_TASKS_MAX, nullptr);
+            } else if (mask->type != GGML_TYPE_F16) {
               mask = safe_ggml_cast(ctx, mask, GGML_TYPE_F16);
             }
-            // Ensure contiguous (get_rows result may not be contiguous).
             if (!ggml_is_contiguous(mask)) {
               mask = ggml_cont(ctx, mask);
             }
@@ -2066,28 +2102,36 @@ static Error build_graph(
         case ggml_ir::OpCode::LE: {
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
           struct ggml_tensor* args[2] = {a, b};
-          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+              std::max(a->ne[0], b->ne[0]), std::max(a->ne[1], b->ne[1]),
+              std::max(a->ne[2], b->ne[2]), std::max(a->ne[3], b->ne[3]),
               args, 2, ggml_custom_le, GGML_N_TASKS_MAX, nullptr);
           break;
         }
         case ggml_ir::OpCode::LT: {
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
           struct ggml_tensor* args[2] = {a, b};
-          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+              std::max(a->ne[0], b->ne[0]), std::max(a->ne[1], b->ne[1]),
+              std::max(a->ne[2], b->ne[2]), std::max(a->ne[3], b->ne[3]),
               args, 2, ggml_custom_lt, GGML_N_TASKS_MAX, nullptr);
           break;
         }
         case ggml_ir::OpCode::GT: {
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
           struct ggml_tensor* args[2] = {a, b};
-          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+              std::max(a->ne[0], b->ne[0]), std::max(a->ne[1], b->ne[1]),
+              std::max(a->ne[2], b->ne[2]), std::max(a->ne[3], b->ne[3]),
               args, 2, ggml_custom_gt, GGML_N_TASKS_MAX, nullptr);
           break;
         }
         case ggml_ir::OpCode::GE: {
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
           struct ggml_tensor* args[2] = {a, b};
-          gt = ggml_custom_4d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+          gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+              std::max(a->ne[0], b->ne[0]), std::max(a->ne[1], b->ne[1]),
+              std::max(a->ne[2], b->ne[2]), std::max(a->ne[3], b->ne[3]),
               args, 2, ggml_custom_ge, GGML_N_TASKS_MAX, nullptr);
           break;
         }

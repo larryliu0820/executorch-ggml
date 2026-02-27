@@ -278,23 +278,31 @@ def test_dynamic_shapes_gqa():
 
         ggml_out = pte.forward((input_ids, cache_position))[0]
 
-        abs_diff = (eager_out - ggml_out).abs().max().item()
-        match = abs_diff < 1.0  # LLM logits across vocab; random weights + flash_attn accumulation order
+        diff = (eager_out - ggml_out).abs()
+        abs_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        match = abs_diff < 0.5  # flash_attn_ext vs math SDPA accumulation order
         if not match:
             all_passed = False
         status = "PASS" if match else "FAIL"
         print(f"[test]   step {i}: input_ids={input_ids.tolist()} "
               f"cache_pos={cache_position.tolist()} "
               f"| shape={list(eager_out.shape)} "
-              f"| max_abs_diff={abs_diff:.6f} | {status}", flush=True)
-        if not match:
-            # Show top-5 logits comparison
-            eager_topk = eager_out[0, -1].topk(5)
-            ggml_topk = ggml_out[0, -1].topk(5)
-            print(f"[test]     eager top5: vals={eager_topk.values.tolist()} "
-                  f"idx={eager_topk.indices.tolist()}")
-            print(f"[test]     ggml  top5: vals={ggml_topk.values.tolist()} "
-                  f"idx={ggml_topk.indices.tolist()}")
+              f"| max_abs_diff={abs_diff:.6f} mean={mean_diff:.6f} | {status}", flush=True)
+
+        # Always show detailed diagnostics for debugging
+        eager_topk = eager_out[0, -1].topk(10)
+        ggml_topk = ggml_out[0, -1].topk(10)
+        print(f"[test]     eager top10: vals={[f'{v:.4f}' for v in eager_topk.values.tolist()]} "
+              f"idx={eager_topk.indices.tolist()}")
+        print(f"[test]     ggml  top10: vals={[f'{v:.4f}' for v in ggml_topk.values.tolist()]} "
+              f"idx={ggml_topk.indices.tolist()}")
+        print(f"[test]     eager argmax={eager_out[0,-1].argmax().item()} "
+              f"ggml argmax={ggml_out[0,-1].argmax().item()}")
+        # Diff distribution
+        for thr in [0.01, 0.05, 0.1, 0.2, 0.5]:
+            cnt = (diff > thr).sum().item()
+            print(f"[test]     diff>{thr}: {cnt}/{diff.numel()}", flush=True)
 
     print("-" * 60)
     assert all_passed, "GQA dynamic shape test failed"
