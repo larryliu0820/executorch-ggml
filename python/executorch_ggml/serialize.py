@@ -298,8 +298,13 @@ def pack_transpose_params(dim0: int, dim1: int, ndim: int) -> bytes:
     return struct.pack("<iii", int(dim0), int(dim1), int(ndim))
 
 
-def pack_unsqueeze_params(dim: int) -> bytes:
-    return pack_i32(dim)
+def pack_unsqueeze_params(dim: int, ndim: int) -> bytes:
+    """Pack unsqueeze parameters.
+
+    dim: PyTorch unsqueeze dim (normalized to [0, ndim])
+    ndim: PyTorch input rank before unsqueeze
+    """
+    return struct.pack("<ii", int(dim), int(ndim))
 
 
 def pack_cat_params(ggml_axis: int) -> bytes:

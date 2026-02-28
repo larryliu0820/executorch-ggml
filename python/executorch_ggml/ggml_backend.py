@@ -593,6 +593,11 @@ class GgmlBackend(BackendDetails):
                     src_node = node.args[0]
                     dim = int(node.args[1])
                     src_id = node_to_id[src_node]
+                    src_val = src_node.meta.get("val")
+                    src_shape = _resolve_shape(src_val)
+                    src_ndim = len(src_shape) if len(src_shape) > 0 else 1
+                    if dim < 0:
+                        dim += src_ndim + 1
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
                     out_dtype = (
@@ -608,7 +613,7 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_UNSQUEEZE,
                             src_ids=[src_id],
-                            op_params=pack_unsqueeze_params(dim),
+                            op_params=pack_unsqueeze_params(dim, src_ndim),
                         )
                     )
                     node_to_id[node] = tid
