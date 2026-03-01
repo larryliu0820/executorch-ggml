@@ -240,11 +240,11 @@ def dump_graph(blob: bytes):
                 short_key = key.split(".")[-1] if "." in key else key
                 flags.append(f"CONST({short_key})")
 
-        # Dynamic dims
-        dd = [t.DynamicDims(d) for d in range(t.DynamicDimsLength())] if t.DynamicDimsLength() > 0 else []
-        if any(dd):
-            dyn_str = "".join("D" if d else "." for d in dd)
-            flags.append(f"dyn=[{dyn_str}]")
+        # Symbolic dim IDs
+        sids = [t.SymDimIds(d) for d in range(t.SymDimIdsLength())] if t.SymDimIdsLength() > 0 else []
+        if any(sid >= 0 for sid in sids):
+            sym_str = ",".join(f"s{sid}" if sid >= 0 else "." for sid in sids)
+            flags.append(f"sym=[{sym_str}]")
 
         # Op params
         op_params_raw = bytes(t.OpParamsAsNumpy()) if t.OpParamsLength() > 0 else b""

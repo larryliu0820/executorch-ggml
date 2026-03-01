@@ -155,29 +155,29 @@ class Tensor(object):
         return -1
 
     # Tensor
-    def DynamicDims(self, j):
+    def SymDimIds(self, j):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(24))
         if o != 0:
             a = self._tab.Vector(o)
-            return self._tab.Get(flatbuffers.number_types.BoolFlags, a + flatbuffers.number_types.UOffsetTFlags.py_type(j * 1))
+            return self._tab.Get(flatbuffers.number_types.Int32Flags, a + flatbuffers.number_types.UOffsetTFlags.py_type(j * 4))
         return 0
 
     # Tensor
-    def DynamicDimsAsNumpy(self):
+    def SymDimIdsAsNumpy(self):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(24))
         if o != 0:
-            return self._tab.GetVectorAsNumpy(flatbuffers.number_types.BoolFlags, o)
+            return self._tab.GetVectorAsNumpy(flatbuffers.number_types.Int32Flags, o)
         return 0
 
     # Tensor
-    def DynamicDimsLength(self):
+    def SymDimIdsLength(self):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(24))
         if o != 0:
             return self._tab.VectorLen(o)
         return 0
 
     # Tensor
-    def DynamicDimsIsNone(self):
+    def SymDimIdsIsNone(self):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(24))
         return o == 0
 
@@ -265,17 +265,17 @@ def TensorAddInputIndex(builder, inputIndex):
 def AddInputIndex(builder, inputIndex):
     TensorAddInputIndex(builder, inputIndex)
 
-def TensorAddDynamicDims(builder, dynamicDims):
-    builder.PrependUOffsetTRelativeSlot(10, flatbuffers.number_types.UOffsetTFlags.py_type(dynamicDims), 0)
+def TensorAddSymDimIds(builder, symDimIds):
+    builder.PrependUOffsetTRelativeSlot(10, flatbuffers.number_types.UOffsetTFlags.py_type(symDimIds), 0)
 
-def AddDynamicDims(builder, dynamicDims):
-    TensorAddDynamicDims(builder, dynamicDims)
+def AddSymDimIds(builder, symDimIds):
+    TensorAddSymDimIds(builder, symDimIds)
 
-def TensorStartDynamicDimsVector(builder, numElems):
-    return builder.StartVector(1, numElems, 1)
+def TensorStartSymDimIdsVector(builder, numElems):
+    return builder.StartVector(4, numElems, 4)
 
-def StartDynamicDimsVector(builder, numElems):
-    return TensorStartDynamicDimsVector(builder, numElems)
+def StartSymDimIdsVector(builder, numElems):
+    return TensorStartSymDimIdsVector(builder, numElems)
 
 def TensorEnd(builder):
     return builder.EndObject()

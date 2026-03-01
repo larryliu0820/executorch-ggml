@@ -117,7 +117,7 @@ class IrTensor:
         "is_input",
         "is_output",
         "input_index",
-        "dynamic_dims",
+        "sym_dim_ids",
     )
 
     def __init__(
@@ -132,7 +132,7 @@ class IrTensor:
         is_input: bool = False,
         is_output: bool = False,
         input_index: int = -1,
-        dynamic_dims: Optional[List[bool]] = None,
+        sym_dim_ids: Optional[List[int]] = None,
     ):
         self.id = tensor_id
         self.tensor_type = tensor_type
@@ -144,7 +144,7 @@ class IrTensor:
         self.is_input = is_input
         self.is_output = is_output
         self.input_index = input_index
-        self.dynamic_dims = dynamic_dims or []
+        self.sym_dim_ids = sym_dim_ids or []
 
 
 # ---------------------------------------------------------------------------
@@ -192,10 +192,10 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
         else:
             data_key_off = None
 
-        if t.dynamic_dims and any(t.dynamic_dims):
-            dyn_vec = _create_bool_vector(builder, t.dynamic_dims)
+        if t.sym_dim_ids and any(sid >= 0 for sid in t.sym_dim_ids):
+            sym_vec = _create_int32_vector(builder, t.sym_dim_ids)
         else:
-            dyn_vec = None
+            sym_vec = None
 
         # Build the Tensor table
         # Start table with the right number of fields (11 fields)
@@ -215,8 +215,8 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
         builder.PrependBoolSlot(7, t.is_input, False)    # is_input
         builder.PrependBoolSlot(8, t.is_output, False)   # is_output
         builder.PrependInt32Slot(9, t.input_index, -1)   # input_index
-        if dyn_vec is not None:
-            builder.PrependUOffsetTRelativeSlot(10, dyn_vec, 0)  # dynamic_dims
+        if sym_vec is not None:
+            builder.PrependUOffsetTRelativeSlot(10, sym_vec, 0)  # sym_dim_ids
 
         tensor_offsets.append(builder.EndObject())
 

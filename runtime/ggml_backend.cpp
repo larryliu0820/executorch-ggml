@@ -572,12 +572,12 @@ struct GgmlDelegateHandle {
   // build_graph() restores these into the ggml context on each rebuild.
   std::vector<SavedConstant> constant_data;
 
-  // True if any input has dynamic_dims (enables shape-change detection).
+  // True if any tensor has sym_dim_ids (enables shape-change detection).
   bool has_dynamic = false;
 
-  // Per-input dynamic_dims flags (ggml ne order, padded to 4).
-  // input_dynamic_dims[i] has 4 bools for input i.
-  std::vector<std::vector<bool>> input_dynamic_dims;
+  // Per-input sym_dim_ids (ggml ne order, padded to 4).
+  // input_sym_dim_ids[i] has 4 int32_t values for input i (-1 = static).
+  std::vector<std::vector<int32_t>> input_sym_dim_ids;
 
   // Last-seen input shapes (ggml ne order, 4 values per input, flattened).
   // Used to detect when a rebuild is needed.
@@ -699,22 +699,18 @@ static Error build_graph(
   // Deferred I64→I32 casts (for input tensors).
   std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>> deferred_i64_to_i32;
 
-  // Build dynamic size mapping: trace-time ne value → runtime ne value.
-  // Used to fix output shapes of ops that bake in trace-time sizes
-  // (ARANGE, FULL, comparison ops, etc.).
-  std::unordered_map<int64_t, int64_t> dynamic_size_map;
+  // Build sym_dim_values: symbolic variable ID → runtime concrete value.
+  // Populated from input tensors that have sym_dim_ids annotations.
+  std::unordered_map<int32_t, int64_t> sym_dim_values;
   if (input_ne_overrides) {
     for (int i = 0; i < n_tensors; ++i) {
       const auto* ti = fb_tensors->Get(i);
-      if (!ti->is_input() || !ti->dynamic_dims() || !ti->ne()) continue;
+      if (!ti->is_input() || !ti->sym_dim_ids() || !ti->ne()) continue;
       int input_idx = ti->input_index();
-      for (size_t d = 0; d < ti->dynamic_dims()->size() && d < 4; ++d) {
-        if (ti->dynamic_dims()->Get(d)) {
-          int64_t trace_val = ti->ne()->Get(d);
-          int64_t runtime_val = input_ne_overrides[input_idx * 4 + d];
-          if (trace_val != runtime_val) {
-            dynamic_size_map[trace_val] = runtime_val;
-          }
+      for (size_t d = 0; d < ti->sym_dim_ids()->size() && d < 4; ++d) {
+        int32_t sid = ti->sym_dim_ids()->Get(d);
+        if (sid >= 0) {
+          sym_dim_values[sid] = input_ne_overrides[input_idx * 4 + d];
         }
       }
     }
@@ -734,21 +730,27 @@ static Error build_graph(
       }
     }
 
-    // Override dynamic dims with runtime shapes for input tensors (M2).
-    if (input_ne_overrides && t->is_input() && t->dynamic_dims()) {
+    // Override dynamic dims with runtime shapes for input tensors.
+    if (input_ne_overrides && t->is_input() && t->sym_dim_ids()) {
       int input_idx = t->input_index();
-      for (size_t d = 0; d < t->dynamic_dims()->size() && d < 4; ++d) {
-        if (t->dynamic_dims()->Get(d)) {
+      for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
+        int32_t sid = t->sym_dim_ids()->Get(d);
+        if (sid >= 0) {
           ne[d] = input_ne_overrides[input_idx * 4 + d];
         }
       }
     }
 
-    // NOTE: dynamic_size_map is NOT applied globally to op ne[] because
-    // value-based remapping causes collisions (e.g. max_cache_len-1 ==
-    // trace_seq_len).  Instead, each op that bakes trace-time sizes into
-    // its output shape applies the map locally (ARANGE, FULL) or derives
-    // its output shape from input tensors (comparison ops, SLICE, etc.).
+    // Resolve sym_dim_ids for non-input tensors (ARANGE, FULL, VIEW, etc.).
+    if (!t->is_input() && t->sym_dim_ids() && !sym_dim_values.empty()) {
+      for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
+        int32_t sid = t->sym_dim_ids()->Get(d);
+        if (sid >= 0) {
+          auto it = sym_dim_values.find(sid);
+          if (it != sym_dim_values.end()) ne[d] = it->second;
+        }
+      }
+    }
 
     // Determine n_dims from ne (count trailing 1s)
     int n_dims = 4;
@@ -1316,52 +1318,19 @@ static Error build_graph(
             memcpy(&new_ne[i], data + 4 + i * 8, sizeof(int64_t));
           }
 
-          // Fix VIEW target shape for dynamic dims.  The baked-in new_ne[]
-          // may contain trace-time values that need updating.
-          //
-          // Strategy: use dynamic_size_map entries as candidates, but try
-          // ONE dim at a time (outer-to-inner) and accept the first remap
-          // that makes view_numel == src_numel.  This avoids the collision
-          // problem where multiple dims share the same trace-time value
-          // (e.g. seq_len=4 and n_heads=4) — only the outermost matching
-          // dim (seq_len in ggml ne order) gets remapped.
-          int64_t src_numel = ggml_nelements(srcs[0]);
-          int64_t view_numel = new_ne[0] * new_ne[1] * new_ne[2] * new_ne[3];
-
-          // Fix VIEW target shape for dynamic dims.
-          //
-          // Apply dynamic_size_map to ALL matching dims simultaneously.
-          // This handles cases where multiple dims are dynamic (e.g. BMM
-          // output [T_q, T_kv, n_heads, B] where both T_q and T_kv are
-          // dynamic).  After applying all, verify numel matches.  If not,
-          // fall back to single-dim inference (outer-to-inner).
-          if (src_numel != view_numel && !dynamic_size_map.empty()) {
-            // First try: remap ALL dims that appear in the map.
-            int64_t try_ne[4] = {new_ne[0], new_ne[1], new_ne[2], new_ne[3]};
-            for (int d = 0; d < 4; ++d) {
-              auto it = dynamic_size_map.find(try_ne[d]);
-              if (it != dynamic_size_map.end()) {
-                try_ne[d] = it->second;
-              }
-            }
-            if (try_ne[0]*try_ne[1]*try_ne[2]*try_ne[3] == src_numel) {
-              // All-at-once remap matched — use it.
-              for (int d = 0; d < 4; ++d) new_ne[d] = try_ne[d];
-            } else {
-              // All-at-once didn't match (collision: a non-dynamic dim
-              // shares the same value).  Try one-at-a-time, outer-to-inner.
-              for (int d = 3; d >= 0; --d) {
-                auto it = dynamic_size_map.find(new_ne[d]);
-                if (it == dynamic_size_map.end()) continue;
-                int64_t old = new_ne[d];
-                new_ne[d] = it->second;
-                if (new_ne[0]*new_ne[1]*new_ne[2]*new_ne[3] == src_numel) break;
-                new_ne[d] = old;
+          // Resolve sym_dim_ids for VIEW target shape.
+          if (t->sym_dim_ids() && !sym_dim_values.empty()) {
+            for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
+              int32_t sid = t->sym_dim_ids()->Get(d);
+              if (sid >= 0) {
+                auto it = sym_dim_values.find(sid);
+                if (it != sym_dim_values.end()) new_ne[d] = it->second;
               }
             }
           }
-          // Fallback: if dynamic_size_map didn't fully resolve, infer from numel.
-          view_numel = new_ne[0] * new_ne[1] * new_ne[2] * new_ne[3];
+          // Numel-inference fallback as safety net.
+          int64_t src_numel = ggml_nelements(srcs[0]);
+          int64_t view_numel = new_ne[0] * new_ne[1] * new_ne[2] * new_ne[3];
           if (src_numel != view_numel && view_numel > 0) {
             for (int d = 3; d >= 0; --d) {
               if (new_ne[d] <= 1) continue;
@@ -2097,15 +2066,7 @@ static Error build_graph(
             default: out_type = GGML_TYPE_I64; break;
           }
 
-          // ARANGE has no input tensors — apply dynamic_size_map locally.
-          if (!dynamic_size_map.empty()) {
-            for (int d = 0; d < 4; ++d) {
-              auto it = dynamic_size_map.find(ne[d]);
-              if (it != dynamic_size_map.end()) {
-                ne[d] = it->second;
-              }
-            }
-          }
+          // sym_dim_ids resolution already applied to ne[] above.
 
           gt = ggml_new_tensor_4d(ctx, out_type, ne[0], ne[1], ne[2], ne[3]);
           const size_t nelem = ggml_nelements(gt);
@@ -2148,15 +2109,7 @@ static Error build_graph(
             default: out_type = GGML_TYPE_F32; break;
           }
 
-          // FULL has no input tensors — apply dynamic_size_map locally.
-          if (!dynamic_size_map.empty()) {
-            for (int d = 0; d < 4; ++d) {
-              auto it = dynamic_size_map.find(ne[d]);
-              if (it != dynamic_size_map.end()) {
-                ne[d] = it->second;
-              }
-            }
-          }
+          // sym_dim_ids resolution already applied to ne[] above.
 
           gt = ggml_new_tensor_4d(ctx, out_type, ne[0], ne[1], ne[2], ne[3]);
           const size_t nelem = ggml_nelements(gt);
@@ -2490,7 +2443,7 @@ static Error build_graph(
   //     }
   //
   // KEY CHANGE (M2+ only, skip for M1):
-  //   For input tensors with dynamic_dims, override ne[d] from
+  //   For input tensors with sym_dim_ids, override ne[d] from
   //   input_ne_overrides when input_ne_overrides != nullptr.
 
   // Sort outputs by output_index (stored in input_index field for outputs)
@@ -2793,27 +2746,33 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     handle->constant_data.push_back(std::move(sc));
   }
 
-  // --- 5. Read dynamic_dims from IR for each input ---
+  // --- 5. Read sym_dim_ids from IR ---
+  // Scan ALL tensors (not just inputs) for sym_dim_ids to detect dynamic models.
   for (int i = 0; i < n_tensors; ++i) {
     const auto* t = fb_tensors->Get(i);
-    if (!t->is_input()) continue;
-
-    std::vector<bool> dd(4, false);
-    if (t->dynamic_dims()) {
-      for (size_t d = 0; d < t->dynamic_dims()->size() && d < 4; ++d) {
-        dd[d] = t->dynamic_dims()->Get(d);
+    if (t->sym_dim_ids()) {
+      for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
+        if (t->sym_dim_ids()->Get(d) >= 0) {
+          handle->has_dynamic = true;
+          break;
+        }
       }
     }
-    if (std::any_of(dd.begin(), dd.end(), [](bool v) { return v; })) {
-      handle->has_dynamic = true;
+    if (!t->is_input()) continue;
+
+    std::vector<int32_t> sids(4, -1);
+    if (t->sym_dim_ids()) {
+      for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
+        sids[d] = t->sym_dim_ids()->Get(d);
+      }
     }
     // Store in input_index order (may be sparse; resize as needed).
     int idx = t->input_index();
-    if (idx >= 0 && static_cast<size_t>(idx) >= handle->input_dynamic_dims.size()) {
-      handle->input_dynamic_dims.resize(idx + 1);
+    if (idx >= 0 && static_cast<size_t>(idx) >= handle->input_sym_dim_ids.size()) {
+      handle->input_sym_dim_ids.resize(idx + 1);
     }
     if (idx >= 0) {
-      handle->input_dynamic_dims[idx] = std::move(dd);
+      handle->input_sym_dim_ids[idx] = std::move(sids);
     }
   }
 

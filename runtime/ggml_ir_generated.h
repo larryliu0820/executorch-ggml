@@ -275,7 +275,7 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_IS_INPUT = 18,
     VT_IS_OUTPUT = 20,
     VT_INPUT_INDEX = 22,
-    VT_DYNAMIC_DIMS = 24
+    VT_SYM_DIM_IDS = 24
   };
   int32_t id() const {
     return GetField<int32_t>(VT_ID, 0);
@@ -307,8 +307,8 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   int32_t input_index() const {
     return GetField<int32_t>(VT_INPUT_INDEX, -1);
   }
-  const ::flatbuffers::Vector<uint8_t> *dynamic_dims() const {
-    return GetPointer<const ::flatbuffers::Vector<uint8_t> *>(VT_DYNAMIC_DIMS);
+  const ::flatbuffers::Vector<int32_t> *sym_dim_ids() const {
+    return GetPointer<const ::flatbuffers::Vector<int32_t> *>(VT_SYM_DIM_IDS);
   }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
@@ -326,8 +326,8 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyField<uint8_t>(verifier, VT_IS_INPUT, 1) &&
            VerifyField<uint8_t>(verifier, VT_IS_OUTPUT, 1) &&
            VerifyField<int32_t>(verifier, VT_INPUT_INDEX, 4) &&
-           VerifyOffset(verifier, VT_DYNAMIC_DIMS) &&
-           verifier.VerifyVector(dynamic_dims()) &&
+           VerifyOffset(verifier, VT_SYM_DIM_IDS) &&
+           verifier.VerifyVector(sym_dim_ids()) &&
            verifier.EndTable();
   }
 };
@@ -366,8 +366,8 @@ struct TensorBuilder {
   void add_input_index(int32_t input_index) {
     fbb_.AddElement<int32_t>(Tensor::VT_INPUT_INDEX, input_index, -1);
   }
-  void add_dynamic_dims(::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> dynamic_dims) {
-    fbb_.AddOffset(Tensor::VT_DYNAMIC_DIMS, dynamic_dims);
+  void add_sym_dim_ids(::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> sym_dim_ids) {
+    fbb_.AddOffset(Tensor::VT_SYM_DIM_IDS, sym_dim_ids);
   }
   explicit TensorBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
@@ -392,9 +392,9 @@ inline ::flatbuffers::Offset<Tensor> CreateTensor(
     bool is_input = false,
     bool is_output = false,
     int32_t input_index = -1,
-    ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> dynamic_dims = 0) {
+    ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> sym_dim_ids = 0) {
   TensorBuilder builder_(_fbb);
-  builder_.add_dynamic_dims(dynamic_dims);
+  builder_.add_sym_dim_ids(sym_dim_ids);
   builder_.add_input_index(input_index);
   builder_.add_data_key(data_key);
   builder_.add_op_params(op_params);
@@ -420,12 +420,12 @@ inline ::flatbuffers::Offset<Tensor> CreateTensorDirect(
     bool is_input = false,
     bool is_output = false,
     int32_t input_index = -1,
-    const std::vector<uint8_t> *dynamic_dims = nullptr) {
+    const std::vector<int32_t> *sym_dim_ids = nullptr) {
   auto ne__ = ne ? _fbb.CreateVector<int64_t>(*ne) : 0;
   auto src_ids__ = src_ids ? _fbb.CreateVector<int32_t>(*src_ids) : 0;
   auto op_params__ = op_params ? _fbb.CreateVector<uint8_t>(*op_params) : 0;
   auto data_key__ = data_key ? _fbb.CreateString(data_key) : 0;
-  auto dynamic_dims__ = dynamic_dims ? _fbb.CreateVector<uint8_t>(*dynamic_dims) : 0;
+  auto sym_dim_ids__ = sym_dim_ids ? _fbb.CreateVector<int32_t>(*sym_dim_ids) : 0;
   return ggml_ir::CreateTensor(
       _fbb,
       id,
@@ -438,7 +438,7 @@ inline ::flatbuffers::Offset<Tensor> CreateTensorDirect(
       is_input,
       is_output,
       input_index,
-      dynamic_dims__);
+      sym_dim_ids__);
 }
 
 struct GgmlGraph FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {

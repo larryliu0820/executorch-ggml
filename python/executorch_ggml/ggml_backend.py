@@ -119,16 +119,40 @@ def _resolve_shape(fake_val) -> List[int]:
     return [_concrete_int(s) for s in fake_val.shape]
 
 
-def _detect_dynamic_dims(fake_val) -> List[bool]:
-    """Return a list of bools indicating which dims of fake_val are symbolic.
+def _get_sym_dim_id(s, sym_id_map: dict) -> int:
+    """Return symbolic dim ID for a SymInt, or -1 for static."""
+    if not isinstance(s, torch.SymInt):
+        return -1
+    import sympy
+    expr = s.node.expr
+    if isinstance(expr, sympy.Symbol):
+        name = str(expr)
+        if name not in sym_id_map:
+            sym_id_map[name] = len(sym_id_map)
+        return sym_id_map[name]
+    raise ValueError(
+        f"Unsupported symbolic expression in tensor shape: {expr}. "
+        f"Only simple symbolic variables (e.g. s0) are supported, "
+        f"not derived expressions (e.g. s0 + 1)."
+    )
 
-    The result is in **PyTorch** dim order (outermost first), matching the
-    shape returned by _resolve_shape.  The caller is responsible for reversing
-    to ggml ne order when serializing into the IR.
-    """
+
+def _get_sym_dim_ids(fake_val, sym_id_map: dict) -> List[int]:
+    """Per-dim symbolic IDs in PyTorch dim order. -1 = static."""
     if fake_val is None or not hasattr(fake_val, "shape"):
         return []
-    return [isinstance(s, torch.SymInt) for s in fake_val.shape]
+    return [_get_sym_dim_id(s, sym_id_map) for s in fake_val.shape]
+
+
+def _sym_dim_ids_ggml(fake_val, sym_id_map: dict) -> 'List[int] | None':
+    """Compute ggml-order sym_dim_ids, or None if all static."""
+    pt_sym = _get_sym_dim_ids(fake_val, sym_id_map)
+    if not pt_sym or all(sid == -1 for sid in pt_sym):
+        return None
+    ggml_sym = list(reversed(pt_sym))
+    while len(ggml_sym) < 4:
+        ggml_sym.append(-1)
+    return ggml_sym[:4]
 
 
 def _pytorch_shape_to_ggml_ne(shape: List[int]) -> List[int]:
@@ -183,6 +207,9 @@ class GgmlBackend(BackendDetails):
         node_to_id: Dict[torch.fx.Node, int] = {}
         ir_tensors: List[IrTensor] = []
         next_id = 0
+
+        # Maps symbolic variable name (e.g. "s0") → unique integer ID
+        sym_id_map: Dict[str, int] = {}
 
         # NOTE: BN folding is now intended to be done via a rewrite pass
         # (BatchNormFoldingRewritePass) *before* partitioning/lowering.
@@ -317,14 +344,8 @@ class GgmlBackend(BackendDetails):
 
                     shape = _resolve_shape(fake_val)
 
-                    # Detect which dimensions are symbolic (dynamic at runtime).
-                    # _detect_dynamic_dims returns PyTorch dim order; we reverse
-                    # to match ggml ne order (innermost first), then pad to 4D.
-                    pt_dyn = _detect_dynamic_dims(fake_val)
-                    ggml_dyn = list(reversed(pt_dyn))
-                    while len(ggml_dyn) < 4:
-                        ggml_dyn.append(False)
-                    ggml_dyn = ggml_dyn[:4]
+                    # Compute per-dimension symbolic variable IDs.
+                    ggml_sym = _sym_dim_ids_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     # Runtime input dtype based on FakeTensor meta when available.
@@ -348,7 +369,7 @@ class GgmlBackend(BackendDetails):
                             op=OP_NONE,
                             is_input=True,
                             input_index=runtime_input_idx,
-                            dynamic_dims=ggml_dyn if any(ggml_dyn) else None,
+                            sym_dim_ids=ggml_sym,
                         )
                     )
                     node_to_id[node] = tid
@@ -902,6 +923,7 @@ class GgmlBackend(BackendDetails):
                             op=OP_VIEW,
                             src_ids=[slice_id],
                             op_params=pack_view_params(ggml_ne),
+                            sym_dim_ids=_sym_dim_ids_ggml(fake_val, sym_id_map),
                         )
                     )
                     node_to_id[node] = tid
@@ -1321,6 +1343,7 @@ class GgmlBackend(BackendDetails):
                             op=OP_VIEW,
                             src_ids=[src_id],
                             op_params=pack_view_params(ggml_ne),
+                            sym_dim_ids=_sym_dim_ids_ggml(fake_val, sym_id_map),
                         )
                     )
                     node_to_id[node] = tid
@@ -1794,6 +1817,7 @@ class GgmlBackend(BackendDetails):
                             op=OP_ARANGE,
                             src_ids=[],
                             op_params=pack_arange_params(start, step),
+                            sym_dim_ids=_sym_dim_ids_ggml(fake_val, sym_id_map),
                         )
                     )
                     node_to_id[node] = tid
@@ -1821,6 +1845,7 @@ class GgmlBackend(BackendDetails):
                             op=OP_ARANGE,
                             src_ids=[],
                             op_params=pack_arange_params(start, step),
+                            sym_dim_ids=_sym_dim_ids_ggml(fake_val, sym_id_map),
                         )
                     )
                     node_to_id[node] = tid
@@ -1902,6 +1927,7 @@ class GgmlBackend(BackendDetails):
                             op=OP_FULL,
                             src_ids=[],
                             op_params=pack_full_params(fill_value),
+                            sym_dim_ids=_sym_dim_ids_ggml(fake_val, sym_id_map),
                         )
                     )
                     node_to_id[node] = tid

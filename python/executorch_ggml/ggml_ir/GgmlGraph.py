@@ -31,7 +31,7 @@ class GgmlGraph(object):
             x = self._tab.Vector(o)
             x += flatbuffers.number_types.UOffsetTFlags.py_type(j) * 4
             x = self._tab.Indirect(x)
-            from executorch_ggml.ggml_ir.Tensor import Tensor
+            from ggml_ir.Tensor import Tensor
             obj = Tensor()
             obj.Init(self._tab.Bytes, x)
             return obj
