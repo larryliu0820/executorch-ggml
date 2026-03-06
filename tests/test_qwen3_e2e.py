@@ -16,19 +16,18 @@ Usage:
 """
 
 import os
-import tempfile
 
 import torch
 
 
 def _export_qwen3(max_seq_len: int = 128):
     """Export Qwen3-0.6B to .pte with ggml backend delegation."""
+    from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
     from executorch_ggml import GgmlPartitioner
-    from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
-    from optimum.exporters.executorch.integrations import CausalLMExportableModule
     from executorch_ggml.passes import RemoveGraphAssertsPass
     from executorch_ggml.passes.replace_copy_ops_pass import ReplaceCopyOpsPass
-    from executorch.exir import to_edge_transform_and_lower, EdgeCompileConfig
+    from optimum.exporters.executorch.integrations import CausalLMExportableModule
+    from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
 
     model_id = "Qwen/Qwen3-0.6B"
     config = AutoConfig.from_pretrained(model_id)
@@ -115,10 +114,12 @@ def _greedy_decode_ggml(pte_model, tokenizer, prompt, max_new_tokens=10):
     # Decode
     for i in range(max_new_tokens - 1):
         pos = seq_len + i
-        out = pte_model.forward((
-            torch.tensor([[next_tok]], dtype=torch.long),
-            torch.tensor([pos], dtype=torch.long),
-        ))
+        out = pte_model.forward(
+            (
+                torch.tensor([[next_tok]], dtype=torch.long),
+                torch.tensor([pos], dtype=torch.long),
+            )
+        )
         next_tok = out[0][:, -1, :].argmax(dim=-1).item()
         tokens.append(next_tok)
 
@@ -130,8 +131,8 @@ class TestQwen3E2E:
 
     def test_greedy_decode_produces_coherent_text(self):
         """Export Qwen3-0.6B, run 10-token greedy decode, verify output is sane."""
-        from transformers import AutoTokenizer
         from executorch.extension.pybindings.portable_lib import _load_for_executorch
+        from transformers import AutoTokenizer
 
         max_seq_len = 128
         max_new_tokens = 10
@@ -142,10 +143,11 @@ class TestQwen3E2E:
 
         tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
-        # Save .pte and load via ExecuTorch runtime
-        with tempfile.NamedTemporaryFile(suffix=".pte", delete=False) as f:
+        # Save .pte locally so it can be reused / inspected
+        pte_path = os.path.join(os.path.dirname(__file__), "qwen3_e2e.pte")
+        with open(pte_path, "wb") as f:
             f.write(edge_mgr.to_executorch().buffer)
-            pte_path = f.name
+        print(f"Saved .pte to {pte_path}")
 
         try:
             pte_model = _load_for_executorch(pte_path)
@@ -169,9 +171,9 @@ class TestQwen3E2E:
 
             # --- Assertions ---
             # 1. Output must be finite and non-empty
-            assert len(ggml_tokens) == len(eager_tokens), (
-                f"Token count mismatch: eager={len(eager_tokens)} ggml={len(ggml_tokens)}"
-            )
+            assert len(ggml_tokens) == len(
+                eager_tokens
+            ), f"Token count mismatch: eager={len(eager_tokens)} ggml={len(ggml_tokens)}"
 
             # 2. Prefill token (first generated) must match
             input_len = len(tokenizer.encode(prompt))
@@ -188,9 +190,9 @@ class TestQwen3E2E:
             assert len(ggml_generated.strip()) > 0, "GGML generated empty text"
             # Should contain at least some alphabetic characters
             alpha_chars = sum(1 for c in ggml_generated if c.isalpha())
-            assert alpha_chars > 3, (
-                f"GGML output lacks alphabetic content: {ggml_generated!r}"
-            )
+            assert (
+                alpha_chars > 3
+            ), f"GGML output lacks alphabetic content: {ggml_generated!r}"
 
             # 4. Log token-by-token comparison
             print("\nToken-by-token comparison:")
@@ -213,4 +215,4 @@ class TestQwen3E2E:
             print(f"\nToken match: {n_match}/{n_total}")
 
         finally:
-            os.unlink(pte_path)
+            pass

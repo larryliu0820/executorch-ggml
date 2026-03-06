@@ -1,2 +1,2 @@
 --extra-index-url https://download.pytorch.org/whl/nightly/cpu/
-executorch==1.2.0.dev20260218
+executorch==1.2.0.dev20260305
