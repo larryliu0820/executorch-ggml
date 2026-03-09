@@ -655,6 +655,7 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.float32
                     )
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -664,6 +665,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_LINEAR,
                             src_ids=src_ids,
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -940,6 +943,7 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.float32
                     )
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -949,6 +953,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_UNSQUEEZE,
                             src_ids=[src_id],
                             op_params=pack_unsqueeze_params(dim, src_ndim),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -1050,6 +1056,7 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.float32
                     )
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
                     # Normalize negative dim and compute ggml axis directly.
                     # ggml axis = (rank - 1) - dim, where rank is the full PyTorch rank.
                     ndim = len(shape)
@@ -1065,6 +1072,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_CAT,
                             src_ids=src_ids,
                             op_params=pack_cat_params(ggml_axis),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -1085,6 +1094,7 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.float32
                     )
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -1094,6 +1104,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_REPEAT_INTERLEAVE,
                             src_ids=[src_id],
                             op_params=pack_repeat_interleave_params(dim, repeats),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -1323,6 +1335,7 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.float32
                     )
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -1332,6 +1345,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_LLAMA_ATTENTION,
                             src_ids=src_ids,
                             op_params=b"",  # TODO: pack model params (n_head, head_dim, start_pos binding)
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -1347,6 +1362,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1356,6 +1372,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_MUL_MAT,
                             src_ids=[weight_id, input_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -1374,6 +1392,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     # First: MUL_MAT
                     mm_id = alloc_id()
@@ -1384,6 +1403,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_MUL_MAT,
                             src_ids=[weight_id, input_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
 
@@ -1396,6 +1417,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_ADD,
                             src_ids=[mm_id, bias_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = add_id
@@ -1435,6 +1458,7 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.float32
                     )
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1445,6 +1469,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_PAD,
                             src_ids=[src_id],
                             op_params=pack_pad_params(pad_list, fill_value),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -1530,6 +1556,7 @@ class GgmlBackend(BackendDetails):
                         op_params = pack_conv2d_params(stride, padding, dilation, groups)
                         op_code = OP_CONV_2D_DW if is_depthwise else OP_CONV_2D
 
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -1539,6 +1566,8 @@ class GgmlBackend(BackendDetails):
                             op=op_code,
                             src_ids=src_ids,
                             op_params=op_params,
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -1680,6 +1709,7 @@ class GgmlBackend(BackendDetails):
                         else torch.float32
                     )
                     dst_ne = _pytorch_shape_to_ggml_ne(out_shape)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     # Create a shape-only "like" tensor for ggml_repeat.
                     like_id = alloc_id()
@@ -1690,6 +1720,8 @@ class GgmlBackend(BackendDetails):
                             ne=dst_ne,
                             op=OP_NONE,
                             is_input=False,
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
 
@@ -1701,6 +1733,8 @@ class GgmlBackend(BackendDetails):
                             ne=dst_ne,
                             op=OP_REPEAT,
                             src_ids=[src_id, like_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2052,6 +2086,7 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.float32
                     )
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2061,6 +2096,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_BMM,
                             src_ids=[a_id, b_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2131,6 +2168,7 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.float32
                     )
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2140,6 +2178,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_WHERE,
                             src_ids=[cond_id, x_id, y_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2157,33 +2197,49 @@ class GgmlBackend(BackendDetails):
                         else torch.float32
                     )
 
-                    # Create a scalar constant and use MUL_SCALAR with a tensor of ones
-                    # Actually, simpler: create a VIEW of a scalar tensor.
-                    # For now, store the fill value as a named constant.
-                    import hashlib
-                    import numpy as np
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
+                    has_dynamic = _vsym is not None and any(s != -1 for s in _vsym)
 
-                    # Create numpy array with fill value
-                    numel = 1
-                    for d in shape:
-                        numel *= d
-                    const_data = np.full(numel, fill_value, dtype=np.float32)
-                    const_key = f"_full_like_{hashlib.sha256(const_data.tobytes()).hexdigest()[:16]}"
-
-                    data_store.add_named_data(
-                        const_key, const_data.tobytes(), alignment=64
-                    )
-
-                    tid = alloc_id()
-                    ir_tensors.append(
-                        IrTensor(
-                            tensor_id=tid,
-                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
-                            ne=_pytorch_shape_to_ggml_ne(shape),
-                            op=OP_NONE,  # Constant
-                            data_key=const_key,
+                    if has_dynamic:
+                        # Dynamic shape — emit OP_FULL so C++ fills at runtime
+                        tid = alloc_id()
+                        ir_tensors.append(
+                            IrTensor(
+                                tensor_id=tid,
+                                tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                                ne=_pytorch_shape_to_ggml_ne(shape),
+                                op=OP_FULL,
+                                src_ids=[],
+                                op_params=pack_full_params(fill_value),
+                                sym_dim_ids=_vsym,
+                                sym_dim_exprs=_vexprs,
+                            )
                         )
-                    )
+                    else:
+                        # Static shape — keep existing constant path (OP_NONE + baked data)
+                        import hashlib
+                        import numpy as np
+
+                        numel = 1
+                        for d in shape:
+                            numel *= d
+                        const_data = np.full(numel, fill_value, dtype=np.float32)
+                        const_key = f"_full_like_{hashlib.sha256(const_data.tobytes()).hexdigest()[:16]}"
+
+                        data_store.add_named_data(
+                            const_key, const_data.tobytes(), alignment=64
+                        )
+
+                        tid = alloc_id()
+                        ir_tensors.append(
+                            IrTensor(
+                                tensor_id=tid,
+                                tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                                ne=_pytorch_shape_to_ggml_ne(shape),
+                                op=OP_NONE,  # Constant
+                                data_key=const_key,
+                            )
+                        )
                     node_to_id[node] = tid
 
                 elif "dim_order_ops._to_dim_order_copy.default" in target_str:
@@ -2265,6 +2321,7 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.float32
                     )
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2274,6 +2331,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_MUL_MAT,  # Use MUL_MAT for matmul
                             src_ids=[a_id, b_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2349,6 +2408,7 @@ class GgmlBackend(BackendDetails):
                         else torch.int64
                     )
                     ndim = len(shape)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2359,6 +2419,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_CUMSUM,
                             src_ids=[src_id],
                             op_params=pack_cumsum_params(dim, ndim),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2371,6 +2433,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2381,6 +2444,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_EQ,
                             src_ids=[src_id],
                             op_params=pack_comparison_params(scalar, is_scalar=True),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2393,6 +2458,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2403,6 +2469,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_EQ,
                             src_ids=[a_id, b_id],
                             op_params=pack_comparison_params(0.0, is_scalar=False),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2415,6 +2483,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2425,6 +2494,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_NE,
                             src_ids=[src_id],
                             op_params=pack_comparison_params(scalar, is_scalar=True),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2437,6 +2508,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2446,6 +2518,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_LE,
                             src_ids=[a_id, b_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2458,6 +2532,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2467,6 +2542,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_LT,
                             src_ids=[a_id, b_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2479,6 +2556,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2488,6 +2566,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_GT,
                             src_ids=[a_id, b_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2500,6 +2580,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2509,6 +2590,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_GE,
                             src_ids=[a_id, b_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2526,6 +2609,7 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.bool
                     )
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2535,6 +2619,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_BITWISE_AND,
                             src_ids=[a_id, b_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2547,6 +2633,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2556,6 +2643,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_BITWISE_AND,
                             src_ids=[a_id, b_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2573,6 +2662,7 @@ class GgmlBackend(BackendDetails):
                         if fake_val is not None
                         else torch.bool
                     )
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2582,6 +2672,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_BITWISE_OR,
                             src_ids=[a_id, b_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2593,6 +2685,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2602,6 +2695,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_LOGICAL_NOT,
                             src_ids=[src_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2613,6 +2708,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -2622,6 +2718,8 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_LOGICAL_NOT,
                             src_ids=[src_id],
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2634,6 +2732,7 @@ class GgmlBackend(BackendDetails):
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     src_val = (
                         src_node.meta.get("val") if hasattr(src_node, "meta") else None
@@ -2650,6 +2749,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_ANY,
                             src_ids=[src_id],
                             op_params=pack_any_params(dim, ndim),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2755,10 +2856,12 @@ class GgmlBackend(BackendDetails):
                             chunk_shape = _resolve_shape(chunk_fv)
                             chunk_dtype = getattr(chunk_fv, "dtype", torch.float32)
                         else:
+                            chunk_fv = None
                             chunk_shape = list(src_shape)
                             chunk_shape[dim] = sz
                             chunk_dtype = torch.float32
 
+                        _vsym, _vexprs = _sym_dim_info_ggml(chunk_fv, sym_id_map)
                         chunk_tid = alloc_id()
                         ir_tensors.append(
                             IrTensor(
@@ -2770,6 +2873,8 @@ class GgmlBackend(BackendDetails):
                                 op_params=pack_slice_params(
                                     dim, start_i, end_i, 1, ndim
                                 ),
+                                sym_dim_ids=_vsym,
+                                sym_dim_exprs=_vexprs,
                             )
                         )
                         chunk_ids.append(chunk_tid)

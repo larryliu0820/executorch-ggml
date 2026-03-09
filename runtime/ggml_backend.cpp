@@ -800,16 +800,11 @@ static Error build_graph(
 
   // === Phase A: calculate ctx size, create ggml context ===
   // Calculate memory needed for ggml context.
-  // Sum up actual constant tensor sizes from the IR so we allocate exactly
-  // what is needed, plus a fixed overhead for graph bookkeeping.
-  size_t constant_data_size = 0;
+  // Sum up ALL tensor sizes from the IR (constants + intermediate results)
+  // so we allocate enough for the full computation graph.
+  size_t total_tensor_data_size = 0;
   for (int i = 0; i < n_tensors; ++i) {
     const auto* t = fb_tensors->Get(i);
-    // Only leaf tensors with data_key hold constant data in the ggml context.
-    if (static_cast<ggml_ir::OpCode>(t->op()) != ggml_ir::OpCode::NONE) continue;
-    if (!t->data_key() || std::strlen(t->data_key()->c_str()) == 0) continue;
-
-    // Compute byte size: product of ne[] dims × element size for the type.
     size_t n_elems = 1;
     if (t->ne()) {
       for (size_t d = 0; d < t->ne()->size(); ++d) {
@@ -825,7 +820,7 @@ static Error build_graph(
       case ggml_ir::TensorType::BOOL: elem_size = 4; break; // stored as I32
       default:                        elem_size = 4; break;
     }
-    constant_data_size += n_elems * elem_size;
+    total_tensor_data_size += n_elems * elem_size;
   }
 
   // Estimate graph size: 4× the IR tensors to account for compound ops.
@@ -834,11 +829,12 @@ static Error build_graph(
     est_graph_size = GGML_DEFAULT_GRAPH_SIZE;
   }
 
+  // Use 3× total tensor data to account for intermediate ggml tensors
+  // created by compound ops (e.g. ggml_mul internally creates temporaries).
   size_t ctx_size =
-      static_cast<size_t>(n_tensors) * ggml_tensor_overhead() +
-      constant_data_size +
-      ggml_graph_overhead_custom(est_graph_size, false) +
-      4ull * 1024 * 1024 * 1024;  // 4GB headroom for intermediate op tensors and graph nodes
+      static_cast<size_t>(n_tensors) * 4 * ggml_tensor_overhead() +
+      total_tensor_data_size * 3 +
+      ggml_graph_overhead_custom(est_graph_size, false);
 
   struct ggml_init_params params = {
       /* .mem_size   = */ ctx_size,
@@ -1743,6 +1739,22 @@ static Error build_graph(
           if (end > actual_dim) end = actual_dim;
           ne[ax] = end - start;
 
+          // When sym_dim_ids resolved a different value for the sliced axis,
+          // prefer it — the baked end from op_params may be a trace-time constant
+          // that doesn't match the runtime source shape.
+          if (t->sym_dim_ids() && ax < (int)t->sym_dim_ids()->size()) {
+            int32_t sid_ax = t->sym_dim_ids()->Get(ax);
+            if ((sid_ax == -2 || sid_ax >= 0) && resolved_slice_ne > 0 &&
+                resolved_slice_ne != ne[ax]) {
+              ne[ax] = resolved_slice_ne;
+              end = start + resolved_slice_ne;
+              if (end > actual_dim) {
+                end = actual_dim;
+                ne[ax] = end - start;
+              }
+            }
+          }
+
           size_t offset = static_cast<size_t>(start) * a->nb[ax];
           gt = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3],
                             a->nb[1], a->nb[2], a->nb[3], offset);
@@ -2357,7 +2369,6 @@ static Error build_graph(
           }
 
           // sym_dim_ids resolution already applied to ne[] above.
-
           gt = ggml_new_tensor_4d(ctx, out_type, ne[0], ne[1], ne[2], ne[3]);
           const size_t nelem = ggml_nelements(gt);
 
@@ -2874,6 +2885,7 @@ static Error build_graph(
       }
 
       id_to_tensor[tid] = gt;
+
     }
 
     if (t->is_output()) {
