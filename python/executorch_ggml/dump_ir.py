@@ -27,6 +27,7 @@ _OPCODE_NAMES = {
     OpCode.POW: "POW", OpCode.COS: "COS", OpCode.SIN: "SIN",
     OpCode.BMM: "BMM", OpCode.SIGMOID: "SIGMOID", OpCode.SOFTMAX: "SOFTMAX",
     OpCode.LINEAR: "LINEAR", OpCode.EMBEDDING: "EMBEDDING", OpCode.SILU: "SILU",
+    OpCode.RELU: "RELU", OpCode.TANH: "TANH",
     OpCode.LEAKY_RELU: "LEAKY_RELU", OpCode.CONV_2D: "CONV_2D",
     OpCode.CONV_2D_DW: "CONV_2D_DW", OpCode.HARDTANH: "HARDTANH",
     OpCode.MEAN: "MEAN", OpCode.RSQRT: "RSQRT", OpCode.VIEW: "VIEW",
@@ -40,6 +41,10 @@ _OPCODE_NAMES = {
     OpCode.EQ: "EQ", OpCode.NE: "NE", OpCode.LE: "LE", OpCode.LT: "LT",
     OpCode.GT: "GT", OpCode.GE: "GE",
     OpCode.LLAMA_ATTENTION: "LLAMA_ATTENTION",
+    OpCode.LAYER_NORM: "LAYER_NORM", OpCode.BATCH_NORM: "BATCH_NORM",
+    OpCode.ARGMAX: "ARGMAX", OpCode.DIV: "DIV",
+    OpCode.CONV_1D: "CONV_1D", OpCode.CONV_1D_DW: "CONV_1D_DW",
+    OpCode.PAD: "PAD",
     OpCode.BITWISE_AND: "BITWISE_AND", OpCode.BITWISE_OR: "BITWISE_OR",
     OpCode.LOGICAL_NOT: "LOGICAL_NOT", OpCode.ANY: "ANY",
     OpCode.UPDATE_CACHE: "UPDATE_CACHE",
@@ -49,6 +54,60 @@ _TYPE_NAMES = {
     TensorType.F32: "f32", TensorType.F16: "f16", TensorType.I64: "i64",
     TensorType.I32: "i32", TensorType.BOOL: "bool", TensorType.BF16: "bf16",
 }
+
+
+def _disassemble_bytecode(code: bytes) -> str:
+    """Disassemble postfix bytecode into a human-readable infix expression."""
+    stack = []
+    i = 0
+    while i < len(code):
+        op = code[i]
+        i += 1
+        if op == 0x01:  # PUSH_SYM
+            sid = code[i]
+            i += 1
+            stack.append(f"s{sid}")
+        elif op == 0x02:  # PUSH_CONST
+            val = struct.unpack_from("<i", code, i)[0]
+            i += 4
+            stack.append(str(val))
+        elif op == 0x10:  # ADD
+            b, a = stack.pop(), stack.pop()
+            stack.append(f"({a}+{b})")
+        elif op == 0x11:  # SUB
+            b, a = stack.pop(), stack.pop()
+            stack.append(f"({a}-{b})")
+        elif op == 0x12:  # MUL
+            b, a = stack.pop(), stack.pop()
+            stack.append(f"({a}*{b})")
+        elif op == 0x13:  # FLOORDIV
+            b, a = stack.pop(), stack.pop()
+            stack.append(f"({a}//{b})")
+        elif op == 0x14:  # MOD
+            b, a = stack.pop(), stack.pop()
+            stack.append(f"({a}%{b})")
+        elif op == 0x15:  # NEG
+            a = stack.pop()
+            stack.append(f"(-{a})")
+        else:
+            stack.append(f"?0x{op:02x}")
+    return stack[0] if len(stack) == 1 else "??"
+
+
+def _decode_sym_dim_exprs(exprs_data: bytes, dim: int) -> str:
+    """Decode the packed sym_dim_exprs for a given dimension."""
+    offset = 0
+    for d in range(4):
+        if offset + 2 > len(exprs_data):
+            return ""
+        length = struct.unpack_from("<H", exprs_data, offset)[0]
+        offset += 2
+        if d == dim:
+            if length == 0:
+                return ""
+            return _disassemble_bytecode(exprs_data[offset:offset + length])
+        offset += length
+    return ""
 
 
 def _decode_op_params(op: int, raw: bytes) -> str:
@@ -113,6 +172,16 @@ def _decode_op_params(op: int, raw: bytes) -> str:
         elif op == OpCode.POW:
             exp = struct.unpack_from("<f", raw, 0)[0]
             return f"exp={exp}"
+        elif op == OpCode.PAD:
+            ndim_pairs = struct.unpack_from("<i", raw, 0)[0]
+            pairs = []
+            off = 4
+            for i in range(ndim_pairs):
+                l, r = struct.unpack_from("<ii", raw, off)
+                pairs.append(f"({l},{r})")
+                off += 8
+            val = struct.unpack_from("<f", raw, off)[0]
+            return f"pad=[{','.join(pairs)}] val={val}"
     except struct.error:
         pass
     return f"raw[{len(raw)}]"
@@ -240,11 +309,20 @@ def dump_graph(blob: bytes):
                 short_key = key.split(".")[-1] if "." in key else key
                 flags.append(f"CONST({short_key})")
 
-        # Symbolic dim IDs
+        # Symbolic dim IDs + expressions
         sids = [t.SymDimIds(d) for d in range(t.SymDimIdsLength())] if t.SymDimIdsLength() > 0 else []
-        if any(sid >= 0 for sid in sids):
-            sym_str = ",".join(f"s{sid}" if sid >= 0 else "." for sid in sids)
-            flags.append(f"sym=[{sym_str}]")
+        exprs_data = bytes(t.SymDimExprsAsNumpy()) if t.SymDimExprsLength() > 0 else b""
+        if any(sid >= 0 or sid == -2 for sid in sids):
+            parts = []
+            for d, sid in enumerate(sids):
+                if sid == -2 and exprs_data:
+                    expr_str = _decode_sym_dim_exprs(exprs_data, d)
+                    parts.append(f"expr({expr_str})" if expr_str else ".")
+                elif sid >= 0:
+                    parts.append(f"s{sid}")
+                else:
+                    parts.append(".")
+            flags.append(f"sym=[{','.join(parts)}]")
 
         # Op params
         op_params_raw = bytes(t.OpParamsAsNumpy()) if t.OpParamsLength() > 0 else b""

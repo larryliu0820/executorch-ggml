@@ -42,6 +42,8 @@ OP_LEAKY_RELU = 3
 OP_LINEAR = 20
 OP_EMBEDDING = 21
 OP_SILU = 22
+OP_RELU = 23
+OP_TANH = 24
 
 # Vision
 OP_CONV_2D = 4
@@ -84,6 +86,17 @@ OP_BITWISE_OR = 71
 OP_LOGICAL_NOT = 72
 OP_ANY = 73
 
+# Parakeet / ASR ops
+OP_LAYER_NORM = 25
+OP_BATCH_NORM = 26
+OP_ARGMAX = 27
+OP_DIV = 28
+
+# Conv1d
+OP_CONV_1D = 80
+OP_CONV_1D_DW = 81
+OP_PAD = 82
+
 # KV cache ops
 OP_UPDATE_CACHE = 74
 
@@ -118,6 +131,7 @@ class IrTensor:
         "is_output",
         "input_index",
         "sym_dim_ids",
+        "sym_dim_exprs",
     )
 
     def __init__(
@@ -133,6 +147,7 @@ class IrTensor:
         is_output: bool = False,
         input_index: int = -1,
         sym_dim_ids: Optional[List[int]] = None,
+        sym_dim_exprs: Optional[bytes] = None,
     ):
         self.id = tensor_id
         self.tensor_type = tensor_type
@@ -145,6 +160,7 @@ class IrTensor:
         self.is_output = is_output
         self.input_index = input_index
         self.sym_dim_ids = sym_dim_ids or []
+        self.sym_dim_exprs = sym_dim_exprs or b""
 
 
 # ---------------------------------------------------------------------------
@@ -192,14 +208,19 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
         else:
             data_key_off = None
 
-        if t.sym_dim_ids and any(sid >= 0 for sid in t.sym_dim_ids):
+        if t.sym_dim_ids and any(sid != -1 for sid in t.sym_dim_ids):
             sym_vec = _create_int32_vector(builder, t.sym_dim_ids)
         else:
             sym_vec = None
 
+        if t.sym_dim_exprs:
+            sym_exprs_vec = _create_uint8_vector(builder, t.sym_dim_exprs)
+        else:
+            sym_exprs_vec = None
+
         # Build the Tensor table
-        # Start table with the right number of fields (11 fields)
-        builder.StartObject(11)
+        # Start table with the right number of fields (12 fields)
+        builder.StartObject(12)
 
         builder.PrependInt32Slot(0, t.id, 0)           # id
         builder.PrependInt32Slot(1, t.tensor_type, 0)  # type
@@ -217,6 +238,8 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
         builder.PrependInt32Slot(9, t.input_index, -1)   # input_index
         if sym_vec is not None:
             builder.PrependUOffsetTRelativeSlot(10, sym_vec, 0)  # sym_dim_ids
+        if sym_exprs_vec is not None:
+            builder.PrependUOffsetTRelativeSlot(11, sym_exprs_vec, 0)  # sym_dim_exprs
 
         tensor_offsets.append(builder.EndObject())
 
@@ -456,6 +479,51 @@ def pack_comparison_params(scalar: float = 0.0, is_scalar: bool = False) -> byte
 def pack_any_params(dim: int, ndim: int) -> bytes:
     """Pack any.dim parameters: dim (int32), ndim (int32)."""
     return struct.pack("<ii", int(dim), int(ndim))
+
+
+def pack_layer_norm_params(eps: float, has_weight: bool, has_bias: bool) -> bytes:
+    """Pack layer_norm parameters: eps (float32), has_weight (int32), has_bias (int32)."""
+    return struct.pack("<fii", float(eps), int(has_weight), int(has_bias))
+
+
+def pack_batch_norm_params(eps: float) -> bytes:
+    """Pack batch_norm parameters: eps (float32)."""
+    return struct.pack("<f", float(eps))
+
+
+def pack_argmax_params(dim: int, ndim: int) -> bytes:
+    """Pack argmax parameters: dim (int32), ndim (int32)."""
+    return struct.pack("<ii", int(dim), int(ndim))
+
+
+def pack_conv1d_params(
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+) -> bytes:
+    """Pack conv1d parameters into little-endian bytes.
+
+    Layout: stride, pad, dilation, groups — each int32.
+    """
+    return struct.pack("<iiii", int(stride), int(padding), int(dilation), int(groups))
+
+
+def pack_pad_params(pads: List[int], value: float = 0.0) -> bytes:
+    """Pack constant_pad_nd parameters into little-endian bytes.
+
+    PyTorch pad list is innermost-first: [left_N, right_N, ..., left_0, right_0].
+    Layout: int32 ndim_pairs, then ndim_pairs × (int32 left, int32 right), float32 value.
+    Pairs are stored innermost-first (matching PyTorch order).
+    """
+    ndim_pairs = len(pads) // 2
+    parts = [struct.pack("<i", ndim_pairs)]
+    for i in range(ndim_pairs):
+        left = int(pads[2 * i])
+        right = int(pads[2 * i + 1])
+        parts.append(struct.pack("<ii", left, right))
+    parts.append(struct.pack("<f", float(value)))
+    return b"".join(parts)
 
 
 def pack_update_cache_params(seq_dim: int = 1) -> bytes:

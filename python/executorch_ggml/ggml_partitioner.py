@@ -96,6 +96,22 @@ _SUPPORTED_OP_NAMES = {
     "aten.mm.default",
     "aten.addmm.default",
     "aten.leaky_relu.default",
+    # Parakeet encoder ops
+    "aten.constant_pad_nd.default",
+    "aten.div.Tensor",
+    "aten.div.Tensor_mode",
+    "aten.repeat.default",
+    "aten.logical_and.default",
+    "aten.bitwise_not.default",
+    # Parakeet / ASR ops
+    "aten.relu.default",
+    "aten.tanh.default",
+    "aten.native_layer_norm.default",
+    "aten._native_batch_norm_legit_no_training.default",
+    "aten.argmax.default",
+    "aten.split_with_sizes_copy.default",
+    "aten.squeeze_copy.dims",
+    "aten.squeeze.dims",
     # MobileNetV2 ops
     "aten.convolution.default",
     "aten.conv2d.default",
@@ -110,6 +126,8 @@ _SUPPORTED_OP_NAMES = {
 
 def _is_supported_target(target) -> bool:
     s = str(target)
+    if "<built-in function getitem>" in s:
+        return True
     return any(name in s for name in _SUPPORTED_OP_NAMES)
 
 
@@ -201,6 +219,10 @@ def _is_supported_node(node) -> bool:
             "aten.cumsum",
             "aten.sub",  # int64 subtraction for position calc
             "aten.add",  # int64 addition for position calc
+            "aten.argmax",  # argmax produces int64
+            # dtype cast / clone (identity-like for int64 tensors)
+            "aten._to_copy",
+            "aten.clone",
         }
         if not any(op in target_str for op in int64_safe_ops):
             return False

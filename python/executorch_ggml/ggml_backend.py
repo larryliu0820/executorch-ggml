@@ -28,9 +28,13 @@ from executorch_ggml.serialize import (
     OP_LINEAR,
     OP_EMBEDDING,
     OP_SILU,
+    OP_RELU,
+    OP_TANH,
     OP_LEAKY_RELU,
     OP_CONV_2D,
     OP_CONV_2D_DW,
+    OP_CONV_1D,
+    OP_CONV_1D_DW,
     OP_HARDTANH,
     OP_MEAN,
     OP_RSQRT,
@@ -62,6 +66,11 @@ from executorch_ggml.serialize import (
     OP_LOGICAL_NOT,
     OP_ANY,
     OP_UPDATE_CACHE,
+    OP_LAYER_NORM,
+    OP_BATCH_NORM,
+    OP_ARGMAX,
+    OP_DIV,
+    OP_PAD,
     # Types
     TYPE_F32,
     TYPE_F16,
@@ -95,6 +104,11 @@ from executorch_ggml.serialize import (
     pack_comparison_params,
     pack_any_params,
     pack_update_cache_params,
+    pack_layer_norm_params,
+    pack_batch_norm_params,
+    pack_argmax_params,
+    pack_conv1d_params,
+    pack_pad_params,
     serialize_graph,
 )
 
@@ -107,6 +121,13 @@ def _concrete_int(s) -> int:
     ``shape_env.var_to_range`` during ``preprocess``."""
     if isinstance(s, int):
         return s
+    # FX Node — resolve from FakeTensor metadata (scalar_tensor output).
+    if isinstance(s, torch.fx.Node):
+        fv = s.meta.get("val")
+        if fv is not None and hasattr(fv, "item"):
+            return int(fv.item())
+        # Fall back to a large sentinel for "end" values
+        return 2**62
     # torch.SymInt — read the hint (concrete value used during tracing)
     # without creating a guard that narrows var_to_range.
     return s.node.hint
@@ -119,40 +140,226 @@ def _resolve_shape(fake_val) -> List[int]:
     return [_concrete_int(s) for s in fake_val.shape]
 
 
-def _get_sym_dim_id(s, sym_id_map: dict) -> int:
-    """Return symbolic dim ID for a SymInt, or -1 for static."""
+# ---------------------------------------------------------------------------
+# Symbolic expression bytecode compiler
+# ---------------------------------------------------------------------------
+#
+# Opcodes for postfix bytecode encoding of sympy expressions.
+# Used to serialize derived dynamic shape expressions (e.g. ((s0-1)//8)+1)
+# from strided convolutions into the FlatBuffer IR.
+#
+# The C++ runtime evaluates these with a simple stack machine.
+
+SYM_OP_PUSH_SYM  = 0x01  # 1-byte operand: sym_id
+SYM_OP_PUSH_CONST = 0x02  # 4-byte operand: int32 LE
+SYM_OP_ADD       = 0x10
+SYM_OP_SUB       = 0x11
+SYM_OP_MUL       = 0x12
+SYM_OP_FLOORDIV  = 0x13
+SYM_OP_MOD       = 0x14
+SYM_OP_NEG       = 0x15
+
+import struct as _struct
+
+
+def _sympy_to_bytecode(expr, sym_id_map: dict) -> bytes:
+    """Compile a sympy expression to postfix bytecode.
+
+    Handles: Symbol, Integer, One, NegativeOne, Add, Mul,
+    FloorDiv (torch.utils._sympy.functions.FloorDiv), Mod.
+    """
+    import sympy
+
+    # Try to import torch's FloorDiv
+    try:
+        from torch.utils._sympy.functions import FloorDiv
+    except ImportError:
+        FloorDiv = None
+
+    buf = bytearray()
+
+    def _emit(node):
+        if isinstance(node, sympy.Symbol):
+            name = str(node)
+            if name not in sym_id_map:
+                sym_id_map[name] = len(sym_id_map)
+            buf.append(SYM_OP_PUSH_SYM)
+            buf.append(sym_id_map[name] & 0xFF)
+            return
+
+        if isinstance(node, sympy.Integer):
+            val = int(node)
+            buf.append(SYM_OP_PUSH_CONST)
+            buf.extend(_struct.pack("<i", val))
+            return
+
+        # Add: sum of args
+        if isinstance(node, sympy.Add):
+            args = list(node.args)
+            _emit(args[0])
+            for a in args[1:]:
+                _emit(a)
+                buf.append(SYM_OP_ADD)
+            return
+
+        # Mul: product of args
+        if isinstance(node, sympy.Mul):
+            args = list(node.args)
+            # Handle Mul(-1, x) as NEG(x)
+            if len(args) == 2 and args[0] == sympy.S.NegativeOne:
+                _emit(args[1])
+                buf.append(SYM_OP_NEG)
+                return
+            _emit(args[0])
+            for a in args[1:]:
+                _emit(a)
+                buf.append(SYM_OP_MUL)
+            return
+
+        # FloorDiv (torch-specific or sympy)
+        if FloorDiv is not None and isinstance(node, FloorDiv):
+            _emit(node.args[0])
+            _emit(node.args[1])
+            buf.append(SYM_OP_FLOORDIV)
+            return
+
+        # sympy.floor(a/b) pattern
+        if isinstance(node, sympy.floor):
+            inner = node.args[0]
+            if isinstance(inner, sympy.Mul) and len(inner.args) == 2:
+                a, b = inner.args
+                if isinstance(b, sympy.Pow) and b.args[1] == -1:
+                    _emit(a)
+                    _emit(b.args[0])
+                    buf.append(SYM_OP_FLOORDIV)
+                    return
+            # Fallback: emit floor arg, floordiv by 1 (identity)
+            _emit(inner)
+            return
+
+        # Mod
+        if isinstance(node, sympy.Mod):
+            _emit(node.args[0])
+            _emit(node.args[1])
+            buf.append(SYM_OP_MOD)
+            return
+
+        raise ValueError(f"Unsupported sympy node type: {type(node).__name__} ({node})")
+
+    _emit(expr)
+    return bytes(buf)
+
+
+def _eval_bytecode(code: bytes, sym_values: dict) -> int:
+    """Evaluate postfix bytecode with given symbol values. Python-side mirror
+    of the C++ eval_sym_expr() for testing."""
+    stack = []
+    i = 0
+    while i < len(code):
+        op = code[i]
+        i += 1
+        if op == SYM_OP_PUSH_SYM:
+            sid = code[i]
+            i += 1
+            stack.append(sym_values[sid])
+        elif op == SYM_OP_PUSH_CONST:
+            val = _struct.unpack_from("<i", code, i)[0]
+            i += 4
+            stack.append(val)
+        elif op == SYM_OP_ADD:
+            b, a = stack.pop(), stack.pop()
+            stack.append(a + b)
+        elif op == SYM_OP_SUB:
+            b, a = stack.pop(), stack.pop()
+            stack.append(a - b)
+        elif op == SYM_OP_MUL:
+            b, a = stack.pop(), stack.pop()
+            stack.append(a * b)
+        elif op == SYM_OP_FLOORDIV:
+            b, a = stack.pop(), stack.pop()
+            # Python-style floor division (rounds toward -inf)
+            stack.append(a // b)
+        elif op == SYM_OP_MOD:
+            b, a = stack.pop(), stack.pop()
+            stack.append(a % b)
+        elif op == SYM_OP_NEG:
+            stack.append(-stack.pop())
+        else:
+            raise ValueError(f"Unknown bytecode op: 0x{op:02x}")
+    assert len(stack) == 1, f"Stack not empty after eval: {stack}"
+    return stack[0]
+
+
+def _get_sym_dim_info(s, sym_id_map: dict):
+    """Return (sym_dim_id, bytecode_or_None) for a single SymInt dimension.
+
+    Returns:
+      (-1, None)        — static dimension
+      (id, None)        — simple symbol (direct lookup)
+      (-2, bytecode)    — derived expression (evaluate bytecode)
+    """
     if not isinstance(s, torch.SymInt):
-        return -1
+        return (-1, None)
     import sympy
     expr = s.node.expr
     if isinstance(expr, sympy.Symbol):
         name = str(expr)
         if name not in sym_id_map:
             sym_id_map[name] = len(sym_id_map)
-        return sym_id_map[name]
-    raise ValueError(
-        f"Unsupported symbolic expression in tensor shape: {expr}. "
-        f"Only simple symbolic variables (e.g. s0) are supported, "
-        f"not derived expressions (e.g. s0 + 1)."
-    )
+        return (sym_id_map[name], None)
+    # Derived expression — compile to bytecode
+    free = expr.free_symbols
+    if len(free) >= 1:
+        # Ensure all free symbols are registered
+        for sym in free:
+            name = str(sym)
+            if name not in sym_id_map:
+                sym_id_map[name] = len(sym_id_map)
+        bytecode = _sympy_to_bytecode(expr, sym_id_map)
+        return (-2, bytecode)
+    # No free symbols — treat as static
+    return (-1, None)
 
 
-def _get_sym_dim_ids(fake_val, sym_id_map: dict) -> List[int]:
-    """Per-dim symbolic IDs in PyTorch dim order. -1 = static."""
+def _sym_dim_info_ggml(fake_val, sym_id_map: dict):
+    """Compute ggml-order sym_dim_ids and packed sym_dim_exprs.
+
+    Returns (sym_dim_ids_or_None, sym_dim_exprs_or_None).
+    """
+    from typing import Optional
     if fake_val is None or not hasattr(fake_val, "shape"):
-        return []
-    return [_get_sym_dim_id(s, sym_id_map) for s in fake_val.shape]
+        return (None, None)
 
+    # Collect per-dim info in PyTorch order
+    pt_info = [_get_sym_dim_info(s, sym_id_map) for s in fake_val.shape]
+    if not pt_info or all(sid == -1 for sid, _ in pt_info):
+        return (None, None)
 
-def _sym_dim_ids_ggml(fake_val, sym_id_map: dict) -> 'List[int] | None':
-    """Compute ggml-order sym_dim_ids, or None if all static."""
-    pt_sym = _get_sym_dim_ids(fake_val, sym_id_map)
-    if not pt_sym or all(sid == -1 for sid in pt_sym):
-        return None
-    ggml_sym = list(reversed(pt_sym))
-    while len(ggml_sym) < 4:
-        ggml_sym.append(-1)
-    return ggml_sym[:4]
+    # Reverse to ggml order, pad to 4
+    ggml_info = list(reversed(pt_info))
+    while len(ggml_info) < 4:
+        ggml_info.append((-1, None))
+    ggml_info = ggml_info[:4]
+
+    ggml_sym = [sid for sid, _ in ggml_info]
+    has_exprs = any(bc is not None for _, bc in ggml_info)
+
+    if not has_exprs:
+        # No derived expressions — just return sym_dim_ids (backwards compat)
+        if all(sid == -1 for sid in ggml_sym):
+            return (None, None)
+        return (ggml_sym, None)
+
+    # Pack sym_dim_exprs: 4 entries, each prefixed by uint16 length
+    exprs_buf = bytearray()
+    for _, bc in ggml_info:
+        if bc is not None:
+            exprs_buf.extend(_struct.pack("<H", len(bc)))
+            exprs_buf.extend(bc)
+        else:
+            exprs_buf.extend(_struct.pack("<H", 0))
+
+    return (ggml_sym, bytes(exprs_buf))
 
 
 def _pytorch_shape_to_ggml_ne(shape: List[int]) -> List[int]:
@@ -313,7 +520,7 @@ class GgmlBackend(BackendDetails):
                             t_cpu, torch.tensor(0.0), torch.tensor(neg_inf)
                         )
                         t_cpu = t_float.to(torch.float16)
-                    elif t_cpu.dtype == torch.float32 and t_cpu.ndim >= 4:
+                    elif t_cpu.dtype == torch.float32 and t_cpu.ndim >= 3:
                         t_cpu = t_cpu.to(torch.float16)
 
                     # Store inside the .pte.
@@ -344,8 +551,8 @@ class GgmlBackend(BackendDetails):
 
                     shape = _resolve_shape(fake_val)
 
-                    # Compute per-dimension symbolic variable IDs.
-                    ggml_sym = _sym_dim_ids_ggml(fake_val, sym_id_map)
+                    # Compute per-dimension symbolic variable IDs + expressions.
+                    ggml_sym, ggml_exprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     # Runtime input dtype based on FakeTensor meta when available.
@@ -370,6 +577,7 @@ class GgmlBackend(BackendDetails):
                             is_input=True,
                             input_index=runtime_input_idx,
                             sym_dim_ids=ggml_sym,
+                            sym_dim_exprs=ggml_exprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -532,6 +740,52 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
+                elif "aten.relu.default" in target_str:
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    shape = _resolve_shape(fake_val)
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_RELU,
+                            src_ids=[src_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.tanh.default" in target_str:
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    shape = _resolve_shape(fake_val)
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_TANH,
+                            src_ids=[src_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
                 elif "aten.mul.Tensor" in target_str:
                     # mul(a, b)
                     # NOTE: Broadcasting should be handled by BroadcastCanonicalizationPass
@@ -557,6 +811,34 @@ class GgmlBackend(BackendDetails):
                             tensor_type=_torch_dtype_to_ir_type(out_dtype),
                             ne=_pytorch_shape_to_ggml_ne(out_shape),
                             op=OP_MUL,
+                            src_ids=[a_id, b_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif (
+                    "aten.div.Tensor_mode" in target_str
+                    or "aten.div.Tensor" in target_str
+                ):
+                    # div(a, b) → OP_DIV
+                    a_node, b_node = node.args[0], node.args[1]
+                    a_id = node_to_id[a_node]
+                    b_id = node_to_id[b_node]
+                    fake_val = node.meta.get("val")
+                    out_shape = _resolve_shape(fake_val)
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(out_shape),
+                            op=OP_DIV,
                             src_ids=[a_id, b_id],
                         )
                     )
@@ -603,6 +885,38 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_RSQRT,
                             src_ids=[src_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif (
+                    "aten.squeeze.dims" in target_str
+                    or "aten.squeeze_copy.dims" in target_str
+                ):
+                    # squeeze(x, dims) — remove size-1 dims → equivalent to reshape/VIEW
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    shape = _resolve_shape(fake_val)
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
+
+                    ggml_ne = _pytorch_shape_to_ggml_ne(shape)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=ggml_ne,
+                            op=OP_VIEW,
+                            src_ids=[src_id],
+                            op_params=pack_view_params(ggml_ne),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -696,6 +1010,18 @@ class GgmlBackend(BackendDetails):
                     )
                     src_shape = _resolve_shape(src_val)
                     ndim = len(src_shape) if src_shape else len(shape)
+
+                    # If start or end hit the 2**62 sentinel (unresolvable SymInt),
+                    # derive concrete trace-time values from the output shape.
+                    if start_i == 2**62:
+                        start_i = 0
+                    if end_i == 2**62 and shape:
+                        # output_shape[dim] == (end - start) / step
+                        d = dim if dim >= 0 else ndim + dim
+                        if d < len(shape):
+                            end_i = start_i + shape[d] * step
+
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -707,13 +1033,15 @@ class GgmlBackend(BackendDetails):
                             op_params=pack_slice_params(
                                 dim, start_i, end_i, step, ndim
                             ),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
 
                 elif "aten.cat.default" in target_str:
                     tensors = list(node.args[0])
-                    dim = int(node.args[1])
+                    dim = int(node.args[1]) if len(node.args) > 1 else 0
                     src_ids = [node_to_id[t] for t in tensors]
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
@@ -914,6 +1242,7 @@ class GgmlBackend(BackendDetails):
 
                     # Squeeze the dim via VIEW to out_shape
                     ggml_ne = _pytorch_shape_to_ggml_ne(out_shape)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -923,7 +1252,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_VIEW,
                             src_ids=[slice_id],
                             op_params=pack_view_params(ggml_ne),
-                            sym_dim_ids=_sym_dim_ids_ggml(fake_val, sym_id_map),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -1091,6 +1421,34 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
+                elif "aten.constant_pad_nd.default" in target_str:
+                    # constant_pad_nd(input, pad_list, value=0.0)
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+                    pad_list = [int(p) for p in node.args[1]]
+                    fill_value = float(node.args[2]) if len(node.args) > 2 else 0.0
+
+                    fake_val = node.meta.get("val")
+                    out_shape = _resolve_shape(fake_val)
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(out_shape),
+                            op=OP_PAD,
+                            src_ids=[src_id],
+                            op_params=pack_pad_params(pad_list, fill_value),
+                        )
+                    )
+                    node_to_id[node] = tid
+
                 elif (
                     "aten.convolution.default" in target_str
                     or "aten.conv2d.default" in target_str
@@ -1141,30 +1499,18 @@ class GgmlBackend(BackendDetails):
                     if transposed:
                         raise RuntimeError("Transposed convolution not yet supported")
 
-                    # Check if we have folded params for this conv
                     weight_id = node_to_id[weight_node]
                     if bias_node is not None:
                         bias_id = node_to_id[bias_node]
                     else:
                         bias_id = None
 
-                    # If this conv has folded BN params, replace the weight/bias tensors
-                    # Note: We already have the folded params from BatchNormFoldingPass
-                    # We need to check if the weight/bias placeholders should be replaced
-                    # For now, we use the weight/bias as-is (they should already be folded by the pass)
-
                     input_id = node_to_id[input_node]
 
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
 
-                    # Determine if this is depthwise conv
-                    # Depthwise: groups > 1 and groups == in_channels
-                    # For MobileNetV2, depthwise conv has groups == in_channels
                     is_depthwise = groups > 1
-
-                    # Pack parameters
-                    op_params = pack_conv2d_params(stride, padding, dilation, groups)
 
                     # Build src_ids: [weight, input, bias?]
                     if bias_id is not None:
@@ -1172,13 +1518,25 @@ class GgmlBackend(BackendDetails):
                     else:
                         src_ids = [weight_id, input_id]
 
+                    # Detect 1D vs 2D by stride length
+                    is_conv1d = len(stride) == 1
+
+                    if is_conv1d:
+                        op_params = pack_conv1d_params(
+                            stride[0], padding[0], dilation[0], groups
+                        )
+                        op_code = OP_CONV_1D_DW if is_depthwise else OP_CONV_1D
+                    else:
+                        op_params = pack_conv2d_params(stride, padding, dilation, groups)
+                        op_code = OP_CONV_2D_DW if is_depthwise else OP_CONV_2D
+
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
                             tensor_type=TYPE_F32,
                             ne=_pytorch_shape_to_ggml_ne(shape),
-                            op=OP_CONV_2D_DW if is_depthwise else OP_CONV_2D,
+                            op=op_code,
                             src_ids=src_ids,
                             op_params=op_params,
                         )
@@ -1310,6 +1668,43 @@ class GgmlBackend(BackendDetails):
                         # Same shape or not repeatable — pass through.
                         node_to_id[node] = src_id
 
+                elif "aten.repeat.default" in target_str:
+                    # repeat(input, repeats) → tile input by repeats along each dim
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+                    fake_val = node.meta.get("val")
+                    out_shape = _resolve_shape(fake_val)
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
+                    dst_ne = _pytorch_shape_to_ggml_ne(out_shape)
+
+                    # Create a shape-only "like" tensor for ggml_repeat.
+                    like_id = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=like_id,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=dst_ne,
+                            op=OP_NONE,
+                            is_input=False,
+                        )
+                    )
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=dst_ne,
+                            op=OP_REPEAT,
+                            src_ids=[src_id, like_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
                 elif (
                     "aten.view.default" in target_str
                     or "aten.view_copy.default" in target_str
@@ -1333,6 +1728,7 @@ class GgmlBackend(BackendDetails):
                     # Pack the shape in ggml ne order (reversed from PyTorch)
                     # since the C++ runtime passes these directly to ggml_reshape_4d.
                     ggml_ne = _pytorch_shape_to_ggml_ne(new_shape)
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -1343,7 +1739,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_VIEW,
                             src_ids=[src_id],
                             op_params=pack_view_params(ggml_ne),
-                            sym_dim_ids=_sym_dim_ids_ggml(fake_val, sym_id_map),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -1808,6 +2205,7 @@ class GgmlBackend(BackendDetails):
                         else torch.int64
                     )
 
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -1817,7 +2215,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_ARANGE,
                             src_ids=[],
                             op_params=pack_arange_params(start, step),
-                            sym_dim_ids=_sym_dim_ids_ggml(fake_val, sym_id_map),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -1836,6 +2235,7 @@ class GgmlBackend(BackendDetails):
                         else torch.int64
                     )
 
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -1845,7 +2245,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_ARANGE,
                             src_ids=[],
                             op_params=pack_arange_params(start, step),
-                            sym_dim_ids=_sym_dim_ids_ggml(fake_val, sym_id_map),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -1918,6 +2319,7 @@ class GgmlBackend(BackendDetails):
                         else torch.float32
                     )
 
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
@@ -1927,7 +2329,8 @@ class GgmlBackend(BackendDetails):
                             op=OP_FULL,
                             src_ids=[],
                             op_params=pack_full_params(fill_value),
-                            sym_dim_ids=_sym_dim_ids_ggml(fake_val, sym_id_map),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
@@ -2136,6 +2539,27 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
+                elif "aten.logical_and.default" in target_str:
+                    # logical_and(x, y) — identical to bitwise_and for bool tensors
+                    a_node, b_node = node.args[0], node.args[1]
+                    a_id = node_to_id[a_node]
+                    b_id = node_to_id[b_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = _resolve_shape(fake_val)
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=TYPE_BOOL,
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_BITWISE_AND,
+                            src_ids=[a_id, b_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
                 elif "aten.bitwise_or.Tensor" in target_str:
                     # bitwise_or(x, y)
                     a_node, b_node = node.args[0], node.args[1]
@@ -2164,6 +2588,26 @@ class GgmlBackend(BackendDetails):
 
                 elif "aten.logical_not.default" in target_str:
                     # logical_not(x)
+                    src_node = node.args[0]
+                    src_id = node_to_id[src_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = _resolve_shape(fake_val)
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=TYPE_BOOL,
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_LOGICAL_NOT,
+                            src_ids=[src_id],
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "aten.bitwise_not.default" in target_str:
+                    # bitwise_not(x) — identical to logical_not for bool tensors
                     src_node = node.args[0]
                     src_id = node_to_id[src_node]
 
@@ -2279,6 +2723,214 @@ class GgmlBackend(BackendDetails):
                         )
                     )
                     node_to_id[node] = tid
+
+                elif "aten.split_with_sizes_copy.default" in target_str:
+                    # split_with_sizes_copy(x, split_sizes, dim=0) → tuple of slices
+                    # Decompose into multiple SLICE ops
+                    src_node = node.args[0]
+                    split_sizes = list(node.args[1])
+                    dim = int(node.args[2]) if len(node.args) > 2 else 0
+                    src_id = node_to_id[src_node]
+
+                    src_val = src_node.meta.get("val")
+                    src_shape = _resolve_shape(src_val)
+                    ndim = len(src_shape) if src_shape else 4
+
+                    # Normalize negative dim
+                    if dim < 0:
+                        dim = ndim + dim
+
+                    # Emit one SLICE per chunk
+                    chunk_ids = []
+                    offset = 0
+                    fake_vals = node.meta.get("val")  # tuple of FakeTensors
+                    for i, sz in enumerate(split_sizes):
+                        start_i = offset
+                        end_i = offset + sz
+                        offset = end_i
+
+                        # Get shape from FakeTensor tuple
+                        if isinstance(fake_vals, (list, tuple)) and i < len(fake_vals):
+                            chunk_fv = fake_vals[i]
+                            chunk_shape = _resolve_shape(chunk_fv)
+                            chunk_dtype = getattr(chunk_fv, "dtype", torch.float32)
+                        else:
+                            chunk_shape = list(src_shape)
+                            chunk_shape[dim] = sz
+                            chunk_dtype = torch.float32
+
+                        chunk_tid = alloc_id()
+                        ir_tensors.append(
+                            IrTensor(
+                                tensor_id=chunk_tid,
+                                tensor_type=_torch_dtype_to_ir_type(chunk_dtype),
+                                ne=_pytorch_shape_to_ggml_ne(chunk_shape),
+                                op=OP_SLICE,
+                                src_ids=[src_id],
+                                op_params=pack_slice_params(
+                                    dim, start_i, end_i, 1, ndim
+                                ),
+                            )
+                        )
+                        chunk_ids.append(chunk_tid)
+
+                    # Store as list for getitem resolution
+                    node_to_id[node] = chunk_ids
+
+                elif "aten.native_layer_norm.default" in target_str:
+                    # native_layer_norm(input, normalized_shape, weight, bias, eps)
+                    # Returns tuple (output, mean, rstd)
+                    input_node = node.args[0]
+                    # normalized_shape = node.args[1]  # not needed for IR
+                    weight_node = node.args[2] if len(node.args) > 2 else None
+                    bias_node = node.args[3] if len(node.args) > 3 else None
+                    eps = float(node.args[4]) if len(node.args) > 4 else 1e-5
+
+                    input_id = node_to_id[input_node]
+                    has_weight = weight_node is not None and not (
+                        isinstance(weight_node, type(None))
+                    )
+                    has_bias = bias_node is not None and not (
+                        isinstance(bias_node, type(None))
+                    )
+
+                    src_ids = [input_id]
+                    if has_weight:
+                        src_ids.append(node_to_id[weight_node])
+                    if has_bias:
+                        src_ids.append(node_to_id[bias_node])
+
+                    # Output shape comes from the first element of the tuple
+                    fake_val = node.meta.get("val")
+                    if isinstance(fake_val, (list, tuple)):
+                        out_fv = fake_val[0]
+                    else:
+                        out_fv = fake_val
+                    shape = _resolve_shape(out_fv)
+                    out_dtype = (
+                        getattr(out_fv, "dtype", torch.float32)
+                        if out_fv is not None
+                        else torch.float32
+                    )
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_LAYER_NORM,
+                            src_ids=src_ids,
+                            op_params=pack_layer_norm_params(
+                                eps, has_weight, has_bias
+                            ),
+                        )
+                    )
+                    # Store as single int — getitem(0) will resolve to this
+                    node_to_id[node] = tid
+
+                elif "aten._native_batch_norm_legit_no_training.default" in target_str:
+                    # _native_batch_norm_legit_no_training(input, weight, bias, running_mean, running_var, momentum, eps)
+                    # Returns tuple (output, mean, rstd)
+                    input_node = node.args[0]
+                    weight_node = node.args[1] if len(node.args) > 1 else None
+                    bias_node = node.args[2] if len(node.args) > 2 else None
+                    mean_node = node.args[3] if len(node.args) > 3 else None
+                    var_node = node.args[4] if len(node.args) > 4 else None
+                    # momentum = node.args[5]  # not used
+                    eps = float(node.args[6]) if len(node.args) > 6 else 1e-5
+
+                    input_id = node_to_id[input_node]
+
+                    src_ids = [input_id]
+                    has_w = isinstance(weight_node, torch.fx.Node) and weight_node in node_to_id
+                    has_b = isinstance(bias_node, torch.fx.Node) and bias_node in node_to_id
+                    has_m = isinstance(mean_node, torch.fx.Node) and mean_node in node_to_id
+                    has_v = isinstance(var_node, torch.fx.Node) and var_node in node_to_id
+
+                    if has_w:
+                        src_ids.append(node_to_id[weight_node])
+                    if has_b:
+                        src_ids.append(node_to_id[bias_node])
+                    if has_m:
+                        src_ids.append(node_to_id[mean_node])
+                    if has_v:
+                        src_ids.append(node_to_id[var_node])
+
+                    # Output shape from tuple[0]
+                    fake_val = node.meta.get("val")
+                    if isinstance(fake_val, (list, tuple)):
+                        out_fv = fake_val[0]
+                    else:
+                        out_fv = fake_val
+                    shape = _resolve_shape(out_fv)
+                    out_dtype = (
+                        getattr(out_fv, "dtype", torch.float32)
+                        if out_fv is not None
+                        else torch.float32
+                    )
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_BATCH_NORM,
+                            src_ids=src_ids,
+                            op_params=pack_batch_norm_params(eps),
+                        )
+                    )
+                    # Store as single int — getitem(0) will resolve to this
+                    node_to_id[node] = tid
+
+                elif "aten.argmax.default" in target_str:
+                    # argmax(x, dim=None, keepdim=False)
+                    src_node = node.args[0]
+                    dim = int(node.args[1]) if len(node.args) > 1 and node.args[1] is not None else -1
+                    src_id = node_to_id[src_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = _resolve_shape(fake_val)
+
+                    src_val = src_node.meta.get("val")
+                    src_shape = _resolve_shape(src_val)
+                    ndim = len(src_shape) if src_shape else len(shape) + 1
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=TYPE_I32,  # ggml_argmax returns I32
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_ARGMAX,
+                            src_ids=[src_id],
+                            op_params=pack_argmax_params(dim, ndim),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif callable(target) and "getitem" in str(target):
+                    # Generic getitem handler for tuple outputs
+                    # (layer_norm, batch_norm, split_with_sizes_copy)
+                    src_node = node.args[0]
+                    idx = int(node.args[1])
+                    src_val = node_to_id.get(src_node)
+
+                    if isinstance(src_val, list):
+                        # split_with_sizes_copy: list of tensor IDs
+                        node_to_id[node] = src_val[idx]
+                    elif isinstance(src_val, int):
+                        # layer_norm / batch_norm: single tensor ID (only index 0 is the output)
+                        if idx == 0:
+                            node_to_id[node] = src_val
+                        else:
+                            # mean/rstd outputs — not used in inference, skip
+                            pass
+                    else:
+                        raise RuntimeError(
+                            f"getitem: unexpected source type {type(src_val)} for {src_node}"
+                        )
 
                 else:
                     raise RuntimeError(

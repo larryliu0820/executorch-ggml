@@ -26,6 +26,12 @@ class OpCode(object):
     LINEAR = 20
     EMBEDDING = 21
     SILU = 22
+    RELU = 23
+    TANH = 24
+    LAYER_NORM = 25
+    BATCH_NORM = 26
+    ARGMAX = 27
+    DIV = 28
     RSQRT = 30
     UNSQUEEZE = 31
     TRANSPOSE = 40
@@ -53,3 +59,6 @@ class OpCode(object):
     LOGICAL_NOT = 72
     ANY = 73
     UPDATE_CACHE = 74
+    CONV_1D = 80
+    CONV_1D_DW = 81
+    PAD = 82

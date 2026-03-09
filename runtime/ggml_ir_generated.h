@@ -45,6 +45,12 @@ enum class OpCode : int32_t {
   LINEAR = 20,
   EMBEDDING = 21,
   SILU = 22,
+  RELU = 23,
+  TANH = 24,
+  LAYER_NORM = 25,
+  BATCH_NORM = 26,
+  ARGMAX = 27,
+  DIV = 28,
   RSQRT = 30,
   UNSQUEEZE = 31,
   TRANSPOSE = 40,
@@ -72,11 +78,14 @@ enum class OpCode : int32_t {
   LOGICAL_NOT = 72,
   ANY = 73,
   UPDATE_CACHE = 74,
+  CONV_1D = 80,
+  CONV_1D_DW = 81,
+  PAD = 82,
   MIN = NONE,
-  MAX = UPDATE_CACHE
+  MAX = PAD
 };
 
-inline const OpCode (&EnumValuesOpCode())[50] {
+inline const OpCode (&EnumValuesOpCode())[59] {
   static const OpCode values[] = {
     OpCode::NONE,
     OpCode::ADD,
@@ -101,6 +110,12 @@ inline const OpCode (&EnumValuesOpCode())[50] {
     OpCode::LINEAR,
     OpCode::EMBEDDING,
     OpCode::SILU,
+    OpCode::RELU,
+    OpCode::TANH,
+    OpCode::LAYER_NORM,
+    OpCode::BATCH_NORM,
+    OpCode::ARGMAX,
+    OpCode::DIV,
     OpCode::RSQRT,
     OpCode::UNSQUEEZE,
     OpCode::TRANSPOSE,
@@ -127,13 +142,16 @@ inline const OpCode (&EnumValuesOpCode())[50] {
     OpCode::BITWISE_OR,
     OpCode::LOGICAL_NOT,
     OpCode::ANY,
-    OpCode::UPDATE_CACHE
+    OpCode::UPDATE_CACHE,
+    OpCode::CONV_1D,
+    OpCode::CONV_1D_DW,
+    OpCode::PAD
   };
   return values;
 }
 
 inline const char * const *EnumNamesOpCode() {
-  static const char * const names[76] = {
+  static const char * const names[84] = {
     "NONE",
     "ADD",
     "MUL_MAT",
@@ -157,12 +175,12 @@ inline const char * const *EnumNamesOpCode() {
     "LINEAR",
     "EMBEDDING",
     "SILU",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
+    "RELU",
+    "TANH",
+    "LAYER_NORM",
+    "BATCH_NORM",
+    "ARGMAX",
+    "DIV",
     "",
     "RSQRT",
     "UNSQUEEZE",
@@ -209,13 +227,21 @@ inline const char * const *EnumNamesOpCode() {
     "LOGICAL_NOT",
     "ANY",
     "UPDATE_CACHE",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "CONV_1D",
+    "CONV_1D_DW",
+    "PAD",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameOpCode(OpCode e) {
-  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::UPDATE_CACHE)) return "";
+  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::PAD)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesOpCode()[index];
 }
@@ -275,7 +301,8 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_IS_INPUT = 18,
     VT_IS_OUTPUT = 20,
     VT_INPUT_INDEX = 22,
-    VT_SYM_DIM_IDS = 24
+    VT_SYM_DIM_IDS = 24,
+    VT_SYM_DIM_EXPRS = 26
   };
   int32_t id() const {
     return GetField<int32_t>(VT_ID, 0);
@@ -310,6 +337,9 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   const ::flatbuffers::Vector<int32_t> *sym_dim_ids() const {
     return GetPointer<const ::flatbuffers::Vector<int32_t> *>(VT_SYM_DIM_IDS);
   }
+  const ::flatbuffers::Vector<uint8_t> *sym_dim_exprs() const {
+    return GetPointer<const ::flatbuffers::Vector<uint8_t> *>(VT_SYM_DIM_EXPRS);
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<int32_t>(verifier, VT_ID, 4) &&
@@ -328,6 +358,8 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyField<int32_t>(verifier, VT_INPUT_INDEX, 4) &&
            VerifyOffset(verifier, VT_SYM_DIM_IDS) &&
            verifier.VerifyVector(sym_dim_ids()) &&
+           VerifyOffset(verifier, VT_SYM_DIM_EXPRS) &&
+           verifier.VerifyVector(sym_dim_exprs()) &&
            verifier.EndTable();
   }
 };
@@ -369,6 +401,9 @@ struct TensorBuilder {
   void add_sym_dim_ids(::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> sym_dim_ids) {
     fbb_.AddOffset(Tensor::VT_SYM_DIM_IDS, sym_dim_ids);
   }
+  void add_sym_dim_exprs(::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> sym_dim_exprs) {
+    fbb_.AddOffset(Tensor::VT_SYM_DIM_EXPRS, sym_dim_exprs);
+  }
   explicit TensorBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -392,8 +427,10 @@ inline ::flatbuffers::Offset<Tensor> CreateTensor(
     bool is_input = false,
     bool is_output = false,
     int32_t input_index = -1,
-    ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> sym_dim_ids = 0) {
+    ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> sym_dim_ids = 0,
+    ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> sym_dim_exprs = 0) {
   TensorBuilder builder_(_fbb);
+  builder_.add_sym_dim_exprs(sym_dim_exprs);
   builder_.add_sym_dim_ids(sym_dim_ids);
   builder_.add_input_index(input_index);
   builder_.add_data_key(data_key);
@@ -420,12 +457,14 @@ inline ::flatbuffers::Offset<Tensor> CreateTensorDirect(
     bool is_input = false,
     bool is_output = false,
     int32_t input_index = -1,
-    const std::vector<int32_t> *sym_dim_ids = nullptr) {
+    const std::vector<int32_t> *sym_dim_ids = nullptr,
+    const std::vector<uint8_t> *sym_dim_exprs = nullptr) {
   auto ne__ = ne ? _fbb.CreateVector<int64_t>(*ne) : 0;
   auto src_ids__ = src_ids ? _fbb.CreateVector<int32_t>(*src_ids) : 0;
   auto op_params__ = op_params ? _fbb.CreateVector<uint8_t>(*op_params) : 0;
   auto data_key__ = data_key ? _fbb.CreateString(data_key) : 0;
   auto sym_dim_ids__ = sym_dim_ids ? _fbb.CreateVector<int32_t>(*sym_dim_ids) : 0;
+  auto sym_dim_exprs__ = sym_dim_exprs ? _fbb.CreateVector<uint8_t>(*sym_dim_exprs) : 0;
   return ggml_ir::CreateTensor(
       _fbb,
       id,
@@ -438,7 +477,8 @@ inline ::flatbuffers::Offset<Tensor> CreateTensorDirect(
       is_input,
       is_output,
       input_index,
-      sym_dim_ids__);
+      sym_dim_ids__,
+      sym_dim_exprs__);
 }
 
 struct GgmlGraph FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {

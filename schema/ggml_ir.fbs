@@ -33,6 +33,8 @@ enum OpCode : int32 {
     LINEAR = 20,         // src_ids: [x, w, b?]  (b optional)
     EMBEDDING = 21,      // src_ids: [weight, indices]
     SILU = 22,           // src_ids: [x]
+    RELU = 23,           // src_ids: [x]
+    TANH = 24,           // src_ids: [x]
     LEAKY_RELU = 3,      // src_ids: [x]  op_params: float32 negative_slope
     HARDTANH = 6,        // src_ids: [x]  op_params: float32 min, float32 max
 
@@ -75,6 +77,17 @@ enum OpCode : int32 {
     // Attention (fused llama.cpp/ggml path)
     LLAMA_ATTENTION = 60, // src_ids: TBD; op_params: model-specific (see runtime)
 
+    // Parakeet / ASR ops
+    LAYER_NORM = 25,     // src_ids: [x, weight?, bias?] op_params: float32 eps, int32 has_weight, int32 has_bias
+    BATCH_NORM = 26,     // src_ids: [x, weight, bias, mean, var] op_params: float32 eps
+    ARGMAX = 27,         // src_ids: [x] op_params: int32 dim, int32 ndim
+    DIV = 28,            // src_ids: [a, b]
+
+    // Conv1d
+    CONV_1D = 80,        // src_ids: [weight, input, bias?] op_params: int32 stride, pad, dilation, groups
+    CONV_1D_DW = 81,     // depthwise conv1d
+    PAD = 82,            // src_ids: [x] op_params: int32 ndim_pairs, ndim_pairs × (int32 left, int32 right), float32 value
+
     // Bitwise / logical ops
     BITWISE_AND = 70,    // src_ids: [a, b]
     BITWISE_OR = 71,     // src_ids: [a, b]
@@ -113,8 +126,15 @@ table Tensor {
 
     // Per-dimension symbolic variable IDs for dynamic shapes.
     // -1 = static dimension; >= 0 = unique symbolic variable ID.
+    // -2 = evaluate bytecode expression from sym_dim_exprs.
     // Runtime resolves each ID to a concrete value from input tensors.
     sym_dim_ids:[int32];
+
+    // Packed postfix bytecode for derived symbolic expressions.
+    // Layout: 4 entries (one per ggml dim), each prefixed by uint16 length:
+    //   [len0: u16][bytecode0: len0 bytes][len1: u16][...][len2: u16][...][len3: u16][...]
+    // Only present when sym_dim_ids contains -2 sentinels.
+    sym_dim_exprs:[uint8];
 }
 
 table GgmlGraph {
