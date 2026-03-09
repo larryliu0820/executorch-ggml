@@ -521,7 +521,11 @@ class GgmlBackend(BackendDetails):
                         )
                         t_cpu = t_float.to(torch.float16)
                     elif t_cpu.dtype == torch.float32 and t_cpu.ndim >= 3:
-                        t_cpu = t_cpu.to(torch.float16)
+                        # Downcast conv weights to F16 for ggml's im2col_f16.
+                        # Keep positional encodings at F32 for precision.
+                        is_pe = "pe" in fqn or "pos_enc" in fqn
+                        if not is_pe:
+                            t_cpu = t_cpu.to(torch.float16)
 
                     # Store inside the .pte.
                     data_store.add_named_data(fqn, t_cpu, alignment=64)
@@ -996,8 +1000,13 @@ class GgmlBackend(BackendDetails):
                     end = node.args[3] if len(node.args) > 3 else None
                     step = int(node.args[4]) if len(node.args) > 4 else 1
 
-                    # Normalize optional start/end
+                    # Normalize optional start/end.
+                    # Use sentinel (2**62) for non-literal start/end values
+                    # that may depend on dynamic dimensions — the C++ runtime
+                    # will derive the correct value from the resolved output shape.
                     start_i = _concrete_int(start) if start is not None else 0
+                    if start is not None and not isinstance(start, int):
+                        start_i = 2**62  # sentinel: C++ will recompute
                     # If end is None, represent as a large positive bound (runtime will clamp)
                     end_i = _concrete_int(end) if end is not None else (2**62)
                     src_id = node_to_id[src_node]

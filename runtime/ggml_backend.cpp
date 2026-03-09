@@ -1727,26 +1727,34 @@ static Error build_graph(
           // Derive start/end from the resolved output shape when op_params
           // contain the 2^62 sentinel (unresolvable SymInt at export time).
           constexpr int64_t SENTINEL = static_cast<int64_t>(1) << 62;
-          if (start == SENTINEL) start = 0;
-          if (end == SENTINEL) {
+          int64_t actual_dim = a->ne[ax];
+          bool start_is_sentinel = (start == SENTINEL);
+          bool end_is_sentinel = (end == SENTINEL);
+
+          if (start_is_sentinel) start = 0;  // temporary, may be recomputed below
+          if (end_is_sentinel) {
             // Derive end from the resolved output ne along the slice axis.
             end = start + resolved_slice_ne * step;
           }
 
           // Clamp end to actual source dim (handles "slice to end" when
           // source shape changed due to dynamic dims).
-          int64_t actual_dim = a->ne[ax];
           if (end > actual_dim) end = actual_dim;
           ne[ax] = end - start;
 
           // When sym_dim_ids resolved a different value for the sliced axis,
-          // prefer it — the baked end from op_params may be a trace-time constant
-          // that doesn't match the runtime source shape.
+          // prefer it — the baked end/start from op_params may be trace-time
+          // constants that don't match the runtime source shape.
           if (t->sym_dim_ids() && ax < (int)t->sym_dim_ids()->size()) {
             int32_t sid_ax = t->sym_dim_ids()->Get(ax);
             if ((sid_ax == -2 || sid_ax >= 0) && resolved_slice_ne > 0 &&
                 resolved_slice_ne != ne[ax]) {
               ne[ax] = resolved_slice_ne;
+              if (start_is_sentinel) {
+                // Both start and output size are dynamic — center the slice
+                // in the source dimension (used by RelPositionalEncoding).
+                start = (actual_dim - resolved_slice_ne) / 2;
+              }
               end = start + resolved_slice_ne;
               if (end > actual_dim) {
                 end = actual_dim;
