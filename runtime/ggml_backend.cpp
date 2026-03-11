@@ -417,6 +417,51 @@ void ggml_custom_logical_not(
   }
 }
 
+// F32 depthwise conv1d: avoids ggml's im2col F16 path for better precision.
+// src[0] = weight [K, 1, C, 1]  (ggml layout for [C, 1, K] PyTorch)
+// src[1] = input  [L, C, B, 1]  (ggml layout for [B, C, L] PyTorch)
+// userdata = Conv1dDwParams* with stride, pad, dilation.
+struct Conv1dDwParams { int stride, pad, dilation; };
+
+void ggml_custom_conv_1d_dw_f32(
+    struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+  const auto* p = static_cast<const Conv1dDwParams*>(userdata);
+  const struct ggml_tensor* weight = dst->src[0];
+  const struct ggml_tensor* input  = dst->src[1];
+  if (!weight || !input || !weight->data || !input->data || !dst->data) return;
+
+  const int64_t K     = weight->ne[0];
+  const int64_t C     = weight->ne[2];
+  const int64_t L_in  = input->ne[0];
+  const int64_t B     = input->ne[2];
+  const int64_t L_out = dst->ne[0];
+  const int s = p->stride, pad = p->pad, d = p->dilation;
+
+  // Parallelise over (batch, channel) pairs.
+  const int64_t total = B * C;
+  const int64_t work  = (total + nth - 1) / nth;
+  const int64_t i0 = work * ith, i1 = std::min<int64_t>(i0 + work, total);
+
+  for (int64_t bc = i0; bc < i1; ++bc) {
+    const int64_t c = bc % C;
+    const int64_t b = bc / C;
+    const float* w = (const float*)((const char*)weight->data + c * weight->nb[2]);
+    const float* x = (const float*)((const char*)input->data
+                     + c * input->nb[1] + b * input->nb[2]);
+    float* y = (float*)((char*)dst->data + c * dst->nb[1] + b * dst->nb[2]);
+    for (int64_t o = 0; o < L_out; ++o) {
+      float sum = 0.0f;
+      for (int64_t k = 0; k < K; ++k) {
+        int64_t in_idx = o * s - pad + k * d;
+        if (in_idx >= 0 && in_idx < L_in) {
+          sum += w[k] * x[in_idx];
+        }
+      }
+      y[o] = sum;
+    }
+  }
+}
+
 // Custom runtime gather for multi-index advanced indexing:
 //   out = src[idx0, idx1, ...]
 // where dst->src[0] is src and dst->src[1..] are index tensors.
@@ -601,7 +646,9 @@ void ggml_custom_index_put_rows(
 struct ggml_tensor* eager_cast_i64_to_i32(
     struct ggml_context* ctx,
     struct ggml_tensor* src) {
+  ggml_set_no_alloc(ctx, false);
   struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_I32, GGML_MAX_DIMS, src->ne);
+  ggml_set_no_alloc(ctx, true);
   dst->op = GGML_OP_NONE;
   if (src->data && dst->data) {
     const size_t n = ggml_nelements(src);
@@ -615,7 +662,9 @@ struct ggml_tensor* eager_cast_i64_to_i32(
 struct ggml_tensor* eager_cast_i32_to_i64(
     struct ggml_context* ctx,
     struct ggml_tensor* src) {
+  ggml_set_no_alloc(ctx, false);
   struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_I64, GGML_MAX_DIMS, src->ne);
+  ggml_set_no_alloc(ctx, true);
   dst->op = GGML_OP_NONE;
   if (src->data && dst->data) {
     const size_t n = ggml_nelements(src);
@@ -656,7 +705,9 @@ struct ggml_tensor* safe_ggml_cast(
   if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_F32 &&
       ggml_nelements(src) == 1 && src->data) {
     int32_t ival = *(const int32_t*)src->data;
+    ggml_set_no_alloc(ctx, false);
     struct ggml_tensor* dst = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1);
+    ggml_set_no_alloc(ctx, true);
     dst->op = GGML_OP_NONE;
     *(float*)dst->data = static_cast<float>(ival);
     return dst;
@@ -741,6 +792,15 @@ struct InputDataOverride {
 // Frees any previously existing ctx (safe to call on first build too,
 // since it starts as nullptr).
 //
+// ggml_new_f32() asserts no_alloc==false.  This wrapper temporarily disables
+// no_alloc so the scalar's 4 bytes are allocated inline from the context pool.
+static struct ggml_tensor* make_f32_scalar(struct ggml_context* ctx, float value) {
+  ggml_set_no_alloc(ctx, false);
+  struct ggml_tensor* t = ggml_new_f32(ctx, value);
+  ggml_set_no_alloc(ctx, true);
+  return t;
+}
+
 // Eagerly compute a binary f32 scalar op during build_graph.
 // Returns a new GGML_OP_NONE tensor with the result, or nullptr if not applicable.
 static struct ggml_tensor* try_eager_scalar_binop(
@@ -761,7 +821,10 @@ static struct ggml_tensor* try_eager_scalar_binop(
     case '/': result = (vb != 0.0f) ? va / vb : 0.0f; break;
     default: return nullptr;
   }
+  // Temporarily enable allocation for the result scalar.
+  ggml_set_no_alloc(ctx, false);
   struct ggml_tensor* gt = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1);
+  ggml_set_no_alloc(ctx, true);
   gt->op = GGML_OP_NONE;
   *(float*)gt->data = result;
   return gt;
@@ -799,29 +862,9 @@ static Error build_graph(
   const int n_tensors = static_cast<int>(fb_tensors->size());
 
   // === Phase A: calculate ctx size, create ggml context ===
-  // Calculate memory needed for ggml context.
-  // Sum up ALL tensor sizes from the IR (constants + intermediate results)
-  // so we allocate enough for the full computation graph.
-  size_t total_tensor_data_size = 0;
-  for (int i = 0; i < n_tensors; ++i) {
-    const auto* t = fb_tensors->Get(i);
-    size_t n_elems = 1;
-    if (t->ne()) {
-      for (size_t d = 0; d < t->ne()->size(); ++d) {
-        n_elems *= static_cast<size_t>(t->ne()->Get(d));
-      }
-    }
-    size_t elem_size = 4; // default F32
-    switch (static_cast<ggml_ir::TensorType>(t->type())) {
-      case ggml_ir::TensorType::F16:  elem_size = 2; break;
-      case ggml_ir::TensorType::BF16: elem_size = 2; break;
-      case ggml_ir::TensorType::I32:  elem_size = 4; break;
-      case ggml_ir::TensorType::I64:  elem_size = 8; break;
-      case ggml_ir::TensorType::BOOL: elem_size = 4; break; // stored as I32
-      default:                        elem_size = 4; break;
-    }
-    total_tensor_data_size += n_elems * elem_size;
-  }
+  // Context only needs tensor metadata + graph structure.
+  // Actual tensor data is allocated by gallocr (backend scheduler) or by
+  // a temporary CPU host buffer for leaf tensors (constants / inputs).
 
   // Estimate graph size: 4× the IR tensors to account for compound ops.
   size_t est_graph_size = static_cast<size_t>(n_tensors) * 4;
@@ -829,20 +872,63 @@ static Error build_graph(
     est_graph_size = GGML_DEFAULT_GRAPH_SIZE;
   }
 
-  // Use 3× total tensor data to account for intermediate ggml tensors
-  // created by compound ops (e.g. ggml_mul internally creates temporaries).
+  // Eager ops (ARANGE, FULL, CUMSUM, EQ, NE, CAST, etc.) create
+  // data-filled leaf tensors during op dispatch.  Their data is allocated
+  // inline from the context pool (no_alloc temporarily false).
+  // Estimate the headroom needed for these eager allocations.
+  size_t eager_data_estimate = 0;
+  for (int i = 0; i < n_tensors; ++i) {
+    const auto* t = fb_tensors->Get(i);
+    auto op = static_cast<ggml_ir::OpCode>(t->op());
+    if (op == ggml_ir::OpCode::NONE) continue;
+    // Only count ops known to create data-filled tensors during build.
+    bool is_eager = false;
+    // Only count ops that ALWAYS create data-filled tensors during build.
+    // ADD/SUB are only eager for I64 (rare, small). CAST is only eager for
+    // I64 sources or scalars (also small). Skip those to avoid inflating
+    // the estimate with large max-shape tensors.
+    switch (op) {
+      case ggml_ir::OpCode::ARANGE:
+      case ggml_ir::OpCode::FULL:
+      case ggml_ir::OpCode::CUMSUM:
+      case ggml_ir::OpCode::EQ:
+      case ggml_ir::OpCode::NE:
+      case ggml_ir::OpCode::ANY:
+      case ggml_ir::OpCode::INDEX_PUT:
+        is_eager = true;
+        break;
+      default:
+        break;
+    }
+    if (!is_eager) continue;
+    size_t n_elems = 1;
+    if (t->ne()) {
+      for (size_t d = 0; d < t->ne()->size(); ++d) {
+        n_elems *= static_cast<size_t>(t->ne()->Get(d));
+      }
+    }
+    // Worst-case element size (I64 = 8 bytes) + per-tensor overhead.
+    eager_data_estimate += n_elems * 8 + ggml_tensor_overhead() + 64;
+  }
+  // Safety multiplier: compound dispatch may create sub-tensors.
+  eager_data_estimate = std::max(eager_data_estimate * 2, (size_t)(4 * 1024 * 1024));
+
   size_t ctx_size =
       static_cast<size_t>(n_tensors) * 4 * ggml_tensor_overhead() +
-      total_tensor_data_size * 3 +
-      ggml_graph_overhead_custom(est_graph_size, false);
+      ggml_graph_overhead_custom(est_graph_size, false) +
+      eager_data_estimate;
+  fprintf(stderr, "[ggml_backend] ctx_size=%zu MB, tensor_overhead=%zu, n_tensors=%d\n",
+          ctx_size / (1024*1024), ggml_tensor_overhead(), n_tensors);
 
   struct ggml_init_params params = {
       /* .mem_size   = */ ctx_size,
       /* .mem_buffer = */ nullptr,
-      /* .no_alloc   = */ false,
+      /* .no_alloc   = */ true,
   };
 
+  fprintf(stderr, "[ggml_backend] calling ggml_init with %zu bytes\n", ctx_size); fflush(stderr);
   struct ggml_context* ctx = ggml_init(params);
+  fprintf(stderr, "[ggml_backend] ggml_init returned ctx=%p\n", (void*)ctx); fflush(stderr);
   if (!ctx) {
     return Error::MemoryAllocationFailed;
   }
@@ -850,6 +936,16 @@ static Error build_graph(
   // === Phase B: tensor creation loop + op switch ===
   // Map from IR tensor id → ggml_tensor*
   std::vector<struct ggml_tensor*> id_to_tensor(n_tensors, nullptr);
+
+  // Temporary CPU host buffer for leaf tensor data.
+  // Freed after gallocr copies constants to backend buffers (Phase C step 6).
+  ggml_backend_buffer_t host_buf = nullptr;
+
+  // RAII guard: ensure host_buf is freed on early return (error paths).
+  struct HostBufGuard {
+    ggml_backend_buffer_t& buf;
+    ~HostBufGuard() { if (buf) { ggml_backend_buffer_free(buf); buf = nullptr; } }
+  } host_buf_guard{host_buf};
 
   // Track inputs and outputs
   std::vector<std::pair<int, struct ggml_tensor*>> input_pairs;  // (index, tensor)
@@ -874,21 +970,14 @@ static Error build_graph(
     }
   }
 
-  // Walk tensors in topological order
-  for (int i = 0; i < n_tensors; ++i) {
-    const auto* t = fb_tensors->Get(i);
-    const int tid = t->id();
-    const auto op = static_cast<ggml_ir::OpCode>(t->op());
-
-    // Read shape (ne)
-    int64_t ne[4] = {1, 1, 1, 1};
+  // --- Shape resolution helper (shared by leaf and op passes) ---
+  auto resolve_shape = [&](const ggml_ir::Tensor* t, int64_t ne[4], int& n_dims) {
+    ne[0] = ne[1] = ne[2] = ne[3] = 1;
     if (t->ne() && t->ne()->size() > 0) {
       for (size_t d = 0; d < t->ne()->size() && d < 4; ++d) {
         ne[d] = t->ne()->Get(d);
       }
     }
-
-    // Override dynamic dims with runtime shapes for input tensors.
     if (input_ne_overrides && t->is_input() && t->sym_dim_ids()) {
       int input_idx = t->input_index();
       for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
@@ -898,13 +987,10 @@ static Error build_graph(
         }
       }
     }
-
-    // Resolve sym_dim_ids for non-input tensors (ARANGE, FULL, VIEW, etc.).
     if (!t->is_input() && t->sym_dim_ids() && !sym_dim_values.empty()) {
       for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
         int32_t sid = t->sym_dim_ids()->Get(d);
         if (sid == -2) {
-          // Evaluate bytecode expression
           const uint8_t* code = nullptr;
           size_t code_len = 0;
           if (get_dim_expr_bytecode(t->sym_dim_exprs(), d, code, code_len)) {
@@ -916,62 +1002,96 @@ static Error build_graph(
         }
       }
     }
-
-    // Determine n_dims from ne (count trailing 1s)
-    int n_dims = 4;
+    n_dims = 4;
     for (int d = 3; d >= 1; --d) {
-      if (ne[d] == 1) {
-        n_dims = d;
-      } else {
-        break;
-      }
+      if (ne[d] == 1) { n_dims = d; } else { break; }
     }
     if (n_dims == 0) n_dims = 1;
+  };
+
+  // --- IR type → ggml type helper ---
+  auto resolve_gtype = [](const ggml_ir::Tensor* t) -> ggml_type {
+    switch (t->type()) {
+      case ggml_ir::TensorType::F16:  return GGML_TYPE_F16;
+      case ggml_ir::TensorType::I64:  return GGML_TYPE_I64;
+      case ggml_ir::TensorType::I32:  return GGML_TYPE_I32;
+      case ggml_ir::TensorType::BOOL: return GGML_TYPE_I32;  // stored as I32
+      case ggml_ir::TensorType::BF16: return GGML_TYPE_BF16;
+      default:                        return GGML_TYPE_F32;
+    }
+  };
+
+  // === Pre-calculate total leaf data size for tallocr ===
+  {
+    size_t total_leaf_data = 0;
+    const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+    for (int i = 0; i < n_tensors; ++i) {
+      const auto* t = fb_tensors->Get(i);
+      if (static_cast<ggml_ir::OpCode>(t->op()) != ggml_ir::OpCode::NONE) continue;
+      int64_t leaf_ne[4] = {1,1,1,1}; int leaf_ndims;
+      resolve_shape(t, leaf_ne, leaf_ndims);
+      ggml_type gtype = resolve_gtype(t);
+      size_t tensor_bytes = ggml_row_size(gtype, leaf_ne[0]) * leaf_ne[1] * leaf_ne[2] * leaf_ne[3];
+      // Match ggml_tallocr_alloc: GGML_PAD(alloc_size, alignment)
+      size_t padded = ((tensor_bytes + alignment - 1) / alignment) * alignment;
+      total_leaf_data += padded;
+    }
+    // Safety margin: 1% + 1 MB for alignment rounding and initial offset.
+    total_leaf_data += total_leaf_data / 100 + 1024 * 1024;
+    fprintf(stderr, "[ggml_backend] total_leaf_data=%zu MB\n", total_leaf_data / (1024*1024));
+    host_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), total_leaf_data);
+    if (!host_buf) {
+      fprintf(stderr, "[ggml_backend] ERROR: failed to allocate host buffer of %zu bytes\n", total_leaf_data);
+      ggml_free(ctx);
+      return Error::MemoryAllocationFailed;
+    }
+  }
+  struct ggml_tallocr tallocr = ggml_tallocr_new(host_buf);
+
+  // === Phase B: single-pass tensor creation loop ===
+  fprintf(stderr, "[ggml_backend] Phase B: creating tensors (single pass)...\n"); fflush(stderr);
+  static int s_last_processed = -1;
+  static int s_n_tensors = 0;
+  s_last_processed = -1;
+  s_n_tensors = n_tensors;
+  // Temporary SIGABRT handler to catch ggml assertions
+  static auto old_handler = signal(SIGABRT, [](int) {
+    fprintf(stderr, "\n[ggml_backend] SIGABRT caught! last_processed=%d/%d\n", s_last_processed, s_n_tensors);
+    fflush(stderr);
+    std::quick_exit(1);
+  });
+  int last_processed = -1;
+  for (int i = 0; i < n_tensors; ++i) {
+    const auto* t = fb_tensors->Get(i);
+    const int tid = t->id();
+    const auto op = static_cast<ggml_ir::OpCode>(t->op());
+    int64_t ne[4] = {1,1,1,1}; int n_dims = 4;
+    resolve_shape(t, ne, n_dims);
 
     if (op == ggml_ir::OpCode::NONE) {
-      // Leaf tensor: input or constant
+      // --- Leaf tensor: create, allocate from host buffer, load data ---
+      ggml_type gtype = resolve_gtype(t);
       struct ggml_tensor* gt = nullptr;
-
-      // Respect declared tensor type.
-      ggml_type gtype = GGML_TYPE_F32;
-      switch (t->type()) {
-        case ggml_ir::TensorType::F16:
-          gtype = GGML_TYPE_F16;
-          break;
-        case ggml_ir::TensorType::I64:
-          gtype = GGML_TYPE_I64;
-          break;
-        case ggml_ir::TensorType::I32:
-          gtype = GGML_TYPE_I32;
-          break;
-        case ggml_ir::TensorType::BOOL:
-          // Represent bool tensors as I32 in ggml to avoid unsupported ops on I8
-          // (e.g. get_rows has limited support for I8).
-          gtype = GGML_TYPE_I32;
-          break;
-        case ggml_ir::TensorType::BF16:
-          gtype = GGML_TYPE_BF16;
-          break;
-        case ggml_ir::TensorType::F32:
-        default:
-          gtype = GGML_TYPE_F32;
-          break;
-      }
-
       switch (n_dims) {
-        case 1:
-          gt = ggml_new_tensor_1d(ctx, gtype, ne[0]);
-          break;
-        case 2:
-          gt = ggml_new_tensor_2d(ctx, gtype, ne[0], ne[1]);
-          break;
-        case 3:
-          gt = ggml_new_tensor_3d(ctx, gtype, ne[0], ne[1], ne[2]);
-          break;
-        default:
-          gt = ggml_new_tensor_4d(ctx, gtype, ne[0], ne[1], ne[2], ne[3]);
-          break;
+        case 1:  gt = ggml_new_tensor_1d(ctx, gtype, ne[0]); break;
+        case 2:  gt = ggml_new_tensor_2d(ctx, gtype, ne[0], ne[1]); break;
+        case 3:  gt = ggml_new_tensor_3d(ctx, gtype, ne[0], ne[1], ne[2]); break;
+        default: gt = ggml_new_tensor_4d(ctx, gtype, ne[0], ne[1], ne[2], ne[3]); break;
       }
+      s_last_processed = -(i + 100); // encode: NONE tensor entering tallocr
+      if (i == 1371) {
+        fprintf(stderr, "[ggml_backend] NONE tensor %d: gtype=%d ne=(%lld,%lld,%lld,%lld) nbytes=%zu\n",
+            i, gt->type, (long long)gt->ne[0], (long long)gt->ne[1], (long long)gt->ne[2], (long long)gt->ne[3],
+            ggml_nbytes(gt)); fflush(stderr);
+      }
+      if (i >= 1370 && i <= 1375) {
+        size_t alloc_sz = ggml_backend_buffer_get_alloc_size(host_buf, gt);
+        size_t padded = ((alloc_sz + tallocr.alignment - 1) / tallocr.alignment) * tallocr.alignment;
+        fprintf(stderr, "[ggml_backend] tensor %d: nbytes=%zu alloc_sz=%zu padded=%zu offset=%zu / buf=%zu data=%p buf_ptr=%p\n",
+            i, ggml_nbytes(gt), alloc_sz, padded, tallocr.offset,
+            ggml_backend_buffer_get_size(host_buf), gt->data, (void*)gt->buffer); fflush(stderr);
+      }
+      ggml_tallocr_alloc(&tallocr, gt);
 
       // Load constant data from handle->constant_data (populated by init()).
       if (t->data_key() && t->data_key()->c_str() && std::strlen(t->data_key()->c_str()) > 0) {
@@ -984,58 +1104,301 @@ static Error build_graph(
         }
       }
 
-      if (t->is_input()) {
-        input_pairs.emplace_back(t->input_index(), gt);
-
-        // Pre-populate input tensor data so eager ops downstream
-        // (comparisons, bitwise, etc.) read correct values during build.
-        if (input_data && t->input_index() >= 0 &&
-            static_cast<size_t>(t->input_index()) < input_data->size()) {
-          const auto& ido = (*input_data)[t->input_index()];
-          if (ido.data && gt->data) {
-            const size_t nelem = ggml_nelements(gt);
-            // Handle type conversion: ET may pass I64, ggml tensor may be I32.
-            if (gt->type == GGML_TYPE_I32 && ido.et_scalar_type == 4 /* Long */) {
-              const int64_t* src = static_cast<const int64_t*>(ido.data);
-              int32_t* dst = static_cast<int32_t*>(gt->data);
-              for (size_t j = 0; j < nelem; ++j) dst[j] = static_cast<int32_t>(src[j]);
-            } else if (gt->type == GGML_TYPE_F32 && ido.et_scalar_type == 6 /* Float */) {
-              memcpy(gt->data, ido.data, std::min(ido.nbytes, ggml_nbytes(gt)));
-            } else if (gt->type == GGML_TYPE_I32 && ido.et_scalar_type == 11 /* Bool */) {
-              const bool* src = static_cast<const bool*>(ido.data);
-              int32_t* dst = static_cast<int32_t*>(gt->data);
-              for (size_t j = 0; j < nelem; ++j) dst[j] = src[j] ? 1 : 0;
-            } else {
-              // Best-effort: direct copy (matching types).
-              memcpy(gt->data, ido.data, std::min(ido.nbytes, ggml_nbytes(gt)));
-            }
+      // Pre-populate input tensor data so eager ops downstream
+      // (comparisons, bitwise, etc.) read correct values during build.
+      if (t->is_input() && input_data && t->input_index() >= 0 &&
+          static_cast<size_t>(t->input_index()) < input_data->size()) {
+        const auto& ido = (*input_data)[t->input_index()];
+        if (ido.data) {
+          const size_t nelem = ggml_nelements(gt);
+          if (gt->type == GGML_TYPE_I32 && ido.et_scalar_type == 4 /* Long */) {
+            const int64_t* src = static_cast<const int64_t*>(ido.data);
+            int32_t* dst = static_cast<int32_t*>(gt->data);
+            for (size_t j = 0; j < nelem; ++j) dst[j] = static_cast<int32_t>(src[j]);
+          } else if (gt->type == GGML_TYPE_F32 && ido.et_scalar_type == 6 /* Float */) {
+            memcpy(gt->data, ido.data, std::min(ido.nbytes, ggml_nbytes(gt)));
+          } else if (gt->type == GGML_TYPE_I32 && ido.et_scalar_type == 11 /* Bool */) {
+            const bool* src = static_cast<const bool*>(ido.data);
+            int32_t* dst = static_cast<int32_t*>(gt->data);
+            for (size_t j = 0; j < nelem; ++j) dst[j] = src[j] ? 1 : 0;
+          } else {
+            memcpy(gt->data, ido.data, std::min(ido.nbytes, ggml_nbytes(gt)));
           }
         }
       }
 
+      if (t->is_input()) {
+        input_pairs.emplace_back(t->input_index(), gt);
+      }
+      if (t->is_output()) {
+        int out_idx = t->input_index();
+        output_pairs.emplace_back(out_idx >= 0 ? out_idx : (int)output_pairs.size(), gt);
+      }
       id_to_tensor[tid] = gt;
+      continue;
+    }
 
-    } else {
-      // Op tensor: build the ggml operation
-      struct ggml_tensor* gt = nullptr;
+    // --- Op tensor: build the ggml operation ---
+    s_last_processed = -(i + 10000); // encode: op tensor entering dispatch
+    if (i >= 1374 && i <= 1378) {
+      fprintf(stderr, "[ggml_backend] OP tensor %d: op=%d ne=(%lld,%lld,%lld,%lld)\n",
+          i, (int)op, (long long)ne[0], (long long)ne[1], (long long)ne[2], (long long)ne[3]); fflush(stderr);
+    }
+    struct ggml_tensor* gt = nullptr;
 
-      // Resolve sources
-      std::vector<struct ggml_tensor*> srcs;
-      if (t->src_ids()) {
-        for (size_t s = 0; s < t->src_ids()->size(); ++s) {
-          int src_id = t->src_ids()->Get(s);
-          srcs.push_back(id_to_tensor[src_id]);
+    // Resolve sources
+    std::vector<struct ggml_tensor*> srcs;
+    if (t->src_ids()) {
+      for (size_t s = 0; s < t->src_ids()->size(); ++s) {
+        int src_id = t->src_ids()->Get(s);
+        srcs.push_back(id_to_tensor[src_id]);
+      }
+    }
+    // ggml custom ops are CPU callbacks; force them to CPU when mixed
+    // backends are active so GPU backends never try to encode GGML_OP_CUSTOM.
+    auto pin_to_cpu = [&](struct ggml_tensor* x) {
+      if (x && handle->sched && handle->backend_cpu) {
+        ggml_backend_sched_set_tensor_backend(handle->sched, x, handle->backend_cpu);
+      }
+    };
+
+    // ── Shared broadcast helpers for binary ops (ADD, MUL, DIV, SUB) ──
+    auto try_repeat_1d_to_match = [&](struct ggml_tensor * small,
+                                     struct ggml_tensor * big) -> struct ggml_tensor * {
+      // If `small` is effectively 1D (exactly one dim > 1) and its length matches
+      // one of big's dims, reshape+permute it so the matching dim aligns, then repeat.
+      int non1 = 0;
+      int non1_ax = -1;
+      for (int ax = 0; ax < 4; ++ax) {
+        if (small->ne[ax] != 1) {
+          non1++;
+          non1_ax = ax;
         }
       }
-      // ggml custom ops are CPU callbacks; force them to CPU when mixed
-      // backends are active so GPU backends never try to encode GGML_OP_CUSTOM.
-      auto pin_to_cpu = [&](struct ggml_tensor* x) {
-        if (x && handle->sched && handle->backend_cpu) {
-          ggml_backend_sched_set_tensor_backend(handle->sched, x, handle->backend_cpu);
+      if (non1 != 1) {
+        return nullptr;
+      }
+      const int64_t n = small->ne[non1_ax];
+
+      // Normalize to a base view where n is in axis0.
+      struct ggml_tensor * base = small;
+      if (non1_ax != 0) {
+        // permute so that old non1_ax becomes new axis0
+        int axes[4] = {0,1,2,3};
+        axes[0] = non1_ax;
+        int out = 1;
+        for (int ax = 0; ax < 4; ++ax) {
+          if (ax == non1_ax) continue;
+          axes[out++] = ax;
         }
+        base = ggml_permute(ctx, base, axes[0], axes[1], axes[2], axes[3]);
+        base = ggml_cont(ctx, base);
+      }
+      for (int ax = 0; ax < 4; ++ax) {
+        if (big->ne[ax] != n) {
+          continue;
+        }
+        // Start as 4D [n,1,1,1]
+        struct ggml_tensor * s4 = ggml_reshape_4d(ctx, base, n, 1, 1, 1);
+        // Permute so `n` ends up in axis `ax`
+        int p0 = 0, p1 = 1, p2 = 2, p3 = 3;
+        if (ax == 0) {
+          // already in axis0
+        } else if (ax == 1) {
+          // move axis0 -> axis1
+          p0 = 1; p1 = 0; p2 = 2; p3 = 3;
+        } else if (ax == 2) {
+          p0 = 1; p1 = 2; p2 = 0; p3 = 3;
+        } else {
+          // ax == 3: move axis0 -> axis3
+          p0 = 1; p1 = 2; p2 = 3; p3 = 0;
+        }
+        s4 = ggml_permute(ctx, s4, p0, p1, p2, p3);
+        // Make the view contiguous to satisfy ggml_can_repeat in some cases.
+        s4 = ggml_cont(ctx, s4);
+        if (ggml_can_repeat(s4, big)) {
+          return ggml_repeat(ctx, s4, big);
+        }
+      }
+      return nullptr;
+    };
+
+    auto try_permute_to_match = [&](struct ggml_tensor * src,
+                                   struct ggml_tensor * dst) -> struct ggml_tensor * {
+      // If src and dst have the same multiset of extents, try a few permutes.
+      int64_t aa[4] = {dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]};
+      int64_t bb[4] = {src->ne[0], src->ne[1], src->ne[2], src->ne[3]};
+      for (int i = 0; i < 4; ++i) {
+        for (int j = i + 1; j < 4; ++j) {
+          if (aa[j] < aa[i]) { auto t = aa[i]; aa[i] = aa[j]; aa[j] = t; }
+          if (bb[j] < bb[i]) { auto t = bb[i]; bb[i] = bb[j]; bb[j] = t; }
+        }
+      }
+      for (int i = 0; i < 4; ++i) {
+        if (aa[i] != bb[i]) return nullptr;
+      }
+
+      const int perms[][4] = {
+        {0,1,2,3},
+        {3,1,2,0},
+        {0,2,1,3},
+        {1,0,2,3},
+        {2,1,0,3},
+        {1,2,3,0},
+        {2,3,1,0},
+        {3,2,1,0},
+      };
+      for (const auto & p : perms) {
+        struct ggml_tensor * t = ggml_permute(ctx, src, p[0], p[1], p[2], p[3]);
+        t = ggml_cont(ctx, t);
+        if (ggml_are_same_shape(t, dst)) {
+          return t;
+        }
+      }
+      return nullptr;
+    };
+
+    // General PyTorch-style broadcast: reshape `small` by placing its non-1
+    // dims into axes of `big` where they divide evenly, then ggml_repeat.
+    // Handles cases like mask (13,13,1,1) → attention (16,13,256,1).
+    auto try_reshape_broadcast = [&](struct ggml_tensor * small,
+                                    struct ggml_tensor * big) -> struct ggml_tensor * {
+      // Collect non-1 dims of small.
+      struct { int ax; int64_t n; } sdims[4];
+      int ns = 0;
+      for (int d = 0; d < 4; ++d) {
+        if (small->ne[d] != 1) {
+          sdims[ns++] = {d, small->ne[d]};
+        }
+      }
+      if (ns == 0 || ns > 4) return nullptr;
+
+      // For each non-1 dim of small, find candidate axes in big where it divides.
+      // We brute-force all assignments (at most 4^4 = 256 combos).
+      // Each small dim must map to a distinct big axis.
+      int candidates[4][4];
+      int ncand[4];
+      for (int si = 0; si < ns; ++si) {
+        ncand[si] = 0;
+        for (int bi = 0; bi < 4; ++bi) {
+          if (big->ne[bi] % sdims[si].n == 0) {
+            candidates[si][ncand[si]++] = bi;
+          }
+        }
+        if (ncand[si] == 0) return nullptr;
+      }
+
+      // Try all assignments via recursive enumeration (iterative for up to 4).
+      int assign[4] = {0, 0, 0, 0};
+      bool used[4];
+
+      // Helper: check current assignment combo
+      auto try_assignment = [&]() -> struct ggml_tensor * {
+        // Check uniqueness of big-axis assignments.
+        memset(used, 0, sizeof(used));
+        for (int si = 0; si < ns; ++si) {
+          int bi = candidates[si][assign[si]];
+          if (used[bi]) return nullptr;
+          used[bi] = true;
+        }
+        // Build reshaped dims: start with all 1s, place small dims.
+        int64_t new_ne[4] = {1, 1, 1, 1};
+        for (int si = 0; si < ns; ++si) {
+          new_ne[candidates[si][assign[si]]] = sdims[si].n;
+        }
+        // We need to reshape `small` from its current layout to new_ne.
+        // First flatten small to 1D, then reshape to new_ne.
+        int64_t nel = ggml_nelements(small);
+        struct ggml_tensor * flat = ggml_cont(ctx, ggml_reshape_1d(ctx, small, nel));
+        struct ggml_tensor * reshaped = ggml_reshape_4d(ctx, flat, new_ne[0], new_ne[1], new_ne[2], new_ne[3]);
+        if (ggml_can_repeat(reshaped, big)) {
+          return ggml_repeat(ctx, reshaped, big);
+        }
+        return nullptr;
       };
 
-      switch (op) {
+      // Enumerate all assignment combinations.
+      if (ns == 1) {
+        for (assign[0] = 0; assign[0] < ncand[0]; ++assign[0]) {
+          if (auto * r = try_assignment()) return r;
+        }
+      } else if (ns == 2) {
+        for (assign[0] = 0; assign[0] < ncand[0]; ++assign[0])
+          for (assign[1] = 0; assign[1] < ncand[1]; ++assign[1]) {
+            if (auto * r = try_assignment()) return r;
+          }
+      } else if (ns == 3) {
+        for (assign[0] = 0; assign[0] < ncand[0]; ++assign[0])
+          for (assign[1] = 0; assign[1] < ncand[1]; ++assign[1])
+            for (assign[2] = 0; assign[2] < ncand[2]; ++assign[2]) {
+              if (auto * r = try_assignment()) return r;
+            }
+      } else {
+        for (assign[0] = 0; assign[0] < ncand[0]; ++assign[0])
+          for (assign[1] = 0; assign[1] < ncand[1]; ++assign[1])
+            for (assign[2] = 0; assign[2] < ncand[2]; ++assign[2])
+              for (assign[3] = 0; assign[3] < ncand[3]; ++assign[3]) {
+                if (auto * r = try_assignment()) return r;
+              }
+      }
+      return nullptr;
+    };
+
+    // Slice a larger (max-shape) tensor down to match a smaller (runtime-shape)
+    // tensor. Used when a pre-computed constant was exported at max_seq_len but
+    // the runtime sequence is shorter.
+    auto try_slice_to_match = [&](struct ggml_tensor * big,
+                                 struct ggml_tensor * small) -> struct ggml_tensor * {
+      bool any_diff = false;
+      for (int d = 0; d < 4; ++d) {
+        if (big->ne[d] < small->ne[d]) return nullptr;
+        if (big->ne[d] != small->ne[d]) any_diff = true;
+      }
+      if (!any_diff) return nullptr;
+      auto * v = ggml_view_4d(ctx, big,
+          small->ne[0], small->ne[1], small->ne[2], small->ne[3],
+          big->nb[1], big->nb[2], big->nb[3], 0);
+      return ggml_cont(ctx, v);
+    };
+
+    // Shared broadcast resolution for binary ops. Returns true on success,
+    // updating a and b in place. Returns false on failure.
+    auto resolve_broadcast = [&](struct ggml_tensor *& a, struct ggml_tensor *& b,
+                                const char * op_name) -> bool {
+      if (ggml_are_same_shape(a, b)) return true;
+      if (ggml_can_repeat(b, a)) {
+        b = ggml_cont(ctx, ggml_repeat(ctx, b, a));
+      } else if (ggml_can_repeat(a, b)) {
+        a = ggml_cont(ctx, ggml_repeat(ctx, a, b));
+      } else if (auto * bb = try_repeat_1d_to_match(b, a)) {
+        b = bb;
+      } else if (auto * aa = try_repeat_1d_to_match(a, b)) {
+        a = aa;
+      } else if (auto * bp = try_permute_to_match(b, a)) {
+        b = bp;
+      } else if (auto * ap = try_permute_to_match(a, b)) {
+        a = ap;
+      } else if (auto * bb2 = try_reshape_broadcast(b, a)) {
+        b = bb2;
+      } else if (auto * aa2 = try_reshape_broadcast(a, b)) {
+        a = aa2;
+      } else if (auto * as = try_slice_to_match(a, b)) {
+        a = as;
+      } else if (auto * bs = try_slice_to_match(b, a)) {
+        b = bs;
+      } else {
+        fprintf(stderr,
+                "[executorch-ggml] %s shape mismatch not broadcastable: "
+                "a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
+                op_name,
+                (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
+                (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
+        return false;
+      }
+      return true;
+    };
+
+    switch (op) {
         case ggml_ir::OpCode::ADD: {
           struct ggml_tensor* a = srcs[0];
           struct ggml_tensor* b = srcs[1];
@@ -1043,6 +1406,42 @@ static Error build_graph(
           // Eager scalar path for enc_len-style computations.
           if (auto* eager = try_eager_scalar_binop(ctx, a, b, '+')) {
             gt = eager;
+            break;
+          }
+
+          // For int64 types with data available, use eager element-wise add
+          // with manual broadcasting. Must be done BEFORE the broadcast
+          // handling below, which creates ggml ops with null data.
+          if (a->type == GGML_TYPE_I64 && b->type == GGML_TYPE_I64
+              && a->data && b->data) {
+            // Compute output shape (element-wise max of dims).
+            int64_t out_ne[4];
+            for (int d = 0; d < 4; ++d) {
+              out_ne[d] = std::max(a->ne[d], b->ne[d]);
+            }
+            ggml_set_no_alloc(ctx, false);
+            gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I64, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+            ggml_set_no_alloc(ctx, true);
+            int64_t* out_data = static_cast<int64_t*>(gt->data);
+            const int64_t* a_data = static_cast<const int64_t*>(a->data);
+            const int64_t* b_data = static_cast<const int64_t*>(b->data);
+            for (int64_t d3 = 0; d3 < out_ne[3]; ++d3) {
+              for (int64_t d2 = 0; d2 < out_ne[2]; ++d2) {
+                for (int64_t d1 = 0; d1 < out_ne[1]; ++d1) {
+                  for (int64_t d0 = 0; d0 < out_ne[0]; ++d0) {
+                    int64_t ai = (d0 % a->ne[0]) + (d1 % a->ne[1]) * a->ne[0]
+                               + (d2 % a->ne[2]) * a->ne[0] * a->ne[1]
+                               + (d3 % a->ne[3]) * a->ne[0] * a->ne[1] * a->ne[2];
+                    int64_t bi = (d0 % b->ne[0]) + (d1 % b->ne[1]) * b->ne[0]
+                               + (d2 % b->ne[2]) * b->ne[0] * b->ne[1]
+                               + (d3 % b->ne[3]) * b->ne[0] * b->ne[1] * b->ne[2];
+                    int64_t oi = d0 + d1 * out_ne[0] + d2 * out_ne[0] * out_ne[1]
+                               + d3 * out_ne[0] * out_ne[1] * out_ne[2];
+                    out_data[oi] = a_data[ai] + b_data[bi];
+                  }
+                }
+              }
+            }
             break;
           }
 
@@ -1055,139 +1454,12 @@ static Error build_graph(
             if (b->type != tgt) b = safe_ggml_cast(ctx, b, tgt);
           }
 
-          // Handle broadcast by repeating the smaller tensor to match the larger.
-          if (!ggml_are_same_shape(a, b)) {
-            auto try_repeat_1d_to_match = [&](struct ggml_tensor * small,
-                                             struct ggml_tensor * big) -> struct ggml_tensor * {
-              // If `small` is effectively 1D (exactly one dim > 1) and its length matches
-              // one of big's dims, reshape+permute it so the matching dim aligns, then repeat.
-              int non1 = 0;
-              int non1_ax = -1;
-              for (int ax = 0; ax < 4; ++ax) {
-                if (small->ne[ax] != 1) {
-                  non1++;
-                  non1_ax = ax;
-                }
-              }
-              if (non1 != 1) {
-                return nullptr;
-              }
-              const int64_t n = small->ne[non1_ax];
-
-              // Normalize to a base view where n is in axis0.
-              struct ggml_tensor * base = small;
-              if (non1_ax != 0) {
-                // permute so that old non1_ax becomes new axis0
-                int axes[4] = {0,1,2,3};
-                axes[0] = non1_ax;
-                int out = 1;
-                for (int ax = 0; ax < 4; ++ax) {
-                  if (ax == non1_ax) continue;
-                  axes[out++] = ax;
-                }
-                base = ggml_permute(ctx, base, axes[0], axes[1], axes[2], axes[3]);
-                base = ggml_cont(ctx, base);
-              }
-              for (int ax = 0; ax < 4; ++ax) {
-                if (big->ne[ax] != n) {
-                  continue;
-                }
-                // Start as 4D [n,1,1,1]
-                struct ggml_tensor * s4 = ggml_reshape_4d(ctx, base, n, 1, 1, 1);
-                // Permute so `n` ends up in axis `ax`
-                int p0 = 0, p1 = 1, p2 = 2, p3 = 3;
-                if (ax == 0) {
-                  // already in axis0
-                } else if (ax == 1) {
-                  // move axis0 -> axis1
-                  p0 = 1; p1 = 0; p2 = 2; p3 = 3;
-                } else if (ax == 2) {
-                  p0 = 1; p1 = 2; p2 = 0; p3 = 3;
-                } else {
-                  // ax == 3: move axis0 -> axis3
-                  p0 = 1; p1 = 2; p2 = 3; p3 = 0;
-                }
-                s4 = ggml_permute(ctx, s4, p0, p1, p2, p3);
-                // Make the view contiguous to satisfy ggml_can_repeat in some cases.
-                s4 = ggml_cont(ctx, s4);
-                if (ggml_can_repeat(s4, big)) {
-                  return ggml_repeat(ctx, s4, big);
-                }
-              }
-              return nullptr;
-            };
-
-            auto try_permute_to_match = [&](struct ggml_tensor * src,
-                                           struct ggml_tensor * dst) -> struct ggml_tensor * {
-              // If src and dst have the same multiset of extents, try a few permutes.
-              int64_t aa[4] = {dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]};
-              int64_t bb[4] = {src->ne[0], src->ne[1], src->ne[2], src->ne[3]};
-              for (int i = 0; i < 4; ++i) {
-                for (int j = i + 1; j < 4; ++j) {
-                  if (aa[j] < aa[i]) { auto t = aa[i]; aa[i] = aa[j]; aa[j] = t; }
-                  if (bb[j] < bb[i]) { auto t = bb[i]; bb[i] = bb[j]; bb[j] = t; }
-                }
-              }
-              for (int i = 0; i < 4; ++i) {
-                if (aa[i] != bb[i]) return nullptr;
-              }
-
-              const int perms[][4] = {
-                {0,1,2,3},
-                {3,1,2,0},
-                {0,2,1,3},
-                {1,0,2,3},
-                {2,1,0,3},
-                {1,2,3,0},
-                {2,3,1,0},
-                {3,2,1,0},
-              };
-              for (const auto & p : perms) {
-                struct ggml_tensor * t = ggml_permute(ctx, src, p[0], p[1], p[2], p[3]);
-                t = ggml_cont(ctx, t);
-                if (ggml_are_same_shape(t, dst)) {
-                  return t;
-                }
-              }
-              return nullptr;
-            };
-
-            if (ggml_can_repeat(b, a)) {
-              b = ggml_cont(ctx, ggml_repeat(ctx, b, a));
-            } else if (ggml_can_repeat(a, b)) {
-              a = ggml_cont(ctx, ggml_repeat(ctx, a, b));
-            } else {
-              // Try 1D→ND broadcast alignment
-              if (auto * bb = try_repeat_1d_to_match(b, a)) {
-                b = bb;
-              } else if (auto * aa = try_repeat_1d_to_match(a, b)) {
-                a = aa;
-              } else if (auto * bp = try_permute_to_match(b, a)) {
-                b = bp;
-              } else if (auto * ap = try_permute_to_match(a, b)) {
-                a = ap;
-              } else {
-                fprintf(stderr,
-                        "[executorch-ggml] ADD shape mismatch not broadcastable: a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
-                        (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
-                        (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
-                ggml_free(ctx);
-                return Error::InvalidArgument;
-              }
-            }
+          if (!resolve_broadcast(a, b, "ADD")) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
           }
 
-          // For int64 types, use custom element-wise add
-          if (a->type == GGML_TYPE_I64) {
-            gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I64, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
-            const size_t nelem = ggml_nelements(gt);
-            const int64_t* a_data = static_cast<const int64_t*>(a->data);
-            const int64_t* b_data = static_cast<const int64_t*>(b->data);
-            int64_t* out_data = static_cast<int64_t*>(gt->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = a_data[i] + b_data[i];
-          } else {
-            gt = ggml_add(ctx, a, b);
-          }
+          gt = ggml_add(ctx, a, b);
           break;
         }
 
@@ -1207,6 +1479,10 @@ static Error build_graph(
           if (ggml_nelements(a) < ggml_nelements(b)) {
             std::swap(a, b);
           }
+          if (!resolve_broadcast(a, b, "MUL")) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
+          }
           gt = ggml_mul(ctx, a, b);
           break;
         }
@@ -1218,6 +1494,10 @@ static Error build_graph(
           if (auto* eager = try_eager_scalar_binop(ctx, a, b, '/')) {
             gt = eager;
             break;
+          }
+          if (!resolve_broadcast(a, b, "DIV")) {
+            ggml_free(ctx);
+            return Error::InvalidArgument;
           }
           gt = ggml_div(ctx, a, b);
           break;
@@ -1288,7 +1568,7 @@ static Error build_graph(
           // ggml_div(a, b) requires b to be repeatable to a's shape.
           // Since we want 1/sqrt(x), we need a to have x's shape and be filled with 1.0.
           struct ggml_tensor* sx  = ggml_sqrt(ctx, srcs[0]);
-          struct ggml_tensor* one = ggml_new_f32(ctx, 1.0f);
+          struct ggml_tensor* one = make_f32_scalar(ctx, 1.0f);
           // Repeat the scalar 1.0 to match sqrt's shape
           struct ggml_tensor* one_rep = ggml_repeat(ctx, one, sx);
           gt = ggml_div(ctx, one_rep, sx);
@@ -1396,11 +1676,43 @@ static Error build_graph(
           // Note: groups parameter not directly supported in ggml API
           // For depthwise conv (groups > 1), use ggml_conv_2d_dw
           // For regular conv (groups == 1), use ggml_conv_2d
-          if (op == ggml_ir::OpCode::CONV_2D_DW || groups > 1) {
-            // Depthwise convolution
-            gt = ggml_conv_2d_dw(ctx, weight, input, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w);
+          // Pointwise 2D conv (k=1x1, s=1x1, p=0, d=1x1, groups=1) is a matmul.
+          // Bypass ggml_conv_2d (F16 im2col) to stay in F32.
+          int64_t kh = weight->ne[1]; // ggml layout: [kW, kH, C_in, C_out]
+          int64_t kw = weight->ne[0];
+          bool is_pointwise_2d = (kh == 1 && kw == 1
+                                  && stride_h == 1 && stride_w == 1
+                                  && pad_h == 0 && pad_w == 0
+                                  && dilation_h == 1 && dilation_w == 1
+                                  && groups == 1);
+
+          if (is_pointwise_2d) {
+            // weight ggml shape: [kW=1, kH=1, C_in, C_out] → [C_in, C_out]
+            struct ggml_tensor* w2d = ggml_reshape_2d(ctx, weight,
+                                                      weight->ne[2], weight->ne[3]);
+            // input ggml shape: [W, H, C_in, N] → collapse spatial to [W*H, C_in, N, 1]
+            struct ggml_tensor* inp3d = ggml_reshape_3d(ctx, input,
+                                                        input->ne[0] * input->ne[1],
+                                                        input->ne[2],
+                                                        input->ne[3]);
+            // ggml_mul_mat contracts on ne[0], but inp3d has W*H in ne[0].
+            // Transpose so C_in is in ne[0], do matmul, transpose back.
+            struct ggml_tensor* inp_t = ggml_cont(ctx, ggml_transpose(ctx, inp3d));
+            // inp_t: [C_in, W*H, N, 1]
+            struct ggml_tensor* mm = ggml_mul_mat(ctx, w2d, inp_t);
+            // mm: [C_out, W*H, N, 1]
+            struct ggml_tensor* mm_t = ggml_cont(ctx, ggml_transpose(ctx, mm));
+            // mm_t: [W*H, C_out, N, 1]
+            // Reshape back to [W, H, C_out, N]
+            gt = ggml_reshape_4d(ctx, mm_t,
+                                 input->ne[0], input->ne[1],
+                                 weight->ne[3], input->ne[3]);
+          } else if (op == ggml_ir::OpCode::CONV_2D_DW || groups > 1) {
+            // Use ggml_conv_2d_dw_direct which avoids im2col and works in
+            // the input's native type (F32), preserving precision.
+            gt = ggml_conv_2d_dw_direct(ctx, weight, input, stride_w, stride_h, pad_w, pad_h, dilation_w, dilation_h);
           } else {
-            // Regular convolution
+            // Regular convolution — uses im2col in the kernel's type.
             gt = ggml_conv_2d(ctx, weight, input, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w);
           }
 
@@ -2050,7 +2362,9 @@ static Error build_graph(
           // This is needed for enc_len computation chains where F32→I64
           // casts produce the final output scalar.
           if (ggml_nelements(src) == 1 && src->data) {
+            ggml_set_no_alloc(ctx, false);
             gt = ggml_new_tensor_4d(ctx, target_type, 1, 1, 1, 1);
+            ggml_set_no_alloc(ctx, true);
             gt->op = GGML_OP_NONE;
             double val = read_scalar_f64_ptr(static_cast<const char*>(src->data), src->type);
             write_scalar_f64_ptr(static_cast<char*>(gt->data), target_type, val);
@@ -2061,7 +2375,9 @@ static Error build_graph(
           // so I64-source casts must be done eagerly on the CPU.
           if (src->type == GGML_TYPE_I64) {
             // Create output tensor for eager conversion.
+            ggml_set_no_alloc(ctx, false);
             gt = ggml_new_tensor(ctx, target_type, GGML_MAX_DIMS, src->ne);
+            ggml_set_no_alloc(ctx, true);
 
             // Check if src is an input tensor (data only available at execute time).
             bool is_input_src = false;
@@ -2159,15 +2475,41 @@ static Error build_graph(
             gt = eager;
             break;
           }
-          // For int64 types, use custom element-wise sub
-          if (a->type == GGML_TYPE_I64) {
-            gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I64, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
-            const size_t nelem = ggml_nelements(gt);
+          // For int64 types with data, use eager element-wise sub with broadcasting.
+          if (a->type == GGML_TYPE_I64 && b->type == GGML_TYPE_I64
+              && a->data && b->data) {
+            int64_t out_ne[4];
+            for (int d = 0; d < 4; ++d) {
+              out_ne[d] = std::max(a->ne[d], b->ne[d]);
+            }
+            ggml_set_no_alloc(ctx, false);
+            gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I64, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+            ggml_set_no_alloc(ctx, true);
+            int64_t* out_data = static_cast<int64_t*>(gt->data);
             const int64_t* a_data = static_cast<const int64_t*>(a->data);
             const int64_t* b_data = static_cast<const int64_t*>(b->data);
-            int64_t* out_data = static_cast<int64_t*>(gt->data);
-            for (size_t i = 0; i < nelem; ++i) out_data[i] = a_data[i] - b_data[i];
+            for (int64_t d3 = 0; d3 < out_ne[3]; ++d3) {
+              for (int64_t d2 = 0; d2 < out_ne[2]; ++d2) {
+                for (int64_t d1 = 0; d1 < out_ne[1]; ++d1) {
+                  for (int64_t d0 = 0; d0 < out_ne[0]; ++d0) {
+                    int64_t ai = (d0 % a->ne[0]) + (d1 % a->ne[1]) * a->ne[0]
+                               + (d2 % a->ne[2]) * a->ne[0] * a->ne[1]
+                               + (d3 % a->ne[3]) * a->ne[0] * a->ne[1] * a->ne[2];
+                    int64_t bi = (d0 % b->ne[0]) + (d1 % b->ne[1]) * b->ne[0]
+                               + (d2 % b->ne[2]) * b->ne[0] * b->ne[1]
+                               + (d3 % b->ne[3]) * b->ne[0] * b->ne[1] * b->ne[2];
+                    int64_t oi = d0 + d1 * out_ne[0] + d2 * out_ne[0] * out_ne[1]
+                               + d3 * out_ne[0] * out_ne[1] * out_ne[2];
+                    out_data[oi] = a_data[ai] - b_data[bi];
+                  }
+                }
+              }
+            }
           } else {
+            if (!resolve_broadcast(a, b, "SUB")) {
+              ggml_free(ctx);
+              return Error::InvalidArgument;
+            }
             gt = ggml_sub(ctx, a, b);
           }
           break;
@@ -2280,10 +2622,14 @@ static Error build_graph(
           struct ggml_tensor* x = srcs[1];
           struct ggml_tensor* y = srcs[2];
 
-          // Cast condition to float if needed
+          // Cast condition to float if needed.
+          // Legacy .pte files may store bool masks as F16 with 0.0/-inf
+          // (for flash_attn additive bias). Clamp to [0, 1] to recover
+          // proper boolean semantics for the arithmetic emulation below.
           if (cond->type != GGML_TYPE_F32) {
             cond = safe_ggml_cast(ctx, cond, GGML_TYPE_F32);
           }
+          cond = ggml_clamp(ctx, cond, 0.0f, 1.0f);
 
           // Ensure all three tensors have the same shape for the
           // element-wise arithmetic that implements WHERE.
@@ -2303,7 +2649,7 @@ static Error build_graph(
           }
 
           // result = cond * x + (1 - cond) * y
-          struct ggml_tensor* one = ggml_new_f32(ctx, 1.0f);
+          struct ggml_tensor* one = make_f32_scalar(ctx, 1.0f);
           struct ggml_tensor* one_rep = ggml_repeat(ctx, one, cond);
           struct ggml_tensor* not_cond = ggml_sub(ctx, one_rep, cond);
 
@@ -2335,7 +2681,9 @@ static Error build_graph(
 
           // sym_dim_ids resolution already applied to ne[] above.
 
+          ggml_set_no_alloc(ctx, false);
           gt = ggml_new_tensor_4d(ctx, out_type, ne[0], ne[1], ne[2], ne[3]);
+          ggml_set_no_alloc(ctx, true);
           const size_t nelem = ggml_nelements(gt);
 
           // Fill with arange values
@@ -2377,7 +2725,9 @@ static Error build_graph(
           }
 
           // sym_dim_ids resolution already applied to ne[] above.
+          ggml_set_no_alloc(ctx, false);
           gt = ggml_new_tensor_4d(ctx, out_type, ne[0], ne[1], ne[2], ne[3]);
+          ggml_set_no_alloc(ctx, true);
           const size_t nelem = ggml_nelements(gt);
 
           if (out_type == GGML_TYPE_I64) {
@@ -2409,7 +2759,9 @@ static Error build_graph(
           ggml_type out_type = src->type;
 
           // CUMSUM output shape = input shape (use input, not stale IR ne[]).
+          ggml_set_no_alloc(ctx, false);
           gt = ggml_new_tensor_4d(ctx, out_type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+          ggml_set_no_alloc(ctx, true);
 
           // Convert PyTorch dim to ggml axis
           int ggml_axis = (ndim - 1) - dim;
@@ -2472,7 +2824,9 @@ static Error build_graph(
           struct ggml_tensor* b;
           if (is_scalar) {
             // Create a scalar-filled constant tensor as the second argument.
+            ggml_set_no_alloc(ctx, false);
             b = ggml_new_tensor_4d(ctx, a->type, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+            ggml_set_no_alloc(ctx, true);
             const size_t n = ggml_nelements(b);
             if (a->type == GGML_TYPE_I64)      { auto* d=(int64_t*)b->data; for(size_t j=0;j<n;++j) d[j]=(int64_t)scalar; }
             else if (a->type == GGML_TYPE_I32)  { auto* d=(int32_t*)b->data; for(size_t j=0;j<n;++j) d[j]=(int32_t)scalar; }
@@ -2496,7 +2850,9 @@ static Error build_graph(
             memcpy(&is_scalar, t->op_params()->data() + 8, 4);
           }
           struct ggml_tensor* a = srcs[0];
+          ggml_set_no_alloc(ctx, false);
           struct ggml_tensor* b = ggml_new_tensor_4d(ctx, a->type, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+          ggml_set_no_alloc(ctx, true);
           const size_t n = ggml_nelements(b);
           if (a->type == GGML_TYPE_I64)      { auto* d=(int64_t*)b->data; for(size_t j=0;j<n;++j) d[j]=(int64_t)scalar; }
           else if (a->type == GGML_TYPE_I32)  { auto* d=(int32_t*)b->data; for(size_t j=0;j<n;++j) d[j]=(int32_t)scalar; }
@@ -2592,7 +2948,9 @@ static Error build_graph(
 
           int64_t any_ne[4] = {src->ne[0], src->ne[1], src->ne[2], src->ne[3]};
           any_ne[ggml_axis] = 1;
+          ggml_set_no_alloc(ctx, false);
           gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, any_ne[0], any_ne[1], any_ne[2], any_ne[3]);
+          ggml_set_no_alloc(ctx, true);
           const size_t nelem_out = ggml_nelements(gt);
 
           const int32_t* in_data = static_cast<const int32_t*>(src->data);
@@ -2663,7 +3021,9 @@ static Error build_graph(
 
           // Create indices tensor for ggml_set_rows
           int64_t seq_len_new = value->ne[ggml_axis];
+          ggml_set_no_alloc(ctx, false);
           struct ggml_tensor* indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, seq_len_new);
+          ggml_set_no_alloc(ctx, true);
           int64_t* idx_data = static_cast<int64_t*>(indices->data);
           for (int64_t i = 0; i < seq_len_new; ++i) {
             idx_data[i] = start_pos + i;
@@ -2745,10 +3105,10 @@ static Error build_graph(
           // We need scale as [1, C, 1, 1] to match axis 1 (C channel).
           // Reshape scale/shift to [1, C, 1, 1] for correct broadcasting.
 
-          struct ggml_tensor* var_eps = ggml_add1(ctx, var, ggml_new_f32(ctx, eps));
+          struct ggml_tensor* var_eps = ggml_add1(ctx, var, make_f32_scalar(ctx, eps));
           struct ggml_tensor* inv_std = ggml_sqrt(ctx, var_eps);
           // 1/inv_std
-          struct ggml_tensor* one = ggml_new_f32(ctx, 1.0f);
+          struct ggml_tensor* one = make_f32_scalar(ctx, 1.0f);
           struct ggml_tensor* one_rep = ggml_repeat(ctx, one, inv_std);
           struct ggml_tensor* recip_std = ggml_div(ctx, one_rep, inv_std);
 
@@ -2824,8 +3184,35 @@ static Error build_graph(
             memcpy(&groups, data + 12, sizeof(int32_t));
           }
 
-          if (op == ggml_ir::OpCode::CONV_1D_DW || groups > 1) {
-            gt = ggml_conv_1d_dw(ctx, weight, input, stride, pad, dilation);
+          // Pointwise conv (k=1, s=1, p=0, d=1, groups=1) is just a matmul.
+          // Bypass ggml_conv_1d (which uses F16 im2col) to stay in F32.
+          int64_t kernel_size = weight->ne[0];
+          bool is_pointwise = (kernel_size == 1 && stride == 1 && pad == 0
+                               && dilation == 1 && groups == 1);
+
+          if (is_pointwise) {
+            // weight ggml shape: [K=1, C_in, C_out, 1] → squeeze to [C_in, C_out]
+            struct ggml_tensor* w2d = ggml_reshape_2d(ctx, weight,
+                                                      weight->ne[1], weight->ne[2]);
+            // input ggml shape: [L, C_in, B, 1]
+            // ggml_mul_mat contracts on ne[0], but input has L in ne[0].
+            // Transpose so C_in is in ne[0], do matmul, transpose back.
+            struct ggml_tensor* inp_t = ggml_cont(ctx, ggml_transpose(ctx, input));
+            // inp_t: [C_in, L, B, 1]
+            struct ggml_tensor* mm = ggml_mul_mat(ctx, w2d, inp_t);
+            // mm: [C_out, L, B, 1]
+            gt = ggml_cont(ctx, ggml_transpose(ctx, mm));
+            // gt: [L, C_out, B, 1]
+          } else if (op == ggml_ir::OpCode::CONV_1D_DW || groups > 1) {
+            // Use custom F32 depthwise conv to avoid ggml's im2col F16 path.
+            // weight ggml shape: [K, 1, C, 1], input ggml shape: [L, C, B, 1]
+            int64_t L_out = (input->ne[0] + 2 * pad - dilation * (weight->ne[0] - 1) - 1) / stride + 1;
+            auto* params = new Conv1dDwParams{stride, pad, dilation};
+            struct ggml_tensor* args[2] = {weight, input};
+            gt = ggml_custom_4d(ctx, GGML_TYPE_F32,
+                L_out, weight->ne[2], input->ne[2], 1,
+                args, 2, ggml_custom_conv_1d_dw_f32, GGML_N_TASKS_MAX, params);
+            pin_to_cpu(gt);
           } else {
             gt = ggml_conv_1d(ctx, weight, input, stride, pad, dilation);
           }
@@ -2892,30 +3279,14 @@ static Error build_graph(
           return Error::InvalidArgument;
       }
 
-      id_to_tensor[tid] = gt;
-
-    }
-
+    id_to_tensor[tid] = gt;
+    last_processed = i;
     if (t->is_output()) {
-      int out_idx = t->input_index();  // reused for output ordering
-      output_pairs.emplace_back(out_idx >= 0 ? out_idx : (int)output_pairs.size(), id_to_tensor[tid]);
+      int out_idx = t->input_index();
+      output_pairs.emplace_back(out_idx >= 0 ? out_idx : (int)output_pairs.size(), gt);
     }
   }
-  //
-  // KEY CHANGE for constants:
-  //   Instead of reading from NamedDataMap (context.get_named_data_map()),
-  //   find matching entry in handle->constant_data by IR tensor id:
-  //
-  //     for (auto& sc : handle->constant_data) {
-  //       if (sc.ir_tensor_id == tid) {
-  //         memcpy(gt->data, sc.data.data(), nbytes);
-  //         break;
-  //       }
-  //     }
-  //
-  // KEY CHANGE (M2+ only, skip for M1):
-  //   For input tensors with sym_dim_ids, override ne[d] from
-  //   input_ne_overrides when input_ne_overrides != nullptr.
+  fprintf(stderr, "[ggml_backend] Phase B complete, last_processed=%d/%d\n", last_processed, n_tensors); fflush(stderr);
 
   // Sort outputs by output_index (stored in input_index field for outputs)
   // to match the order ExecuTorch expects in the output args span.
@@ -2932,6 +3303,8 @@ static Error build_graph(
   for (auto* out : output_tensors) {
     ggml_build_forward_expand(graph, out);
   }
+  fprintf(stderr, "[ggml_backend] graph built: %d nodes, %d leafs (max %zu)\n",
+          ggml_graph_n_nodes(graph), (int)0, est_graph_size);
   // Sort inputs by input_index
   std::sort(input_pairs.begin(), input_pairs.end(),
             [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -3007,14 +3380,15 @@ static Error build_graph(
         static_cast<uint8_t*>(gt->data) + nbytes)});
   }
 
-  // 2b. Clear all tensor data pointers so gallocr allocates everything
-  //     on the backend. Without this, gallocr skips tensors that already
-  //     have data (from no_alloc=false) and they never get a backend buffer,
-  //     causing "tensor buffer not set" asserts on CUDA.
+  // 2b. Clear all tensor data / buffer pointers so gallocr allocates
+  //     everything on the compute backend (Metal / CPU).  Without this,
+  //     gallocr skips tensors that already have data and they never get a
+  //     backend buffer, causing "tensor buffer not set" asserts.
   for (struct ggml_tensor* t = ggml_get_first_tensor(ctx);
        t != nullptr;
        t = ggml_get_next_tensor(ctx, t)) {
-    t->data = nullptr;
+    t->data   = nullptr;
+    t->buffer = nullptr;
   }
 
   // 4. Allocate graph tensors using scheduler (supports mixed backends).
@@ -3034,6 +3408,12 @@ static Error build_graph(
   for (auto& sc : saved_constants) {
     if (sc.tensor->buffer == nullptr) continue;
     ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
+  }
+
+  // 6. Free the temporary CPU host buffer — data now lives in backend buffers.
+  if (host_buf) {
+    ggml_backend_buffer_free(host_buf);
+    host_buf = nullptr;
   }
 
   // === Update handle ===

@@ -513,19 +513,18 @@ class GgmlBackend(BackendDetails):
                     #   ggml_flash_attn_ext reads the mask as F16 additive bias;
                     #   ggml_get_rows (used by aten.index) also handles F16.
                     if t_cpu.dtype == torch.bool:
-                        # Convert bool causal mask to F16 additive bias:
-                        # True -> 0.0 (attend), False -> -inf (mask out)
-                        neg_inf = float("-inf")
-                        t_float = torch.where(
-                            t_cpu, torch.tensor(0.0), torch.tensor(neg_inf)
-                        )
-                        t_cpu = t_float.to(torch.float16)
+                        # Convert bool to F32 1.0/0.0 mask.
+                        # The WHERE handler uses cond*x + (1-cond)*y arithmetic,
+                        # so we need proper 0/1 values (not 0/-inf which was for
+                        # flash_attn additive bias and breaks WHERE arithmetic).
+                        t_cpu = t_cpu.to(torch.float32)
                     elif t_cpu.dtype == torch.float32 and t_cpu.ndim >= 3:
-                        # Downcast conv weights to F16 for ggml's im2col_f16.
-                        # Keep positional encodings at F32 for precision.
-                        is_pe = "pe" in fqn or "pos_enc" in fqn
-                        if not is_pe:
-                            t_cpu = t_cpu.to(torch.float16)
+                        # Keep all conv weights F32 for precision. ggml's
+                        # ggml_conv_2d uses the kernel's type for im2col
+                        # output, so F32 weights give F32 im2col. Depthwise
+                        # paths use ggml_conv_2d_dw_direct / custom F32 conv
+                        # which avoid im2col entirely.
+                        pass
 
                     # Store inside the .pte.
                     data_store.add_named_data(fqn, t_cpu, alignment=64)
