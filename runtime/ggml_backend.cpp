@@ -728,8 +728,7 @@ struct SavedConstant {
   std::vector<uint8_t> data;
 };
 
-// Saved constant tensor data (weights, biases, precomputed values).
-// After gallocr reassigns buffers, these must be restored.
+// Saved constant tensor data for re-copy after sched_reset.
 struct SavedGraphConstant {
   struct ggml_tensor* tensor;
   std::vector<uint8_t> data;
@@ -748,8 +747,11 @@ struct GgmlDelegateHandle {
   // Each pair is (src_i64_tensor, dst_i32_tensor).
   std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>> deferred_i64_to_i32;
 
-  // Constant data saved during build_graph, restored before each compute.
+  // Constant data saved during build_graph, restored after sched_reset.
   std::vector<SavedGraphConstant> saved_constants;
+
+  // Whether constants need re-copy (true after sched_reset reallocates).
+  bool constants_need_copy = true;
 
   // Primary backend (GPU when available, otherwise CPU)
   ggml_backend_t backend = nullptr;
@@ -3362,23 +3364,8 @@ static Error build_graph(
   for (auto& [src, dst] : deferred_i64_to_i32) {
     deferred_dst_set.insert(dst);
   }
-  for (auto* inp : ordered_inputs) {
-    ggml_set_input(inp);
-  }
-  for (auto* dst : deferred_dst_set) {
-    ggml_set_input(dst);  // receives data during execute
-  }
-  for (auto* out : output_tensors) {
-    ggml_set_output(out);
-  }
 
-  // 2. Save constant data from every tensor in the context that is NOT an
-  //    input or a deferred-cast destination (those get their data at execute
-  //    time).  We iterate the full context (not just id_to_tensor) because
-  //    helper tensors created by ggml ops (e.g. ggml_new_f32 for scalars)
-  //    also need their data preserved.
-  //    Also mark them as inputs so gallocr doesn't reuse their memory
-  //    (constants like the scalar 1.0 in RSQRT are read by multiple layers).
+  // 2. Save constant data for restore after sched_reset.
   handle->saved_constants.clear();
   for (struct ggml_tensor* gt = ggml_get_first_tensor(ctx);
        gt != nullptr;
@@ -3386,8 +3373,6 @@ static Error build_graph(
     if (!gt->data) continue;
     if (input_set.count(gt)) continue;
     if (deferred_dst_set.count(gt)) continue;
-    // Only save leaf tensors (constants / pre-computed values).
-    // Graph op nodes will be recomputed by the backend.
     if (gt->op != GGML_OP_NONE) continue;
     ggml_set_input(gt);  // prevent gallocr from reusing this memory
     size_t nbytes = ggml_nbytes(gt);
@@ -3396,10 +3381,7 @@ static Error build_graph(
         static_cast<uint8_t*>(gt->data) + nbytes)});
   }
 
-  // 2b. Clear all tensor data / buffer pointers so gallocr allocates
-  //     everything on the compute backend (Metal / CPU).  Without this,
-  //     gallocr skips tensors that already have data and they never get a
-  //     backend buffer, causing "tensor buffer not set" asserts.
+  // 2b. Clear all tensor data/buffer pointers for scheduler allocation.
   for (struct ggml_tensor* t = ggml_get_first_tensor(ctx);
        t != nullptr;
        t = ggml_get_next_tensor(ctx, t)) {
@@ -3407,7 +3389,18 @@ static Error build_graph(
     t->buffer = nullptr;
   }
 
-  // 4. Allocate graph tensors using scheduler (supports mixed backends).
+  // 3. Mark inputs/outputs for the scheduler.
+  for (auto* inp : ordered_inputs) {
+    ggml_set_input(inp);
+  }
+  for (auto* dst : deferred_dst_set) {
+    ggml_set_input(dst);
+  }
+  for (auto* out : output_tensors) {
+    ggml_set_output(out);
+  }
+
+  // 4. Allocate graph tensors using scheduler.
   if (!handle->sched) {
     ggml_free(ctx);
     return Error::InvalidState;
@@ -3420,13 +3413,13 @@ static Error build_graph(
   }
 
   // 5. Restore constant data into backend buffers.
-  //    Skip tensors not reachable from the graph (gallocr leaves them unallocated).
   for (auto& sc : handle->saved_constants) {
     if (sc.tensor->buffer == nullptr) continue;
     ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
   }
+  handle->constants_need_copy = false;
 
-  // 6. Free the temporary CPU host buffer — data now lives in backend buffers.
+  // 6. Free the temporary CPU host buffer.
   if (host_buf) {
     ggml_backend_buffer_free(host_buf);
     host_buf = nullptr;
@@ -3797,11 +3790,11 @@ Error GgmlBackendInterface::execute(
     ggml_backend_tensor_set(dst_i32, dst_buf.data(), 0, nelem * sizeof(int32_t));
   }
 
-  // Execute the graph via scheduler (mixed backend aware).
-  // Reset + re-alloc the scheduler before every compute so that backend
-  // buffer assignments are fresh.  Without this, the scheduler may reuse
-  // stale buffer mappings from the previous call, causing data corruption
-  // when the same method is invoked multiple times (e.g. decoder steps).
+  // Execute the graph via scheduler.
+  // Reset + re-alloc + re-copy constants before every compute. The scheduler
+  // caches cross-backend transfer state that goes stale when inputs change,
+  // and sched_reset is the only way to clear it. Constants must be restored
+  // since reset frees the underlying buffer allocations.
   if (!handle->sched) {
     return Error::InvalidState;
   }
@@ -3810,7 +3803,6 @@ Error GgmlBackendInterface::execute(
     fprintf(stderr, "[ggml_backend] ERROR: scheduler re-alloc failed\n");
     return Error::MemoryAllocationFailed;
   }
-  // Re-copy constant data after re-alloc (scheduler may have reassigned buffers).
   for (const auto& sc : handle->saved_constants) {
     if (sc.tensor->buffer == nullptr) continue;
     ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
