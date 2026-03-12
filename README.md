@@ -45,13 +45,13 @@ GgmlBackendInterface       # C++ runtime: deserializes IR, builds ggml_cgraph,
 
 ## Supported Models
 
-| Model | Status | Notes |
-|-------|--------|-------|
-| MobileNetV2 | Full | Requires `BatchNormFoldingRewritePass` to fold Conv+BN patterns |
-| Linear + ReLU | Full | Basic MLP architectures |
-| Custom CNNs | Partial | Conv2d, depthwise conv, pooling, activations supported |
-
-Models with BatchNorm layers require the `BatchNormFoldingRewritePass` to fold BN parameters into preceding convolutions before partitioning. Use `to_edge_rewrite_and_lower(..., ep_passes=[BatchNormFoldingRewritePass()])`.
+| Model | Type | Status | Notes |
+|-------|------|--------|-------|
+| [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | LLM | Full (F32 + Q8_0) | Text generation with KV cache, fused SDPA |
+| [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | ASR | Full (F32 + Q8_0) | Speech-to-text, FastConformer encoder + TDT decoder |
+| MobileNetV2 | Vision | Full | Requires `BatchNormFoldingRewritePass` for Conv+BN |
+| Linear + ReLU | MLP | Full | Basic MLP architectures |
+| Custom CNNs | Vision | Partial | Conv2d, depthwise conv, pooling, activations |
 
 Unsupported ops automatically fall back to ExecuTorch's CPU executor.
 
@@ -126,6 +126,59 @@ et_program = edge.to_executorch()
 
 with open("mobilenet_v2.pte", "wb") as f:
     f.write(et_program.buffer)
+```
+
+### Qwen3-0.6B (Text Generation)
+
+**Export:**
+```bash
+# F32
+python runner/export_qwen3_q8.py
+
+# This produces qwen3/qwen3_q8_0.pte (Q8_0 quantized)
+# For F32, export with the same script but without quant_config (see code)
+```
+
+**Run:**
+```bash
+# Q8_0 (~370 MB)
+python runner/run_qwen3.py --model qwen3/qwen3_q8_0.pte
+
+# F32 (~1.2 GB)
+python runner/run_qwen3.py --model qwen3/qwen3.pte
+```
+
+Requires `optimum-executorch` for the export wrapper:
+```bash
+pip install optimum[executorch]
+```
+
+### Parakeet TDT 0.6B (Speech Recognition)
+
+**Export:**
+```bash
+# F32 model
+python export_parakeet_ggml.py --output-dir ./parakeet_ggml --audio test_audio.wav
+
+# Q8_0 model (also exports F32 comparison)
+python runner/export_parakeet_q8.py --audio test_audio.wav
+```
+
+**Run:**
+```bash
+python runner/run_parakeet_q8.py --audio test_audio.wav
+```
+
+This runs eager PyTorch, Q8_0, and F32 side by side and compares transcriptions.
+
+Requires NeMo for the model:
+```bash
+pip install nemo_toolkit[asr]
+```
+
+To force CPU-only execution (no Metal GPU):
+```bash
+GGML_BACKEND_DEVICE=cpu python runner/run_parakeet_q8.py --audio test_audio.wav
 ```
 
 ### C++ (runtime)
