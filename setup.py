@@ -49,6 +49,27 @@ class CMakeBuild(build_ext):
 
         root = pathlib.Path(__file__).resolve().parent
 
+        # Skip CMake build unless explicitly requested.  When the .so is
+        # already built (e.g. via a manual cmake invocation), a plain
+        # ``pip install -e .`` should just create the editable link without
+        # re-running the full native build.
+        if not os.environ.get("EXECUTORCH_GGML_BUILD_NATIVE"):
+            # Check if the .so already exists in the source tree.
+            pkg_dir = root / "python" / "executorch_ggml"
+            so_files = list(pkg_dir.glob("_ggml_backend*.so")) + list(
+                pkg_dir.glob("_ggml_backend*.dylib")
+            )
+            if so_files:
+                print(
+                    f"[executorch-ggml] Pre-built native extension found ({so_files[0].name}); "
+                    "skipping CMake build. Set EXECUTORCH_GGML_BUILD_NATIVE=1 to force rebuild."
+                )
+                return
+            print(
+                "[executorch-ggml] No pre-built native extension found and "
+                "EXECUTORCH_GGML_BUILD_NATIVE is not set; attempting CMake build."
+            )
+
         # Prefer deps vendored under this repo's third-party/ if present.
         llama_dir = self._discover_dep(
             "LLAMA_CPP_DIR",

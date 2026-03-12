@@ -253,37 +253,46 @@ enum class TensorType : int32_t {
   I32 = 3,
   BOOL = 4,
   BF16 = 5,
+  Q8_0 = 6,
+  Q6_K = 7,
+  Q4_0 = 8,
   MIN = F32,
-  MAX = BF16
+  MAX = Q4_0
 };
 
-inline const TensorType (&EnumValuesTensorType())[6] {
+inline const TensorType (&EnumValuesTensorType())[9] {
   static const TensorType values[] = {
     TensorType::F32,
     TensorType::F16,
     TensorType::I64,
     TensorType::I32,
     TensorType::BOOL,
-    TensorType::BF16
+    TensorType::BF16,
+    TensorType::Q8_0,
+    TensorType::Q6_K,
+    TensorType::Q4_0
   };
   return values;
 }
 
 inline const char * const *EnumNamesTensorType() {
-  static const char * const names[7] = {
+  static const char * const names[10] = {
     "F32",
     "F16",
     "I64",
     "I32",
     "BOOL",
     "BF16",
+    "Q8_0",
+    "Q6_K",
+    "Q4_0",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameTensorType(TensorType e) {
-  if (::flatbuffers::IsOutRange(e, TensorType::F32, TensorType::BF16)) return "";
+  if (::flatbuffers::IsOutRange(e, TensorType::F32, TensorType::Q4_0)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesTensorType()[index];
 }

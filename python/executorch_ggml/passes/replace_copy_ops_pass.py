@@ -28,6 +28,8 @@ _COPY_TO_ORIGINAL: Dict[
     ops.edge.aten.unsqueeze_copy.default: ops.edge.aten.unsqueeze.default,
     torch.ops.aten.expand_copy.default: torch.ops.aten.expand.default,
     ops.edge.aten.expand_copy.default: ops.edge.aten.expand.default,
+    torch.ops.aten.squeeze_copy.dims: torch.ops.aten.squeeze.dims,
+    ops.edge.aten.squeeze_copy.dims: ops.edge.aten.squeeze.dims,
     torch.ops.aten.alias_copy.default: torch.ops.aten.alias.default,
     ops.edge.aten.alias_copy.default: ops.edge.aten.alias.default,
     # NOTE: clone -> alias is NOT safe in general because clone ensures contiguity

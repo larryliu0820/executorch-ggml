@@ -54,9 +54,18 @@ try:
     if _et_so is not None:
         ctypes.CDLL(_et_so, mode=ctypes.RTLD_GLOBAL)
     else:
+        # No ExecuTorch .so loaded yet — try to import one with RTLD_GLOBAL.
+        # We attempt multiple modules because some ET wheel builds ship
+        # _portable_lib or _llm_runner but not both, and either may fail to
+        # load depending on how torch/ET were built.
         _old_flags = sys.getdlopenflags()
         sys.setdlopenflags(_old_flags | ctypes.RTLD_GLOBAL)
-        from executorch.extension.pybindings import _portable_lib  # noqa: F401
+        try:
+            from executorch.extension.pybindings import _portable_lib  # noqa: F401
+        except Exception:
+            # _portable_lib may be broken (e.g. rpath mismatch); try the
+            # LLM runner which also contains the full ET runtime.
+            from executorch.extension.llm.runner import _llm_runner  # noqa: F401
 
         sys.setdlopenflags(_old_flags)
 
@@ -70,9 +79,12 @@ except Exception:
 from executorch_ggml.edge_pipeline import to_edge_rewrite_and_lower
 from executorch_ggml.ggml_backend import GgmlBackend
 from executorch_ggml.ggml_partitioner import GgmlPartitioner
+from executorch_ggml.quantize import GgmlQuantConfig, GgmlQuantType
 
 __all__ = [
     "GgmlPartitioner",
     "GgmlBackend",
+    "GgmlQuantConfig",
+    "GgmlQuantType",
     "to_edge_rewrite_and_lower",
 ]

@@ -1,16 +1,20 @@
 """GgmlPartitioner: tags supported ATen ops for delegation to the ggml backend."""
 
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
 from torch.export import ExportedProgram
 
+from executorch.exir.backend.compile_spec_schema import CompileSpec
 from executorch.exir.backend.partitioner import (
     DelegationSpec,
     Partitioner,
     PartitionResult,
 )
 from executorch.exir.backend.utils import tag_constant_data
+
+if TYPE_CHECKING:
+    from executorch_ggml.quantize import GgmlQuantConfig
 
 from torch.fx.passes.utils.fuser_utils import validate_partition
 
@@ -276,9 +280,29 @@ class GgmlPartitioner(Partitioner):
     contain one SDPA each.
     """
 
-    def __init__(self, max_sdpa_ops: int | None = None):
+    def __init__(
+        self,
+        max_sdpa_ops: int | None = None,
+        quant_config: "GgmlQuantConfig | None" = None,
+    ):
         super().__init__()
-        self.delegation_spec = DelegationSpec(BACKEND_ID, [])
+        compile_specs: list[CompileSpec] = []
+        if quant_config is not None:
+            compile_specs.append(
+                CompileSpec(
+                    key="ggml_quant_type",
+                    value=quant_config.quant_type.value.encode(),
+                )
+            )
+            # Serialize skip patterns as comma-separated string
+            if quant_config.skip_patterns:
+                compile_specs.append(
+                    CompileSpec(
+                        key="ggml_quant_skip",
+                        value=",".join(quant_config.skip_patterns).encode(),
+                    )
+                )
+        self.delegation_spec = DelegationSpec(BACKEND_ID, compile_specs)
         self.max_sdpa_ops = max_sdpa_ops
 
     def ops_to_not_decompose(

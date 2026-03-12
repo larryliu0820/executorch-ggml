@@ -10,8 +10,8 @@ import executorch_ggml  # noqa: F401, I001  # isort: skip
 
 from executorch.extension.llm.runner import GenerationConfig, TextLLMRunner
 
-MODEL_PATH = "/data/users/larryliu/executorch-ggml/tests/qwen3_e2e.pte"
-TOKENIZER_PATH = "/data/users/larryliu/models/qwen3_ggml/"
+MODEL_PATH = "/Users/larryliu/executorch-ggml/qwen3/qwen3.pte"
+TOKENIZER_PATH = "/Users/larryliu/executorch-ggml/qwen3/"
 
 runner = TextLLMRunner(MODEL_PATH, TOKENIZER_PATH)
 

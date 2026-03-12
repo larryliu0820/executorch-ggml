@@ -137,6 +137,15 @@ def export_all_ggml(model, dtype=torch.float):
         "encoder_subsampling_factor": encoder_subsampling_factor,
     }
 
+    # Remove dropout ops (identity in eval mode) so the partitioner
+    # can form a single large delegate instead of many fragments.
+    _dropout_decomp = {
+        torch.ops.aten.dropout.default: lambda input, p, train: input,
+    }
+    for key in list(programs.keys()):
+        if key != "preprocessor":
+            programs[key] = programs[key].run_decompositions(_dropout_decomp)
+
     return programs, metadata
 
 

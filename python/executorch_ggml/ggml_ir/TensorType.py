@@ -9,3 +9,6 @@ class TensorType(object):
     I32 = 3
     BOOL = 4
     BF16 = 5
+    Q8_0 = 6
+    Q6_K = 7
+    Q4_0 = 8

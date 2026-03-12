@@ -728,6 +728,13 @@ struct SavedConstant {
   std::vector<uint8_t> data;
 };
 
+// Saved constant tensor data (weights, biases, precomputed values).
+// After gallocr reassigns buffers, these must be restored.
+struct SavedGraphConstant {
+  struct ggml_tensor* tensor;
+  std::vector<uint8_t> data;
+};
+
 struct GgmlDelegateHandle {
   struct ggml_context* ctx = nullptr;
   struct ggml_cgraph* graph = nullptr;
@@ -740,6 +747,9 @@ struct GgmlDelegateHandle {
   // Deferred I64→I32 casts that must run during execute() (after input copy).
   // Each pair is (src_i64_tensor, dst_i32_tensor).
   std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>> deferred_i64_to_i32;
+
+  // Constant data saved during build_graph, restored before each compute.
+  std::vector<SavedGraphConstant> saved_constants;
 
   // Primary backend (GPU when available, otherwise CPU)
   ggml_backend_t backend = nullptr;
@@ -1017,6 +1027,9 @@ static Error build_graph(
       case ggml_ir::TensorType::I32:  return GGML_TYPE_I32;
       case ggml_ir::TensorType::BOOL: return GGML_TYPE_I32;  // stored as I32
       case ggml_ir::TensorType::BF16: return GGML_TYPE_BF16;
+      case ggml_ir::TensorType::Q8_0: return GGML_TYPE_Q8_0;
+      case ggml_ir::TensorType::Q6_K: return GGML_TYPE_Q6_K;
+      case ggml_ir::TensorType::Q4_0: return GGML_TYPE_Q4_0;
       default:                        return GGML_TYPE_F32;
     }
   };
@@ -2015,25 +2028,29 @@ static Error build_graph(
           int ax = (int(nd) - 1) - dim;
 
           // Resolve dynamic output shape from sym_dim_ids/sym_dim_exprs.
-          // This is needed when the slice extent is symbolic (e.g. pe[:, :seq_len]).
-          for (int d = 0; d < 4; ++d) {
-            int32_t sid = (t->sym_dim_ids() && d < (int)t->sym_dim_ids()->size())
-                          ? t->sym_dim_ids()->Get(d) : -1;
-            if (sid == -2) {
-              const uint8_t* code = nullptr;
-              size_t code_len = 0;
-              if (get_dim_expr_bytecode(t->sym_dim_exprs(), d, code, code_len)) {
-                ne[d] = eval_sym_expr(code, code_len, sym_dim_values);
+          // Only attempt when we have runtime symbol values; during init
+          // (no overrides) the expressions evaluate to garbage (sym=0).
+          int64_t resolved_slice_ne = ne[ax];  // start with static IR value
+          if (!sym_dim_values.empty()) {
+            for (int d = 0; d < 4; ++d) {
+              int32_t sid = (t->sym_dim_ids() && d < (int)t->sym_dim_ids()->size())
+                            ? t->sym_dim_ids()->Get(d) : -1;
+              if (sid == -2) {
+                const uint8_t* code = nullptr;
+                size_t code_len = 0;
+                if (get_dim_expr_bytecode(t->sym_dim_exprs(), d, code, code_len)) {
+                  ne[d] = eval_sym_expr(code, code_len, sym_dim_values);
+                }
+              } else if (sid >= 0) {
+                auto it = sym_dim_values.find(sid);
+                if (it != sym_dim_values.end()) ne[d] = it->second;
               }
-            } else if (sid >= 0) {
-              auto it = sym_dim_values.find(sid);
-              if (it != sym_dim_values.end()) ne[d] = it->second;
             }
+            resolved_slice_ne = ne[ax];
           }
 
           // Use source tensor shape for non-sliced dims (not stale IR ne[]).
           // But keep the (possibly sym-resolved) IR ne for the sliced axis.
-          int64_t resolved_slice_ne = ne[ax];
           for (int d = 0; d < 4; ++d) ne[d] = a->ne[d];
 
           // Derive start/end from the resolved output shape when op_params
@@ -2043,34 +2060,37 @@ static Error build_graph(
           bool start_is_sentinel = (start == SENTINEL);
           bool end_is_sentinel = (end == SENTINEL);
 
-          if (start_is_sentinel) start = 0;  // temporary, may be recomputed below
-          if (end_is_sentinel) {
-            // Derive end from the resolved output ne along the slice axis.
-            end = start + resolved_slice_ne * step;
-          }
+          // When start is a sentinel, derive it from the resolved output shape.
+          // RelPositionalEncoding slices pe[:, center-T : center+T-1] where
+          // center = pe_size/2+1. Centering: start = (pe_size - slice_len) / 2.
+          if (start_is_sentinel && resolved_slice_ne > 0 &&
+              resolved_slice_ne <= actual_dim) {
+            start = (actual_dim - resolved_slice_ne) / 2;
+            end = start + resolved_slice_ne;
+            ne[ax] = resolved_slice_ne;
+          } else {
+            if (start_is_sentinel) start = 0;
+            if (end_is_sentinel) {
+              end = start + resolved_slice_ne * step;
+            }
+            // Clamp end to actual source dim (handles "slice to end" when
+            // source shape changed due to dynamic dims).
+            if (end > actual_dim) end = actual_dim;
+            ne[ax] = end - start;
 
-          // Clamp end to actual source dim (handles "slice to end" when
-          // source shape changed due to dynamic dims).
-          if (end > actual_dim) end = actual_dim;
-          ne[ax] = end - start;
-
-          // When sym_dim_ids resolved a different value for the sliced axis,
-          // prefer it — the baked end/start from op_params may be trace-time
-          // constants that don't match the runtime source shape.
-          if (t->sym_dim_ids() && ax < (int)t->sym_dim_ids()->size()) {
-            int32_t sid_ax = t->sym_dim_ids()->Get(ax);
-            if ((sid_ax == -2 || sid_ax >= 0) && resolved_slice_ne > 0 &&
-                resolved_slice_ne != ne[ax]) {
-              ne[ax] = resolved_slice_ne;
-              if (start_is_sentinel) {
-                // Both start and output size are dynamic — center the slice
-                // in the source dimension (used by RelPositionalEncoding).
-                start = (actual_dim - resolved_slice_ne) / 2;
-              }
-              end = start + resolved_slice_ne;
-              if (end > actual_dim) {
-                end = actual_dim;
-                ne[ax] = end - start;
+            // When sym_dim_ids resolved a different value for the sliced axis,
+            // prefer it — the baked end/start from op_params may be trace-time
+            // constants that don't match the runtime source shape.
+            if (t->sym_dim_ids() && ax < (int)t->sym_dim_ids()->size()) {
+              int32_t sid_ax = t->sym_dim_ids()->Get(ax);
+              if ((sid_ax == -2 || sid_ax >= 0) && resolved_slice_ne > 0 &&
+                  resolved_slice_ne != ne[ax]) {
+                ne[ax] = resolved_slice_ne;
+                end = start + resolved_slice_ne;
+                if (end > actual_dim) {
+                  end = actual_dim;
+                  ne[ax] = end - start;
+                }
               }
             }
           }
@@ -3359,11 +3379,7 @@ static Error build_graph(
   //    also need their data preserved.
   //    Also mark them as inputs so gallocr doesn't reuse their memory
   //    (constants like the scalar 1.0 in RSQRT are read by multiple layers).
-  struct SavedTensor {
-    struct ggml_tensor* tensor;
-    std::vector<uint8_t> data;
-  };
-  std::vector<SavedTensor> saved_constants;
+  handle->saved_constants.clear();
   for (struct ggml_tensor* gt = ggml_get_first_tensor(ctx);
        gt != nullptr;
        gt = ggml_get_next_tensor(ctx, gt)) {
@@ -3375,7 +3391,7 @@ static Error build_graph(
     if (gt->op != GGML_OP_NONE) continue;
     ggml_set_input(gt);  // prevent gallocr from reusing this memory
     size_t nbytes = ggml_nbytes(gt);
-    saved_constants.push_back({gt, std::vector<uint8_t>(
+    handle->saved_constants.push_back({gt, std::vector<uint8_t>(
         static_cast<uint8_t*>(gt->data),
         static_cast<uint8_t*>(gt->data) + nbytes)});
   }
@@ -3405,7 +3421,7 @@ static Error build_graph(
 
   // 5. Restore constant data into backend buffers.
   //    Skip tensors not reachable from the graph (gallocr leaves them unallocated).
-  for (auto& sc : saved_constants) {
+  for (auto& sc : handle->saved_constants) {
     if (sc.tensor->buffer == nullptr) continue;
     ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
   }
@@ -3557,22 +3573,27 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     const char* key = t->data_key()->c_str();
 
     // Compute byte size from IR shape + type.
-    size_t n_elems = 1;
+    // Use ggml_row_size() to correctly handle block-based quantized types
+    // (e.g. Q8_0: 34 bytes per block of 32 elements).
+    int64_t ne[4] = {1, 1, 1, 1};
     if (t->ne()) {
-      for (size_t d = 0; d < t->ne()->size(); ++d) {
-        n_elems *= static_cast<size_t>(t->ne()->Get(d));
+      for (size_t d = 0; d < t->ne()->size() && d < 4; ++d) {
+        ne[d] = t->ne()->Get(d);
       }
     }
-    size_t elem_size = 4;
+    ggml_type load_gtype;
     switch (static_cast<ggml_ir::TensorType>(t->type())) {
-      case ggml_ir::TensorType::F16:  elem_size = 2; break;
-      case ggml_ir::TensorType::BF16: elem_size = 2; break;
-      case ggml_ir::TensorType::I32:  elem_size = 4; break;
-      case ggml_ir::TensorType::I64:  elem_size = 8; break;
-      case ggml_ir::TensorType::BOOL: elem_size = 4; break;
-      default:                        elem_size = 4; break;
+      case ggml_ir::TensorType::F16:  load_gtype = GGML_TYPE_F16;  break;
+      case ggml_ir::TensorType::BF16: load_gtype = GGML_TYPE_BF16; break;
+      case ggml_ir::TensorType::I32:  load_gtype = GGML_TYPE_I32;  break;
+      case ggml_ir::TensorType::I64:  load_gtype = GGML_TYPE_I64;  break;
+      case ggml_ir::TensorType::BOOL: load_gtype = GGML_TYPE_I32;  break;
+      case ggml_ir::TensorType::Q8_0: load_gtype = GGML_TYPE_Q8_0; break;
+      case ggml_ir::TensorType::Q6_K: load_gtype = GGML_TYPE_Q6_K; break;
+      case ggml_ir::TensorType::Q4_0: load_gtype = GGML_TYPE_Q4_0; break;
+      default:                        load_gtype = GGML_TYPE_F32;   break;
     }
-    size_t nbytes = n_elems * elem_size;
+    size_t nbytes = ggml_row_size(load_gtype, ne[0]) * ne[1] * ne[2] * ne[3];
 
     auto fb = ndm->get_data(key);
     if (!fb.ok()) {
@@ -3777,8 +3798,22 @@ Error GgmlBackendInterface::execute(
   }
 
   // Execute the graph via scheduler (mixed backend aware).
+  // Reset + re-alloc the scheduler before every compute so that backend
+  // buffer assignments are fresh.  Without this, the scheduler may reuse
+  // stale buffer mappings from the previous call, causing data corruption
+  // when the same method is invoked multiple times (e.g. decoder steps).
   if (!handle->sched) {
     return Error::InvalidState;
+  }
+  ggml_backend_sched_reset(handle->sched);
+  if (!ggml_backend_sched_alloc_graph(handle->sched, handle->graph)) {
+    fprintf(stderr, "[ggml_backend] ERROR: scheduler re-alloc failed\n");
+    return Error::MemoryAllocationFailed;
+  }
+  // Re-copy constant data after re-alloc (scheduler may have reassigned buffers).
+  for (const auto& sc : handle->saved_constants) {
+    if (sc.tensor->buffer == nullptr) continue;
+    ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
   }
   enum ggml_status status = ggml_backend_sched_graph_compute(handle->sched, handle->graph);
   if (status != GGML_STATUS_SUCCESS) {

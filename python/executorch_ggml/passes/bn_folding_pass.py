@@ -73,8 +73,8 @@ def fold_conv_bn_weights(
     invstd = torch.rsqrt(var + eps)
     scale = gamma * invstd  # [out]
 
-    # Fold into conv weights
-    w_fold = w * scale.reshape(-1, 1, 1, 1)
+    # Fold into conv weights — works for both Conv1d (3D) and Conv2d (4D)
+    w_fold = w * scale.reshape(-1, *([1] * (w.ndim - 1)))
 
     # Fold into bias
     b_fold = (b - mean) * scale + beta

@@ -78,6 +78,7 @@ from executorch_ggml.serialize import (
     TYPE_I32,
     TYPE_BOOL,
     TYPE_BF16,
+    TYPE_Q8_0,
     # Packers
     pack_float,
     pack_i32,
@@ -463,6 +464,16 @@ class GgmlBackend(BackendDetails):
         # to them by key from the delegate blob. Keys are state_dict FQNs.
         data_store = NamedDataStore()
 
+        # Parse quantization config from compile_specs (set by GgmlPartitioner).
+        quant_config = None
+        for spec in compile_specs:
+            if spec.key == "ggml_quant_type":
+                from executorch_ggml.quantize import GgmlQuantConfig, GgmlQuantType
+                qtype_str = spec.value.decode()
+                quant_config = GgmlQuantConfig(quant_type=GgmlQuantType(qtype_str))
+            elif spec.key == "ggml_quant_skip" and quant_config is not None:
+                quant_config.skip_patterns = set(spec.value.decode().split(","))
+
         # Some ggml kernels have dtype contracts. For ggml conv (im2col_f16), the
         # CPU backend expects:
         #   - kernel/weights: F16
@@ -526,14 +537,48 @@ class GgmlBackend(BackendDetails):
                         # which avoid im2col entirely.
                         pass
 
-                    # Store inside the .pte.
+                    # Quantize weight if config says so.
+                    ir_type = _torch_dtype_to_ir_type(t_cpu.dtype)
+                    if quant_config is not None:
+                        from executorch_ggml.quantize import (
+                            should_quantize,
+                            quantize_tensor,
+                            GgmlQuantType,
+                        )
+                        if should_quantize(
+                            fqn, tuple(t_cpu.shape), t_cpu.dtype,
+                            t_cpu.numel(), quant_config,
+                        ):
+                            import numpy as np
+                            f32_data = t_cpu.to(torch.float32).numpy().flatten()
+                            quant_bytes = quantize_tensor(
+                                f32_data, quant_config.quant_type,
+                            )
+                            data_store.add_named_data(fqn, quant_bytes, alignment=64)
+                            if quant_config.quant_type == GgmlQuantType.Q8_0:
+                                ir_type = TYPE_Q8_0
+                            tid = alloc_id()
+                            ir_tensors.append(
+                                IrTensor(
+                                    tensor_id=tid,
+                                    tensor_type=ir_type,
+                                    ne=_pytorch_shape_to_ggml_ne(shape),
+                                    op=OP_NONE,
+                                    data_key=fqn,
+                                    is_input=False,
+                                )
+                            )
+                            node_to_id[node] = tid
+                            continue
+
+                    # Store inside the .pte (unquantized path).
                     data_store.add_named_data(fqn, t_cpu, alignment=64)
 
                     tid = alloc_id()
                     ir_tensors.append(
                         IrTensor(
                             tensor_id=tid,
-                            tensor_type=_torch_dtype_to_ir_type(t_cpu.dtype),
+                            tensor_type=ir_type,
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_NONE,
                             data_key=fqn,
@@ -1006,8 +1051,12 @@ class GgmlBackend(BackendDetails):
                     start_i = _concrete_int(start) if start is not None else 0
                     if start is not None and not isinstance(start, int):
                         start_i = 2**62  # sentinel: C++ will recompute
-                    # If end is None, represent as a large positive bound (runtime will clamp)
+                    # If end is None, represent as a large positive bound (runtime will clamp).
+                    # If end is a symbolic SymInt (depends on dynamic dim), also use
+                    # sentinel so the C++ runtime resolves from output shape.
                     end_i = _concrete_int(end) if end is not None else (2**62)
+                    if end is not None and not isinstance(end, int):
+                        end_i = 2**62  # sentinel: C++ will recompute
                     src_id = node_to_id[src_node]
                     fake_val = node.meta.get("val")
                     shape = _resolve_shape(fake_val)
@@ -1025,12 +1074,11 @@ class GgmlBackend(BackendDetails):
                     src_shape = _resolve_shape(src_val)
                     ndim = len(src_shape) if src_shape else len(shape)
 
-                    # If start or end hit the 2**62 sentinel (unresolvable SymInt),
-                    # derive concrete trace-time values from the output shape.
-                    if start_i == 2**62:
-                        start_i = 0
-                    if end_i == 2**62 and shape:
-                        # output_shape[dim] == (end - start) / step
+                    # If end is the sentinel (end=None → "slice to end") and
+                    # start is concrete, derive end from the output shape.
+                    # When start is a sentinel (symbolic), leave both for the
+                    # C++ runtime to resolve via centering or sym_dim_exprs.
+                    if end_i == 2**62 and start_i != 2**62 and shape:
                         d = dim if dim >= 0 else ndim + dim
                         if d < len(shape):
                             end_i = start_i + shape[d] * step
