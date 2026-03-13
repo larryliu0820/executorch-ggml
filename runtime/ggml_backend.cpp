@@ -1340,9 +1340,8 @@ static Error build_graph(
       };
       for (const auto & p : perms) {
         struct ggml_tensor * t = ggml_permute(ctx, src, p[0], p[1], p[2], p[3]);
-        t = ggml_cont(ctx, t);
         if (ggml_are_same_shape(t, dst)) {
-          return t;
+          return ggml_cont(ctx, t);
         }
       }
       return nullptr;
@@ -1448,7 +1447,7 @@ static Error build_graph(
       auto * v = ggml_view_4d(ctx, big,
           small->ne[0], small->ne[1], small->ne[2], small->ne[3],
           big->nb[1], big->nb[2], big->nb[3], 0);
-      return ggml_cont(ctx, v);
+      return ensure_cont(ctx, v);
     };
 
     // Shared broadcast resolution for binary ops. Returns true on success,
@@ -1456,10 +1455,12 @@ static Error build_graph(
     auto resolve_broadcast = [&](struct ggml_tensor *& a, struct ggml_tensor *& b,
                                 const char * op_name) -> bool {
       if (ggml_are_same_shape(a, b)) return true;
-      if (ggml_can_repeat(b, a)) {
-        b = ggml_cont(ctx, ggml_repeat(ctx, b, a));
-      } else if (ggml_can_repeat(a, b)) {
-        a = ggml_cont(ctx, ggml_repeat(ctx, a, b));
+      // ggml binary ops natively broadcast b over a — no explicit repeat needed.
+      if (ggml_can_repeat(b, a)) return true;
+      if (ggml_can_repeat(a, b)) {
+        // a is smaller — must expand since ggml only broadcasts b over a.
+        // ggml_repeat output is already contiguous, no ggml_cont needed.
+        a = ggml_repeat(ctx, a, b);
       } else if (auto * bb = try_repeat_1d_to_match(b, a)) {
         b = bb;
       } else if (auto * aa = try_repeat_1d_to_match(a, b)) {
@@ -2534,8 +2535,32 @@ static Error build_graph(
           struct ggml_tensor* mask = nullptr;
           if (srcs.size() > 3 && srcs[3] != nullptr) {
             mask = srcs[3];
-            if (mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64) {
-              // Boolean mask → additive F16 via custom op (runs at compute time)
+            if ((mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64)
+                && mask->op == GGML_OP_NONE && mask->data != nullptr) {
+              // Pre-computed boolean mask — convert to F16 additive at build time.
+              // This avoids a custom op + CPU↔Metal copies at each attention layer.
+              int64_t n = ggml_nelements(mask);
+              ggml_set_no_alloc(ctx, false);
+              struct ggml_tensor* f16_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,
+                  mask->ne[0], mask->ne[1], mask->ne[2], mask->ne[3]);
+              ggml_set_no_alloc(ctx, true);
+              const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+              const ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-INFINITY);
+              ggml_fp16_t* dst_data = (ggml_fp16_t*)f16_mask->data;
+              if (mask->type == GGML_TYPE_I32) {
+                const int32_t* src_data = (const int32_t*)mask->data;
+                for (int64_t j = 0; j < n; j++) {
+                  dst_data[j] = src_data[j] ? zero_f16 : neg_inf_f16;
+                }
+              } else {
+                const int64_t* src_data = (const int64_t*)mask->data;
+                for (int64_t j = 0; j < n; j++) {
+                  dst_data[j] = src_data[j] ? zero_f16 : neg_inf_f16;
+                }
+              }
+              mask = f16_mask;
+            } else if (mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64) {
+              // Non-constant boolean mask — fall back to custom op at compute time.
               struct ggml_tensor* args[1] = {mask};
               mask = ggml_custom_4d(ctx, GGML_TYPE_F16,
                   mask->ne[0], mask->ne[1], mask->ne[2], mask->ne[3],
