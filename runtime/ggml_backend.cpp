@@ -734,6 +734,15 @@ struct SavedGraphConstant {
   std::vector<uint8_t> data;
 };
 
+static uint64_t fnv1a_64(const uint8_t* data, size_t len) {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (size_t i = 0; i < len; i++) {
+    h ^= data[i];
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
+
 struct GgmlDelegateHandle {
   struct ggml_context* ctx = nullptr;
   struct ggml_cgraph* graph = nullptr;
@@ -750,8 +759,14 @@ struct GgmlDelegateHandle {
   // Constant data saved during build_graph, restored after sched_reset.
   std::vector<SavedGraphConstant> saved_constants;
 
-  // Whether constants need re-copy (true after sched_reset reallocates).
-  bool constants_need_copy = true;
+  // Constant integrity detection across execute() calls.
+  // After the first compute, some constants may be corrupted by gallocr
+  // buffer sharing (an intermediate tensor's buffer overlaps a constant's).
+  // On the second call we probe ALL constants to find which are corrupted,
+  // then only re-copy those on subsequent calls.
+  static constexpr size_t CONST_SIG_SIZE = 64;
+  int execute_count = 0;                    // 0=never, 1=once, 2+=probed
+  std::vector<bool> const_needs_restore;    // per-constant: true if corrupted
 
   // Primary backend (GPU when available, otherwise CPU)
   ggml_backend_t backend = nullptr;
@@ -3417,7 +3432,10 @@ static Error build_graph(
     if (sc.tensor->buffer == nullptr) continue;
     ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
   }
-  handle->constants_need_copy = false;
+
+  // 5b. Reset constant integrity tracking for the new graph.
+  handle->execute_count = 0;
+  handle->const_needs_restore.clear();
 
   // 6. Free the temporary CPU host buffer.
   if (host_buf) {
@@ -3791,10 +3809,9 @@ Error GgmlBackendInterface::execute(
   }
 
   // Execute the graph via scheduler.
-  // Reset + re-alloc + re-copy constants before every compute. The scheduler
-  // caches cross-backend transfer state that goes stale when inputs change,
-  // and sched_reset is the only way to clear it. Constants must be restored
-  // since reset frees the underlying buffer allocations.
+  // Reset + re-alloc before every compute to clear stale cross-backend state.
+  // Then check whether constants survived via a signature probe (first call
+  // only). If they survive, skip the expensive bulk re-copy on all future calls.
   if (!handle->sched) {
     return Error::InvalidState;
   }
@@ -3803,9 +3820,50 @@ Error GgmlBackendInterface::execute(
     fprintf(stderr, "[ggml_backend] ERROR: scheduler re-alloc failed\n");
     return Error::MemoryAllocationFailed;
   }
-  for (const auto& sc : handle->saved_constants) {
-    if (sc.tensor->buffer == nullptr) continue;
-    ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
+  // Restore constants if needed.
+  // execute_count 0: first call — always restore (build_graph loaded them,
+  //   but sched_reset+alloc just ran and may have invalidated them).
+  // execute_count 1: second call — probe whether constants survived the
+  //   previous compute + this reset+alloc cycle. Cache the result.
+  // execute_count 2+: use cached result. Skip restore if constants survive.
+  {
+    if (handle->execute_count == 0) {
+      // First call: always restore all constants.
+      for (const auto& sc : handle->saved_constants) {
+        if (sc.tensor->buffer == nullptr) continue;
+        ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
+      }
+    } else if (handle->execute_count == 1) {
+      // Second call: probe each constant to find which were corrupted by
+      // the first compute. Build a per-constant mask for future calls.
+      handle->const_needs_restore.resize(handle->saved_constants.size(), false);
+      for (size_t i = 0; i < handle->saved_constants.size(); i++) {
+        auto& sc = handle->saved_constants[i];
+        if (sc.tensor->buffer == nullptr) continue;
+        size_t n = std::min<size_t>(GgmlDelegateHandle::CONST_SIG_SIZE, sc.data.size());
+        uint8_t sample[GgmlDelegateHandle::CONST_SIG_SIZE] = {};
+        ggml_backend_tensor_get(sc.tensor, sample, 0, n);
+        if (fnv1a_64(sample, n) != fnv1a_64(sc.data.data(), n)) {
+          handle->const_needs_restore[i] = true;
+        }
+      }
+      // Restore only corrupted constants.
+      for (size_t i = 0; i < handle->saved_constants.size(); i++) {
+        if (!handle->const_needs_restore[i]) continue;
+        auto& sc = handle->saved_constants[i];
+        if (sc.tensor->buffer == nullptr) continue;
+        ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
+      }
+    } else {
+      // Steady state: restore only the constants known to be corrupted.
+      for (size_t i = 0; i < handle->saved_constants.size(); i++) {
+        if (i >= handle->const_needs_restore.size() || !handle->const_needs_restore[i]) continue;
+        auto& sc = handle->saved_constants[i];
+        if (sc.tensor->buffer == nullptr) continue;
+        ggml_backend_tensor_set(sc.tensor, sc.data.data(), 0, sc.data.size());
+      }
+    }
+    handle->execute_count = std::min(handle->execute_count + 1, 2);
   }
   enum ggml_status status = ggml_backend_sched_graph_compute(handle->sched, handle->graph);
   if (status != GGML_STATUS_SUCCESS) {
