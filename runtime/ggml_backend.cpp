@@ -734,6 +734,66 @@ struct SavedGraphConstant {
   std::vector<uint8_t> data;
 };
 
+// ---------------------------------------------------------------------------
+// Per-op profiling (enabled by GGML_PROFILE=1 environment variable)
+// ---------------------------------------------------------------------------
+// Uses the scheduler's eval callback to time each node. Forces per-node
+// synchronization, so measured times include sync overhead and don't reflect
+// pipelined throughput. Useful for identifying expensive ops.
+
+struct OpProfile {
+  int64_t total_us = 0;
+  int count = 0;
+};
+
+struct ProfileContext {
+  std::unordered_map<int, OpProfile> by_op;  // ggml_op -> timing
+  int64_t t_start = 0;
+};
+
+static bool profile_eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
+  auto* ctx = static_cast<ProfileContext*>(user_data);
+  if (ask) {
+    // Before compute: record start time
+    ctx->t_start = ggml_time_us();
+    return true;  // yes, we want to observe this node
+  }
+  // After compute + sync: record elapsed
+  int64_t elapsed = ggml_time_us() - ctx->t_start;
+  auto& p = ctx->by_op[t->op];
+  p.total_us += elapsed;
+  p.count++;
+  return true;
+}
+
+static void print_profile(const ProfileContext& ctx) {
+  // Sort by total time descending
+  std::vector<std::pair<int, OpProfile>> sorted(ctx.by_op.begin(), ctx.by_op.end());
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto& a, const auto& b) { return a.second.total_us > b.second.total_us; });
+
+  int64_t total = 0;
+  for (auto& [op, p] : sorted) total += p.total_us;
+
+  fprintf(stderr, "\n[ggml_profile] Per-op timing (total %.1f ms):\n", total / 1000.0);
+  fprintf(stderr, "  %-25s %8s %6s %8s %5s\n", "OP", "TOTAL", "COUNT", "AVG", "%");
+  fprintf(stderr, "  %-25s %8s %6s %8s %5s\n", "-------------------------", "--------", "------", "--------", "-----");
+  for (auto& [op, p] : sorted) {
+    if (p.total_us < 10) continue;  // skip noise
+    double pct = total > 0 ? 100.0 * p.total_us / total : 0;
+    fprintf(stderr, "  %-25s %7.1fms %5d  %6.1fus %4.1f%%\n",
+            ggml_op_name((enum ggml_op)op),
+            p.total_us / 1000.0, p.count,
+            (double)p.total_us / p.count, pct);
+  }
+  fprintf(stderr, "\n");
+}
+
+// Ensure tensor is contiguous. No-op if already contiguous.
+static inline struct ggml_tensor* ensure_cont(struct ggml_context* ctx, struct ggml_tensor* t) {
+  return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
+}
+
 static uint64_t fnv1a_64(const uint8_t* data, size_t len) {
   uint64_t h = 0xcbf29ce484222325ULL;
   for (size_t i = 0; i < len; i++) {
@@ -1721,7 +1781,7 @@ static Error build_graph(
             struct ggml_tensor* w2d = ggml_reshape_2d(ctx, weight,
                                                       weight->ne[2], weight->ne[3]);
             // input ggml shape: [W, H, C_in, N] → collapse spatial to [W*H, C_in, N, 1]
-            struct ggml_tensor* inp3d = ggml_reshape_3d(ctx, input,
+            struct ggml_tensor* inp3d = ggml_reshape_3d(ctx, ensure_cont(ctx, input),
                                                         input->ne[0] * input->ne[1],
                                                         input->ne[2],
                                                         input->ne[3]);
@@ -1889,8 +1949,8 @@ static Error build_graph(
             }
           }
 
-          gt = ggml_reshape_4d(ctx, srcs[0], new_ne[0], new_ne[1], new_ne[2], new_ne[3]);
-          gt = ggml_cont(ctx, gt);
+          gt = ggml_reshape_4d(ctx, ensure_cont(ctx, srcs[0]),
+                              new_ne[0], new_ne[1], new_ne[2], new_ne[3]);
           break;
         }
 
@@ -1917,8 +1977,6 @@ static Error build_graph(
 
           // ggml_permute(ctx, tensor, axis0, axis1, axis2, axis3)
           gt = ggml_permute(ctx, srcs[0], perm[0], perm[1], perm[2], perm[3]);
-          // Make contiguous so that output copy works correctly.
-          gt = ggml_cont(ctx, gt);
           break;
         }
 
@@ -1942,8 +2000,6 @@ static Error build_graph(
           perm[ax0] = perm[ax1];
           perm[ax1] = tmp;
           gt = ggml_permute(ctx, srcs[0], perm[0], perm[1], perm[2], perm[3]);
-          // Make contiguous so that output copy works correctly.
-          gt = ggml_cont(ctx, gt);
           break;
         }
 
@@ -1984,7 +2040,7 @@ static Error build_graph(
               ggml_free(ctx);
               return Error::InvalidArgument;
             }
-            gt = ggml_reshape_4d(ctx, a, ne[0], ne[1], ne[2], ne[3]);
+            gt = ggml_reshape_4d(ctx, ensure_cont(ctx, a), ne[0], ne[1], ne[2], ne[3]);
             break;
           }
 
@@ -2011,7 +2067,7 @@ static Error build_graph(
           for (int d = 0; d < out_ndim; ++d) {
             out_ne[d] = pt_out[out_ndim - 1 - d];
           }
-          gt = ggml_reshape_4d(ctx, a, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+          gt = ggml_reshape_4d(ctx, ensure_cont(ctx, a), out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
           break;
         }
 
@@ -2115,8 +2171,12 @@ static Error build_graph(
           size_t offset = static_cast<size_t>(start) * a->nb[ax];
           gt = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3],
                             a->nb[1], a->nb[2], a->nb[3], offset);
-          // Make contiguous so downstream ops and output copy work.
-          gt = ggml_cont(ctx, gt);
+          // Only make contiguous if the slice created a non-contiguous view.
+          // Slicing the innermost dimension or taking the full outer dimension
+          // produces a contiguous result and doesn't need a copy.
+          if (!ggml_is_contiguous(gt)) {
+            gt = ggml_cont(ctx, gt);
+          }
           break;
         }
 
@@ -2128,9 +2188,9 @@ static Error build_graph(
           }
           int32_t ax = 0;
           memcpy(&ax, t->op_params()->data(), 4);
-          struct ggml_tensor* cur = srcs[0];
+          struct ggml_tensor* cur = ensure_cont(ctx, srcs[0]);
           for (size_t si = 1; si < srcs.size(); ++si) {
-            cur = ggml_concat(ctx, cur, srcs[si], ax);
+            cur = ggml_concat(ctx, cur, ensure_cont(ctx, srcs[si]), ax);
           }
           gt = cur;
           break;
@@ -2496,12 +2556,11 @@ static Error build_graph(
           }
 
           struct ggml_tensor* attn = ggml_flash_attn_ext(
-              ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+              ctx, ensure_cont(ctx, q), k, v, mask, scale, 0.0f, 0.0f);
           ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
           // ggml_flash_attn_ext returns [D, H, T, B], but the surrounding
           // lowered graph expects [D, T, H, B] (ggml order for [B, H, T, D]).
           gt = ggml_permute(ctx, attn, 0, 2, 1, 3);
-          gt = ggml_cont(ctx, gt);
           break;
         }
 
@@ -2641,11 +2700,10 @@ static Error build_graph(
             perm[0] = ggml_axis;
             perm[ggml_axis] = 0;
             x = ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3]);
-            x = ggml_cont(ctx, x);
+            x = ensure_cont(ctx, x);
             x = ggml_soft_max(ctx, x);
             // Permute back
-            x = ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3]);
-            gt = ggml_cont(ctx, x);
+            gt = ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3]);
           }
           break;
         }
@@ -3091,7 +3149,7 @@ static Error build_graph(
             memcpy(&has_bias, data + 8, sizeof(int32_t));
           }
 
-          gt = ggml_norm(ctx, srcs[0], eps);
+          gt = ggml_norm(ctx, ensure_cont(ctx, srcs[0]), eps);
 
           if (has_weight && srcs.size() > 1) {
             struct ggml_tensor* w = srcs[1];
@@ -3302,7 +3360,7 @@ static Error build_graph(
             }
           }
 
-          gt = ggml_pad_ext(ctx, srcs[0],
+          gt = ggml_pad_ext(ctx, ensure_cont(ctx, srcs[0]),
                             left[0], right[0],
                             left[1], right[1],
                             left[2], right[2],
@@ -3331,6 +3389,10 @@ static Error build_graph(
             [](const auto& a, const auto& b) { return a.first < b.first; });
   std::vector<struct ggml_tensor*> output_tensors;
   for (auto& [idx, tensor] : output_pairs) {
+    // Output tensors must be contiguous for backend_tensor_get in execute().
+    if (!ggml_is_contiguous(tensor)) {
+      tensor = ggml_cont(ctx, tensor);
+    }
     output_tensors.push_back(tensor);
   }
 
@@ -3865,7 +3927,24 @@ Error GgmlBackendInterface::execute(
     }
     handle->execute_count = std::min(handle->execute_count + 1, 2);
   }
+  // Per-op profiling (GGML_PROFILE=1)
+  static int profile_mode = -1;
+  if (profile_mode < 0) {
+    const char* env = std::getenv("GGML_PROFILE");
+    profile_mode = (env && std::string(env) != "0") ? 1 : 0;
+  }
+  ProfileContext prof_ctx;
+  if (profile_mode) {
+    ggml_backend_sched_set_eval_callback(handle->sched, profile_eval_callback, &prof_ctx);
+  }
+
   enum ggml_status status = ggml_backend_sched_graph_compute(handle->sched, handle->graph);
+
+  if (profile_mode) {
+    ggml_backend_sched_set_eval_callback(handle->sched, nullptr, nullptr);
+    print_profile(prof_ctx);
+  }
+
   if (status != GGML_STATUS_SUCCESS) {
     fprintf(stderr, "[ggml_backend] ERROR: scheduler graph compute failed: %s (%d)\n",
             ggml_status_to_string(status), (int)status);
