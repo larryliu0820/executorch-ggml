@@ -79,7 +79,7 @@ BenchmarkStats run_benchmark(
       auto input = from_blob(&token, {1, 1}, ScalarType::Long);
       int64_t pos = 0;
       auto pos_tensor = from_blob(&pos, {1}, ScalarType::Long);
-      model.forward(input, pos_tensor);
+      (void)model.forward(std::vector<EValue>{EValue(*input), EValue(*pos_tensor)});
     }
     std::cout << "Warmup complete." << std::endl;
   }
@@ -95,7 +95,7 @@ BenchmarkStats run_benchmark(
     int64_t pos = static_cast<int64_t>(i);
     auto pos_tensor = from_blob(&pos, {1}, ScalarType::Long);
 
-    auto result = model.forward(input, pos_tensor);
+    auto result = model.forward(std::vector<EValue>{EValue(*input), EValue(*pos_tensor)});
     if (!result.ok()) {
       std::cerr << "Error during prefill at position " << i << std::endl;
       return stats;
@@ -118,7 +118,7 @@ BenchmarkStats run_benchmark(
   for (int i = 0; i < max_new_tokens; ++i) {
     // Get logits from last forward pass
     Tensor logits_tensor = outputs[0].toTensor();
-    const float* logits = logits_tensor.data_ptr<float>();
+    const float* logits = logits_tensor.const_data_ptr<float>();
     size_t vocab_size = static_cast<size_t>(logits_tensor.numel());
 
     // Sample next token
@@ -129,7 +129,7 @@ BenchmarkStats run_benchmark(
     auto input = from_blob(&next_token, {1, 1}, ScalarType::Long);
     auto pos_tensor = from_blob(&current_pos, {1}, ScalarType::Long);
 
-    auto result = model.forward(input, pos_tensor);
+    auto result = model.forward(std::vector<EValue>{EValue(*input), EValue(*pos_tensor)});
     if (!result.ok()) {
       std::cerr << "Error during decode at position " << current_pos << std::endl;
       break;
