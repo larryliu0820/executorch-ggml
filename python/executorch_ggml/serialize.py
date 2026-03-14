@@ -99,6 +99,7 @@ OP_PAD = 82
 
 # KV cache ops
 OP_UPDATE_CACHE = 74
+OP_GELU = 75
 
 # Fused attention (llama.cpp/ggml)
 OP_LLAMA_ATTENTION = 60
@@ -135,6 +136,7 @@ class IrTensor:
         "input_index",
         "sym_dim_ids",
         "sym_dim_exprs",
+        "elem_size",
     )
 
     def __init__(
@@ -151,6 +153,7 @@ class IrTensor:
         input_index: int = -1,
         sym_dim_ids: Optional[List[int]] = None,
         sym_dim_exprs: Optional[bytes] = None,
+        elem_size: int = 0,
     ):
         self.id = tensor_id
         self.tensor_type = tensor_type
@@ -164,6 +167,7 @@ class IrTensor:
         self.input_index = input_index
         self.sym_dim_ids = sym_dim_ids or []
         self.sym_dim_exprs = sym_dim_exprs or b""
+        self.elem_size = elem_size
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +226,8 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
             sym_exprs_vec = None
 
         # Build the Tensor table
-        # Start table with the right number of fields (12 fields)
-        builder.StartObject(12)
+        # Start table with the right number of fields (13 fields)
+        builder.StartObject(13)
 
         builder.PrependInt32Slot(0, t.id, 0)           # id
         builder.PrependInt32Slot(1, t.tensor_type, 0)  # type
@@ -243,6 +247,8 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
             builder.PrependUOffsetTRelativeSlot(10, sym_vec, 0)  # sym_dim_ids
         if sym_exprs_vec is not None:
             builder.PrependUOffsetTRelativeSlot(11, sym_exprs_vec, 0)  # sym_dim_exprs
+        if t.elem_size > 0:
+            builder.PrependUint8Slot(12, t.elem_size, 0)  # elem_size
 
         tensor_offsets.append(builder.EndObject())
 
@@ -527,6 +533,11 @@ def pack_pad_params(pads: List[int], value: float = 0.0) -> bytes:
         parts.append(struct.pack("<ii", left, right))
     parts.append(struct.pack("<f", float(value)))
     return b"".join(parts)
+
+
+def pack_sdpa_params(is_causal: bool = False) -> bytes:
+    """Pack scaled_dot_product_attention parameters: is_causal (int32)."""
+    return struct.pack("<i", int(is_causal))
 
 
 def pack_update_cache_params(seq_dim: int = 1) -> bytes:

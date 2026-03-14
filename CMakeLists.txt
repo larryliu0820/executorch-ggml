@@ -15,13 +15,14 @@ message("LLAMA_CPP_DIR being set to ${LLAMA_CPP_DIR}")
 message("EXECUTORCH_DIR being set to ${EXECUTORCH_DIR}")
 
 # ---------------------------------------------------------------------------
-# FlatBuffers / flatc – build from source or find on PATH
+# FlatBuffers / flatc
 # ---------------------------------------------------------------------------
-# Prefer building flatc from the flatbuffers source bundled inside the
-# ExecuTorch submodule.  This makes the build self-contained: after
-#   git submodule update --init --recursive
-# no system flatc is required.
+# Build flatc from the flatbuffers source bundled inside the ExecuTorch
+# submodule.  This guarantees the generated header matches the library version
+# (the static_assert in the generated header checks major.minor.revision).
+# Falls back to a system flatc only when the submodule source is missing.
 set(FLATBUFFERS_SOURCE_DIR "${EXECUTORCH_DIR}/third-party/flatbuffers")
+
 if(EXISTS "${FLATBUFFERS_SOURCE_DIR}/CMakeLists.txt")
   set(FLATBUFFERS_BUILD_FLATC ON CACHE BOOL "" FORCE)
   set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -29,11 +30,16 @@ if(EXISTS "${FLATBUFFERS_SOURCE_DIR}/CMakeLists.txt")
   set(FLATBUFFERS_BUILD_FLATHASH OFF CACHE BOOL "" FORCE)
   add_subdirectory("${FLATBUFFERS_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/flatbuffers" EXCLUDE_FROM_ALL)
   set(FLATC_EXECUTABLE $<TARGET_FILE:flatc>)
+  set(FLATC_IS_TARGET TRUE)
   message(STATUS "flatc: building from source (${FLATBUFFERS_SOURCE_DIR})")
 else()
   find_program(FLATC_EXECUTABLE flatc)
+  set(FLATC_IS_TARGET FALSE)
   if(FLATC_EXECUTABLE)
     message(STATUS "flatc: using system binary (${FLATC_EXECUTABLE})")
+    message(WARNING
+      "System flatc may not match the bundled flatbuffers library version. "
+      "If you get version mismatch errors, run: git submodule update --init --recursive")
   else()
     message(WARNING
       "flatc not found and ${FLATBUFFERS_SOURCE_DIR} does not exist. "
@@ -43,11 +49,16 @@ else()
 endif()
 
 if(FLATC_EXECUTABLE)
+  set(_flatc_deps "${CMAKE_CURRENT_SOURCE_DIR}/schema/ggml_ir.fbs")
+  if(FLATC_IS_TARGET)
+    list(APPEND _flatc_deps flatc)
+  endif()
   add_custom_command(
     OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/schema/ggml_ir_generated.h"
-    COMMAND "${FLATC_EXECUTABLE}" --cpp -o "${CMAKE_CURRENT_SOURCE_DIR}/schema"
+    COMMAND "${FLATC_EXECUTABLE}" --scoped-enums --cpp
+            -o "${CMAKE_CURRENT_SOURCE_DIR}/schema"
             "${CMAKE_CURRENT_SOURCE_DIR}/schema/ggml_ir.fbs"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/schema/ggml_ir.fbs" flatc
+    DEPENDS ${_flatc_deps}
     COMMENT "Regenerating schema/ggml_ir_generated.h"
   )
   add_custom_target(ggml_ir_gen

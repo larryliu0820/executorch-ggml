@@ -95,7 +95,10 @@ enum OpCode : int32 {
     ANY = 73,            // src_ids: [x] op_params: int32 dim, int32 ndim
 
     // KV cache ops
-    UPDATE_CACHE = 74    // src_ids: [cache, value, start_pos] op_params: int32 seq_dim
+    UPDATE_CACHE = 74,   // src_ids: [cache, value, start_pos] op_params: int32 seq_dim
+
+    // Activations (continued)
+    GELU = 75            // src_ids: [x]
 }
 
 enum TensorType : int32 {
@@ -138,6 +141,12 @@ table Tensor {
     //   [len0: u16][bytecode0: len0 bytes][len1: u16][...][len2: u16][...][len3: u16][...]
     // Only present when sym_dim_ids contains -2 sentinels.
     sym_dim_exprs:[uint8];
+
+    // Bytes per element for eager context-pool allocations at graph-build time.
+    // 0 = no eager allocation. > 0 = runtime computes:
+    //   resolved_ne[0] * ne[1] * ne[2] * ne[3] * elem_size
+    // Uses the tensor's own ne/sym_dim_ids/sym_dim_exprs for shape resolution.
+    elem_size:uint8 = 0;
 }
 
 table GgmlGraph {

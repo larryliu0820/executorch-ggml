@@ -917,6 +917,65 @@ static struct ggml_tensor* try_eager_scalar_binop(
   return gt;
 }
 
+static struct ggml_tensor* safe_ggml_permute(struct ggml_context* ctx, struct ggml_tensor* a,
+                                              int axis0, int axis1, int axis2, int axis3,
+                                              const char* caller) {
+  if (axis0 < 0 || axis0 >= GGML_MAX_DIMS || axis1 < 0 || axis1 >= GGML_MAX_DIMS ||
+      axis2 < 0 || axis2 >= GGML_MAX_DIMS || axis3 < 0 || axis3 >= GGML_MAX_DIMS) {
+    fprintf(stderr, "[ggml_backend] %s: invalid permute axes [%d,%d,%d,%d], src ne=[%lld,%lld,%lld,%lld]\n",
+            caller, axis0, axis1, axis2, axis3,
+            (long long)a->ne[0], (long long)a->ne[1], (long long)a->ne[2], (long long)a->ne[3]);
+    // Clamp to identity permute to avoid crash
+    return a;
+  }
+  return ggml_permute(ctx, a, axis0, axis1, axis2, axis3);
+}
+
+// Resolve the shape of an IR tensor, applying symbolic overrides when available.
+// Shared by ctx_size estimation (before ggml_init) and tensor creation (Phase B).
+static void resolve_ir_shape(
+    const ggml_ir::Tensor* t,
+    const int64_t* input_ne_overrides,
+    const std::unordered_map<int32_t, int64_t>& sym_dim_values,
+    int64_t ne[4],
+    int& n_dims) {
+  ne[0] = ne[1] = ne[2] = ne[3] = 1;
+  if (t->ne() && t->ne()->size() > 0) {
+    for (size_t d = 0; d < t->ne()->size() && d < 4; ++d) {
+      ne[d] = t->ne()->Get(d);
+    }
+  }
+  if (input_ne_overrides && t->is_input() && t->sym_dim_ids()) {
+    int input_idx = t->input_index();
+    for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
+      int32_t sid = t->sym_dim_ids()->Get(d);
+      if (sid >= 0) {
+        ne[d] = input_ne_overrides[input_idx * 4 + d];
+      }
+    }
+  }
+  if (!t->is_input() && t->sym_dim_ids() && !sym_dim_values.empty()) {
+    for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
+      int32_t sid = t->sym_dim_ids()->Get(d);
+      if (sid == -2) {
+        const uint8_t* code = nullptr;
+        size_t code_len = 0;
+        if (get_dim_expr_bytecode(t->sym_dim_exprs(), d, code, code_len)) {
+          ne[d] = eval_sym_expr(code, code_len, sym_dim_values);
+        }
+      } else if (sid >= 0) {
+        auto it = sym_dim_values.find(sid);
+        if (it != sym_dim_values.end()) ne[d] = it->second;
+      }
+    }
+  }
+  n_dims = 4;
+  for (int d = 3; d >= 1; --d) {
+    if (ne[d] == 1) { n_dims = d; } else { break; }
+  }
+  if (n_dims == 0) n_dims = 1;
+}
+
 // input_ne_overrides: nullptr on first call (use serialized shapes).
 //   In M2+ this will carry runtime shapes for dynamic dims.
 // n_overrides: number of int64_t values (n_inputs × 4).
@@ -959,53 +1018,67 @@ static Error build_graph(
     est_graph_size = GGML_DEFAULT_GRAPH_SIZE;
   }
 
-  // Eager ops (ARANGE, FULL, CUMSUM, EQ, NE, CAST, etc.) create
-  // data-filled leaf tensors during op dispatch.  Their data is allocated
-  // inline from the context pool (no_alloc temporarily false).
-  // Estimate the headroom needed for these eager allocations.
+  // Build sym_dim_values early: needed for shape-aware eager size estimation.
+  // Maps symbolic variable ID → runtime concrete value from input tensors.
+  std::unordered_map<int32_t, int64_t> sym_dim_values;
+  if (input_ne_overrides) {
+    for (int i = 0; i < n_tensors; ++i) {
+      const auto* ti = fb_tensors->Get(i);
+      if (!ti->is_input() || !ti->sym_dim_ids() || !ti->ne()) continue;
+      int input_idx = ti->input_index();
+      for (size_t d = 0; d < ti->sym_dim_ids()->size() && d < 4; ++d) {
+        int32_t sid = ti->sym_dim_ids()->Get(d);
+        if (sid >= 0) {
+          sym_dim_values[sid] = input_ne_overrides[input_idx * 4 + d];
+        }
+      }
+    }
+  }
+
+  // Eager ops create data-filled leaf tensors during op dispatch, allocated
+  // from the context pool. Use serialized elem_size metadata to compute
+  // accurate data sizes from resolved runtime shapes.
   size_t eager_data_estimate = 0;
   for (int i = 0; i < n_tensors; ++i) {
     const auto* t = fb_tensors->Get(i);
-    auto op = static_cast<ggml_ir::OpCode>(t->op());
-    if (op == ggml_ir::OpCode::NONE) continue;
-    // Only count ops known to create data-filled tensors during build.
-    bool is_eager = false;
-    // Only count ops that ALWAYS create data-filled tensors during build.
-    // ADD/SUB are only eager for I64 (rare, small). CAST is only eager for
-    // I64 sources or scalars (also small). Skip those to avoid inflating
-    // the estimate with large max-shape tensors.
-    switch (op) {
-      case ggml_ir::OpCode::ARANGE:
-      case ggml_ir::OpCode::FULL:
-      case ggml_ir::OpCode::CUMSUM:
-      case ggml_ir::OpCode::EQ:
-      case ggml_ir::OpCode::NE:
-      case ggml_ir::OpCode::ANY:
-      case ggml_ir::OpCode::INDEX_PUT:
-        is_eager = true;
-        break;
-      default:
-        break;
+    uint8_t elem_size = t->elem_size();
+
+    if (elem_size > 0) {
+      // Resolve shape using tensor's own ne + sym_dim_ids
+      int64_t ne[4]; int nd;
+      resolve_ir_shape(t, input_ne_overrides, sym_dim_values, ne, nd);
+      eager_data_estimate += (size_t)ne[0] * ne[1] * ne[2] * ne[3] * elem_size;
+      continue;
     }
-    if (!is_eager) continue;
-    size_t n_elems = 1;
-    if (t->ne()) {
-      for (size_t d = 0; d < t->ne()->size(); ++d) {
-        n_elems *= static_cast<size_t>(t->ne()->Get(d));
+
+    // Runtime special case: LLAMA_ATTENTION causal mask [T_kv, T_q] × F16
+    if (static_cast<ggml_ir::OpCode>(t->op()) == ggml_ir::OpCode::LLAMA_ATTENTION) {
+      bool is_causal = false;
+      if (t->op_params() && t->op_params()->size() >= 4) {
+        int32_t ic; memcpy(&ic, t->op_params()->data(), sizeof(int32_t));
+        is_causal = (ic != 0);
+      }
+      if (is_causal && t->src_ids() && t->src_ids()->size() >= 2) {
+        int64_t q_ne[4], k_ne[4]; int qnd, knd;
+        resolve_ir_shape(fb_tensors->Get(t->src_ids()->Get(0)),
+                         input_ne_overrides, sym_dim_values, q_ne, qnd);
+        resolve_ir_shape(fb_tensors->Get(t->src_ids()->Get(1)),
+                         input_ne_overrides, sym_dim_values, k_ne, knd);
+        eager_data_estimate += (size_t)k_ne[1] * q_ne[1] * sizeof(ggml_fp16_t);
       }
     }
-    // Worst-case element size (I64 = 8 bytes) + per-tensor overhead.
-    eager_data_estimate += n_elems * 8 + ggml_tensor_overhead() + 64;
   }
-  // Safety multiplier: compound dispatch may create sub-tensors.
-  eager_data_estimate = std::max(eager_data_estimate * 2, (size_t)(4 * 1024 * 1024));
+  // Safety margin: 2x + 4 MB for misc small allocs (make_f32_scalar, CAST, etc.)
+  eager_data_estimate = eager_data_estimate * 2 + 4 * 1024 * 1024;
 
   size_t ctx_size =
-      static_cast<size_t>(n_tensors) * 4 * ggml_tensor_overhead() +
+      static_cast<size_t>(n_tensors) * 8 * ggml_tensor_overhead() +
       ggml_graph_overhead_custom(est_graph_size, false) +
       eager_data_estimate;
-  fprintf(stderr, "[ggml_backend] ctx_size=%zu MB, tensor_overhead=%zu, n_tensors=%d\n",
-          ctx_size / (1024*1024), ggml_tensor_overhead(), n_tensors);
+  fprintf(stderr, "[ggml_backend] ctx_size=%zu MB (eager=%zu MB, tensor_oh=%zu MB, graph_oh=%zu MB), n_tensors=%d\n",
+          ctx_size / (1024*1024), eager_data_estimate / (1024*1024),
+          (static_cast<size_t>(n_tensors) * 8 * ggml_tensor_overhead()) / (1024*1024),
+          ggml_graph_overhead_custom(est_graph_size, false) / (1024*1024), n_tensors);
 
   struct ggml_init_params params = {
       /* .mem_size   = */ ctx_size,
@@ -1040,60 +1113,11 @@ static Error build_graph(
   // Deferred I64→I32 casts (for input tensors).
   std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>> deferred_i64_to_i32;
 
-  // Build sym_dim_values: symbolic variable ID → runtime concrete value.
-  // Populated from input tensors that have sym_dim_ids annotations.
-  std::unordered_map<int32_t, int64_t> sym_dim_values;
-  if (input_ne_overrides) {
-    for (int i = 0; i < n_tensors; ++i) {
-      const auto* ti = fb_tensors->Get(i);
-      if (!ti->is_input() || !ti->sym_dim_ids() || !ti->ne()) continue;
-      int input_idx = ti->input_index();
-      for (size_t d = 0; d < ti->sym_dim_ids()->size() && d < 4; ++d) {
-        int32_t sid = ti->sym_dim_ids()->Get(d);
-        if (sid >= 0) {
-          sym_dim_values[sid] = input_ne_overrides[input_idx * 4 + d];
-        }
-      }
-    }
-  }
+  // sym_dim_values already built above (Phase A, before ggml_init).
 
   // --- Shape resolution helper (shared by leaf and op passes) ---
   auto resolve_shape = [&](const ggml_ir::Tensor* t, int64_t ne[4], int& n_dims) {
-    ne[0] = ne[1] = ne[2] = ne[3] = 1;
-    if (t->ne() && t->ne()->size() > 0) {
-      for (size_t d = 0; d < t->ne()->size() && d < 4; ++d) {
-        ne[d] = t->ne()->Get(d);
-      }
-    }
-    if (input_ne_overrides && t->is_input() && t->sym_dim_ids()) {
-      int input_idx = t->input_index();
-      for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
-        int32_t sid = t->sym_dim_ids()->Get(d);
-        if (sid >= 0) {
-          ne[d] = input_ne_overrides[input_idx * 4 + d];
-        }
-      }
-    }
-    if (!t->is_input() && t->sym_dim_ids() && !sym_dim_values.empty()) {
-      for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
-        int32_t sid = t->sym_dim_ids()->Get(d);
-        if (sid == -2) {
-          const uint8_t* code = nullptr;
-          size_t code_len = 0;
-          if (get_dim_expr_bytecode(t->sym_dim_exprs(), d, code, code_len)) {
-            ne[d] = eval_sym_expr(code, code_len, sym_dim_values);
-          }
-        } else if (sid >= 0) {
-          auto it = sym_dim_values.find(sid);
-          if (it != sym_dim_values.end()) ne[d] = it->second;
-        }
-      }
-    }
-    n_dims = 4;
-    for (int d = 3; d >= 1; --d) {
-      if (ne[d] == 1) { n_dims = d; } else { break; }
-    }
-    if (n_dims == 0) n_dims = 1;
+    resolve_ir_shape(t, input_ne_overrides, sym_dim_values, ne, n_dims);
   };
 
   // --- IR type → ggml type helper ---
@@ -1282,7 +1306,7 @@ static Error build_graph(
           if (ax == non1_ax) continue;
           axes[out++] = ax;
         }
-        base = ggml_permute(ctx, base, axes[0], axes[1], axes[2], axes[3]);
+        base = safe_ggml_permute(ctx, base, axes[0], axes[1], axes[2], axes[3], "try_permute_base");
         base = ggml_cont(ctx, base);
       }
       for (int ax = 0; ax < 4; ++ax) {
@@ -1304,7 +1328,7 @@ static Error build_graph(
           // ax == 3: move axis0 -> axis3
           p0 = 1; p1 = 2; p2 = 3; p3 = 0;
         }
-        s4 = ggml_permute(ctx, s4, p0, p1, p2, p3);
+        s4 = safe_ggml_permute(ctx, s4, p0, p1, p2, p3, "try_permute_s4");
         // Make the view contiguous to satisfy ggml_can_repeat in some cases.
         s4 = ggml_cont(ctx, s4);
         if (ggml_can_repeat(s4, big)) {
@@ -1340,7 +1364,7 @@ static Error build_graph(
         {3,2,1,0},
       };
       for (const auto & p : perms) {
-        struct ggml_tensor * t = ggml_permute(ctx, src, p[0], p[1], p[2], p[3]);
+        struct ggml_tensor * t = safe_ggml_permute(ctx, src, p[0], p[1], p[2], p[3], "try_permute_reshape");
         if (ggml_are_same_shape(t, dst)) {
           return ggml_cont(ctx, t);
         }
@@ -1688,6 +1712,10 @@ static Error build_graph(
           gt = ggml_tanh(ctx, srcs[0]);
           break;
 
+        case ggml_ir::OpCode::GELU:
+          gt = ggml_gelu(ctx, srcs[0]);
+          break;
+
         case ggml_ir::OpCode::LINEAR: {
           // src_ids: [x, w, b?] where w is [out, in] in PyTorch.
           // Our IR stores shapes in ggml order, so weight ne is [in, out].
@@ -1985,7 +2013,15 @@ static Error build_graph(
           }
 
           // ggml_permute(ctx, tensor, axis0, axis1, axis2, axis3)
-          gt = ggml_permute(ctx, srcs[0], perm[0], perm[1], perm[2], perm[3]);
+          for (int32_t i = 0; i < 4; ++i) {
+            if (perm[i] < 0 || perm[i] >= 4) {
+              fprintf(stderr, "[ggml_backend] PERMUTE: invalid axis perm[%d]=%d (ndims=%d, perm=[%d,%d,%d,%d])\n",
+                      i, perm[i], ndims, perm[0], perm[1], perm[2], perm[3]);
+              ggml_free(ctx);
+              return Error::InvalidArgument;
+            }
+          }
+          gt = safe_ggml_permute(ctx, srcs[0], perm[0], perm[1], perm[2], perm[3], "PERMUTE");
           break;
         }
 
@@ -2001,14 +2037,25 @@ static Error build_graph(
           memcpy(&dim1, t->op_params()->data() + 4, 4);
           memcpy(&nd, t->op_params()->data() + 8, 4);
 
-          // Map PyTorch dims -> ggml axes using the PyTorch rank (not ggml_n_dims)
+          // Map PyTorch dims -> ggml axes using the PyTorch rank (not ggml_n_dims).
+          // Clamp nd to ggml's 4D limit.
+          if (nd > 4) nd = 4;
           int ax0 = (nd - 1) - dim0;
           int ax1 = (nd - 1) - dim1;
           int perm[4] = {0, 1, 2, 3};
-          int tmp = perm[ax0];
-          perm[ax0] = perm[ax1];
-          perm[ax1] = tmp;
-          gt = ggml_permute(ctx, srcs[0], perm[0], perm[1], perm[2], perm[3]);
+          if (ax0 >= 0 && ax0 < 4 && ax1 >= 0 && ax1 < 4) {
+            int tmp = perm[ax0];
+            perm[ax0] = perm[ax1];
+            perm[ax1] = tmp;
+          } else {
+            fprintf(stderr, "[ggml_backend] TRANSPOSE: bad axes ax0=%d ax1=%d (dim0=%d dim1=%d nd=%d)\n",
+                    ax0, ax1, dim0, dim1, nd);
+          }
+          fprintf(stderr, "[ggml_backend] TRANSPOSE: perm=[%d,%d,%d,%d] src_ne=[%lld,%lld,%lld,%lld]\n",
+                  perm[0], perm[1], perm[2], perm[3],
+                  (long long)srcs[0]->ne[0], (long long)srcs[0]->ne[1],
+                  (long long)srcs[0]->ne[2], (long long)srcs[0]->ne[3]);
+          gt = safe_ggml_permute(ctx, srcs[0], perm[0], perm[1], perm[2], perm[3], "TRANSPOSE");
           break;
         }
 
@@ -2534,6 +2581,14 @@ static Error build_graph(
           // F16 — BF16 values that exceed F16 max (~65504) would overflow to
           // Inf, producing +Inf in the dot product accumulation.
 
+          // Read is_causal from op_params (int32, default 0).
+          bool is_causal = false;
+          if (t->op_params() && t->op_params()->size() >= 4) {
+            int32_t ic;
+            memcpy(&ic, t->op_params()->data(), sizeof(int32_t));
+            is_causal = (ic != 0);
+          }
+
           // Optional attention mask.  ggml_flash_attn_ext requires it to be:
           //   - F16 additive logit bias (0.0=attend, -inf=don't attend)
           //   - contiguous
@@ -2591,7 +2646,28 @@ static Error build_graph(
               mask = ggml_cont(ctx, mask);
             }
           }
-          // scale = 1/sqrt(head_dim). head_dim is ne0 in ggml layout when tensors are [D, T, H, B]
+          // Build causal mask at runtime when is_causal=true and no explicit mask.
+          // Q is [D, T_q, H, B] in ggml layout. K is [D, T_kv, H, B].
+          // Mask shape: [T_kv, T_q, 1, 1] — lower-triangular F16 additive.
+          if (is_causal && mask == nullptr) {
+            int64_t T_q  = q->ne[1];
+            int64_t T_kv = k->ne[1];
+            ggml_set_no_alloc(ctx, false);
+            struct ggml_tensor* causal = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, T_kv, T_q, 1, 1);
+            ggml_set_no_alloc(ctx, true);
+            const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-INFINITY);
+            ggml_fp16_t* d = (ggml_fp16_t*)causal->data;
+            for (int64_t row = 0; row < T_q; row++) {
+              for (int64_t col = 0; col < T_kv; col++) {
+                // attend if col <= row + (T_kv - T_q) (handles prefill where T_kv >= T_q)
+                d[row * T_kv + col] = (col <= row + (T_kv - T_q)) ? zero_f16 : neg_inf_f16;
+              }
+            }
+            mask = causal;
+          }
+
+          // scale = 1/sqrt(head_dim). head_dim is ne0 in ggml layout when tensors are [D, T_q, H, B]
           float scale = 1.0f;
           if (q->ne[0] > 0) {
             scale = 1.0f / std::sqrt((float) q->ne[0]);
@@ -2602,7 +2678,10 @@ static Error build_graph(
           ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
           // ggml_flash_attn_ext returns [D, H, T, B], but the surrounding
           // lowered graph expects [D, T, H, B] (ggml order for [B, H, T, D]).
-          gt = ggml_permute(ctx, attn, 0, 2, 1, 3);
+          fprintf(stderr, "[ggml_backend] SDPA output: ne=[%lld,%lld,%lld,%lld] type=%d\n",
+                  (long long)attn->ne[0], (long long)attn->ne[1],
+                  (long long)attn->ne[2], (long long)attn->ne[3], attn->type);
+          gt = safe_ggml_permute(ctx, attn, 0, 2, 1, 3, "LLAMA_ATTN");
           break;
         }
 
@@ -2660,7 +2739,7 @@ static Error build_graph(
           if (t->op_params() && t->op_params()->size() >= 4) {
             memcpy(&scalar, t->op_params()->data(), sizeof(float));
           }
-          gt = ggml_scale(ctx, srcs[0], scalar);
+          gt = ggml_scale(ctx, ensure_cont(ctx, srcs[0]), scalar);
           break;
         }
 
@@ -2741,11 +2820,11 @@ static Error build_graph(
             int perm[4] = {0, 1, 2, 3};
             perm[0] = ggml_axis;
             perm[ggml_axis] = 0;
-            x = ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3]);
+            x = safe_ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3], "SOFTMAX_pre");
             x = ensure_cont(ctx, x);
             x = ggml_soft_max(ctx, x);
             // Permute back
-            gt = ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3]);
+            gt = safe_ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3], "SOFTMAX_post");
           }
           break;
         }
@@ -3029,7 +3108,25 @@ static Error build_graph(
         //   fewer graph nodes (better for CPU-only and Metal unified memory).
 
         case ggml_ir::OpCode::LE: {
-          struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
+          struct ggml_tensor* a = srcs[0];
+          struct ggml_tensor* b;
+          // Support scalar mode: op_params = [float64 scalar, int32 is_scalar]
+          double le_scalar = 0.0;
+          int32_t le_is_scalar = 0;
+          if (t->op_params() && t->op_params()->size() >= 12) {
+            memcpy(&le_scalar, t->op_params()->data(), 8);
+            memcpy(&le_is_scalar, t->op_params()->data() + 8, 4);
+          }
+          if (le_is_scalar) {
+            ggml_set_no_alloc(ctx, false);
+            b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+            ggml_set_no_alloc(ctx, true);
+            const size_t n = ggml_nelements(b);
+            float* d = (float*)b->data;
+            for (size_t j = 0; j < n; ++j) d[j] = (float)le_scalar;
+          } else {
+            b = srcs[1];
+          }
           if (use_native_cmp_ops) {
             if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
             if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
@@ -3147,7 +3244,11 @@ static Error build_graph(
             memcpy(&ndim, t->op_params()->data() + 4, 4);
           }
           struct ggml_tensor* src = srcs[0];
+          // Clamp ndim to ggml's 4D limit. Extra outer dims are collapsed.
+          if (ndim > 4) ndim = 4;
           int ggml_axis = (ndim - 1) - dim;
+          if (ggml_axis < 0) ggml_axis = 0;
+          if (ggml_axis > 3) ggml_axis = 3;
 
           if (src->op == GGML_OP_NONE && src->data != nullptr) {
             // Eager path: source data available at build time.
@@ -3200,14 +3301,14 @@ static Error build_graph(
               // Permute to bring ggml_axis to dim 0.
               int axes[4] = {0, 1, 2, 3};
               axes[0] = ggml_axis; axes[ggml_axis] = 0;
-              x = ggml_cont(ctx, ggml_permute(ctx, x, axes[0], axes[1], axes[2], axes[3]));
+              x = ggml_cont(ctx, safe_ggml_permute(ctx, x, axes[0], axes[1], axes[2], axes[3], "VIEW_cont"));
             }
             x = ggml_step(ctx, ggml_sum_rows(ctx, ggml_abs(ctx, x)));
             if (ggml_axis != 0) {
               // Permute back.
               int axes[4] = {0, 1, 2, 3};
               axes[0] = ggml_axis; axes[ggml_axis] = 0;
-              x = ggml_permute(ctx, x, axes[0], axes[1], axes[2], axes[3]);
+              x = safe_ggml_permute(ctx, x, axes[0], axes[1], axes[2], axes[3], "VIEW_nocont");
             }
             gt = x;
           }
@@ -3417,7 +3518,7 @@ static Error build_graph(
             int perm[4] = {0, 1, 2, 3};
             perm[0] = ggml_axis;
             perm[ggml_axis] = 0;
-            struct ggml_tensor* xp = ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3]);
+            struct ggml_tensor* xp = safe_ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3], "LAYER_NORM");
             xp = ggml_cont(ctx, xp);
             gt = ggml_argmax(ctx, xp);
           }
@@ -3889,11 +3990,15 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
   }
 
   // --- 6. Build initial graph with serialized shapes ---
-  Error err = build_graph(handle, nullptr, 0);
-  if (err != Error::Ok) {
-    cleanup_backends();
-    delete handle;
-    return err;
+  // For models with dynamic shapes, defer graph build to first execute()
+  // to avoid allocating huge max-shape eager tensors at init time.
+  if (!handle->has_dynamic) {
+    Error err = build_graph(handle, nullptr, 0);
+    if (err != Error::Ok) {
+      cleanup_backends();
+      delete handle;
+      return err;
+    }
   }
 
   // --- 7. Initialize last_input_ne from the initial graph's input shapes ---
