@@ -20,4 +20,5 @@ dist/
 .venv/
 model*.pte
 python/executorch_ggml/*.so
+python/executorch_ggml/*.so.*
 python/executorch_ggml/*.dylib
