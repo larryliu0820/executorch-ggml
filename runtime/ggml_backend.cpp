@@ -1144,6 +1144,17 @@ static Error build_graph(
   static int s_n_tensors = 0;
   s_last_processed = -1;
   s_n_tensors = n_tensors;
+  // Decide whether comparison/bitwise/logical ops use native ggml decomposition
+  // (F32, stays on device) or custom CPU callbacks (I32, fewer graph nodes).
+  // Discrete GPUs (CUDA/Vulkan) have expensive PCIe copies at graph splits,
+  // so prefer native.  CPU-only and Metal (unified memory) prefer custom ops.
+  bool use_native_cmp_ops = false;
+  if (handle->backend != handle->backend_cpu) {
+    const char* name = ggml_backend_name(handle->backend);
+    use_native_cmp_ops = (strstr(name, "CUDA") || strstr(name, "Vulkan"));
+  }
+  const char* cmp_env = std::getenv("GGML_NATIVE_CMP_OPS");
+  if (cmp_env) use_native_cmp_ops = (std::string(cmp_env) != "0");
   int last_processed = -1;
   for (int i = 0; i < n_tensors; ++i) {
     const auto* t = fb_tensors->Get(i);
@@ -1557,6 +1568,15 @@ static Error build_graph(
             gt = eager;
             break;
           }
+          // ggml_scale is a single op for scalar * tensor (avoids REPEAT).
+          if (ggml_nelements(b) == 1 && b->data && b->type == GGML_TYPE_F32) {
+            gt = ggml_scale(ctx, a, *(const float*)b->data);
+            break;
+          }
+          if (ggml_nelements(a) == 1 && a->data && a->type == GGML_TYPE_F32) {
+            gt = ggml_scale(ctx, b, *(const float*)a->data);
+            break;
+          }
           if (ggml_nelements(a) < ggml_nelements(b)) {
             std::swap(a, b);
           }
@@ -1692,8 +1712,7 @@ static Error build_graph(
               ggml_free(ctx);
               return Error::InvalidArgument;
             }
-            struct ggml_tensor* b_rep = ggml_repeat(ctx, b, y);
-            y = ggml_add(ctx, y, b_rep);
+            y = ggml_add(ctx, y, b);
           }
           gt = y;
           break;
@@ -1804,8 +1823,8 @@ static Error build_graph(
           }
 
           // Add bias if present.
-          // Conv bias in PyTorch is 1D [Cout]. ggml_add requires broadcastable
-          // shapes, so reshape+repeat the bias to match conv output.
+          // Conv bias in PyTorch is 1D [Cout]. ggml_add natively broadcasts
+          // when ggml_can_repeat(bias, output) holds. Reshape to [1, 1, Cout, 1].
           if (bias && gt) {
             // conv output layout is [W, H, Cout, N]
             struct ggml_tensor* bias4 = ggml_reshape_4d(ctx, bias, 1, 1, bias->ne[0], 1);
@@ -1817,11 +1836,10 @@ static Error build_graph(
               ggml_free(ctx);
               return Error::InvalidArgument;
             }
-            struct ggml_tensor* bias_rep = ggml_repeat(ctx, bias4, gt);
-            if (bias_rep->type == GGML_TYPE_F16) {
-              bias_rep = safe_ggml_cast(ctx, bias_rep, GGML_TYPE_F32);
+            if (bias4->type == GGML_TYPE_F16) {
+              bias4 = safe_ggml_cast(ctx, bias4, GGML_TYPE_F32);
             }
-            gt = ggml_add(ctx, gt, bias_rep);
+            gt = ggml_add(ctx, gt, bias4);
           }
           break;
         }
@@ -2932,7 +2950,7 @@ static Error build_graph(
         }
 
         case ggml_ir::OpCode::EQ: {
-          // eq(a, b) or eq(a, scalar) → 1 - clamp(step(a-b) + step(b-a), 0, 1)
+          // eq(a, b) or eq(a, scalar)
           double scalar = 0.0;
           int32_t is_scalar = 0;
           if (t->op_params() && t->op_params()->size() >= 12) {
@@ -2951,17 +2969,25 @@ static Error build_graph(
           } else {
             b = srcs[1];
           }
-          if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-          if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
-          if (!resolve_broadcast(a, b, "EQ")) { ggml_free(ctx); return Error::InvalidArgument; }
-          struct ggml_tensor* diff = ggml_sub(ctx, a, b);
-          struct ggml_tensor* ne_val = ggml_clamp(ctx, ggml_add(ctx, ggml_step(ctx, diff), ggml_step(ctx, ggml_neg(ctx, diff))), 0.0f, 1.0f);
-          gt = ggml_add(ctx, ggml_neg(ctx, ne_val), make_f32_scalar(ctx, 1.0f));
+          if (use_native_cmp_ops) {
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (!resolve_broadcast(a, b, "EQ")) { ggml_free(ctx); return Error::InvalidArgument; }
+            struct ggml_tensor* diff = ggml_sub(ctx, a, b);
+            struct ggml_tensor* ne_val = ggml_clamp(ctx, ggml_add(ctx, ggml_step(ctx, diff), ggml_step(ctx, ggml_neg(ctx, diff))), 0.0f, 1.0f);
+            gt = ggml_add(ctx, ggml_neg(ctx, ne_val), make_f32_scalar(ctx, 1.0f));
+          } else {
+            struct ggml_tensor* args[2] = {a, b};
+            gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+                a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+                args, 2, ggml_custom_eq, GGML_N_TASKS_MAX, nullptr);
+            pin_to_cpu(gt);
+          }
           break;
         }
 
         case ggml_ir::OpCode::NE: {
-          // ne(a, b) or ne(a, scalar) → clamp(step(a-b) + step(b-a), 0, 1)
+          // ne(a, b) or ne(a, scalar)
           double scalar = 0.0;
           int32_t is_scalar = 1;
           if (t->op_params() && t->op_params()->size() >= 12) {
@@ -2980,77 +3006,136 @@ static Error build_graph(
           } else {
             b = srcs[1];
           }
-          if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-          if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
-          if (!resolve_broadcast(a, b, "NE")) { ggml_free(ctx); return Error::InvalidArgument; }
-          struct ggml_tensor* diff = ggml_sub(ctx, a, b);
-          gt = ggml_clamp(ctx, ggml_add(ctx, ggml_step(ctx, diff), ggml_step(ctx, ggml_neg(ctx, diff))), 0.0f, 1.0f);
+          if (use_native_cmp_ops) {
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (!resolve_broadcast(a, b, "NE")) { ggml_free(ctx); return Error::InvalidArgument; }
+            struct ggml_tensor* diff = ggml_sub(ctx, a, b);
+            gt = ggml_clamp(ctx, ggml_add(ctx, ggml_step(ctx, diff), ggml_step(ctx, ggml_neg(ctx, diff))), 0.0f, 1.0f);
+          } else {
+            struct ggml_tensor* args[2] = {a, b};
+            gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+                a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+                args, 2, ggml_custom_ne_op, GGML_N_TASKS_MAX, nullptr);
+            pin_to_cpu(gt);
+          }
           break;
         }
 
         // ---- Comparison / bitwise / logical ops ----
-        // Decomposed into native ggml ops (step/sub/neg/add/clamp/mul) so
-        // the entire graph stays on GPU (Metal + CUDA).  All output F32 {0.0, 1.0}.
+        // Native path: decomposed into ggml ops (step/sub/neg/add/clamp/mul),
+        //   stays on GPU, output F32 {0.0, 1.0}.
+        // Custom path: single custom op callback on CPU, output I32 {0, 1},
+        //   fewer graph nodes (better for CPU-only and Metal unified memory).
 
         case ggml_ir::OpCode::LE: {
-          // le(a, b) = 1 - step(a - b)
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
-          if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-          if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
-          if (!resolve_broadcast(a, b, "LE")) { ggml_free(ctx); return Error::InvalidArgument; }
-          gt = ggml_add(ctx, ggml_neg(ctx, ggml_step(ctx, ggml_sub(ctx, a, b))), make_f32_scalar(ctx, 1.0f));
+          if (use_native_cmp_ops) {
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (!resolve_broadcast(a, b, "LE")) { ggml_free(ctx); return Error::InvalidArgument; }
+            gt = ggml_add(ctx, ggml_neg(ctx, ggml_step(ctx, ggml_sub(ctx, a, b))), make_f32_scalar(ctx, 1.0f));
+          } else {
+            struct ggml_tensor* args[2] = {a, b};
+            gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+                a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+                args, 2, ggml_custom_le, GGML_N_TASKS_MAX, nullptr);
+            pin_to_cpu(gt);
+          }
           break;
         }
         case ggml_ir::OpCode::LT: {
-          // lt(a, b) = step(b - a) = step(-(a - b))
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
-          if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-          if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
-          if (!resolve_broadcast(a, b, "LT")) { ggml_free(ctx); return Error::InvalidArgument; }
-          gt = ggml_step(ctx, ggml_neg(ctx, ggml_sub(ctx, a, b)));
+          if (use_native_cmp_ops) {
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (!resolve_broadcast(a, b, "LT")) { ggml_free(ctx); return Error::InvalidArgument; }
+            gt = ggml_step(ctx, ggml_neg(ctx, ggml_sub(ctx, a, b)));
+          } else {
+            struct ggml_tensor* args[2] = {a, b};
+            gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+                a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+                args, 2, ggml_custom_lt, GGML_N_TASKS_MAX, nullptr);
+            pin_to_cpu(gt);
+          }
           break;
         }
         case ggml_ir::OpCode::GT: {
-          // gt(a, b) = step(a - b)
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
-          if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-          if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
-          if (!resolve_broadcast(a, b, "GT")) { ggml_free(ctx); return Error::InvalidArgument; }
-          gt = ggml_step(ctx, ggml_sub(ctx, a, b));
+          if (use_native_cmp_ops) {
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (!resolve_broadcast(a, b, "GT")) { ggml_free(ctx); return Error::InvalidArgument; }
+            gt = ggml_step(ctx, ggml_sub(ctx, a, b));
+          } else {
+            struct ggml_tensor* args[2] = {a, b};
+            gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+                a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+                args, 2, ggml_custom_gt, GGML_N_TASKS_MAX, nullptr);
+            pin_to_cpu(gt);
+          }
           break;
         }
         case ggml_ir::OpCode::GE: {
-          // ge(a, b) = 1 - step(b - a) = 1 - step(-(a - b))
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
-          if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-          if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
-          if (!resolve_broadcast(a, b, "GE")) { ggml_free(ctx); return Error::InvalidArgument; }
-          gt = ggml_add(ctx, ggml_neg(ctx, ggml_step(ctx, ggml_neg(ctx, ggml_sub(ctx, a, b)))), make_f32_scalar(ctx, 1.0f));
+          if (use_native_cmp_ops) {
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (!resolve_broadcast(a, b, "GE")) { ggml_free(ctx); return Error::InvalidArgument; }
+            gt = ggml_add(ctx, ggml_neg(ctx, ggml_step(ctx, ggml_neg(ctx, ggml_sub(ctx, a, b)))), make_f32_scalar(ctx, 1.0f));
+          } else {
+            struct ggml_tensor* args[2] = {a, b};
+            gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+                a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+                args, 2, ggml_custom_ge, GGML_N_TASKS_MAX, nullptr);
+            pin_to_cpu(gt);
+          }
           break;
         }
         case ggml_ir::OpCode::BITWISE_AND: {
-          // and(a, b) = a * b  (both {0.0, 1.0})
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
-          if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-          if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
-          if (!resolve_broadcast(a, b, "BITWISE_AND")) { ggml_free(ctx); return Error::InvalidArgument; }
-          gt = ggml_mul(ctx, a, b);
+          if (use_native_cmp_ops) {
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (!resolve_broadcast(a, b, "BITWISE_AND")) { ggml_free(ctx); return Error::InvalidArgument; }
+            gt = ggml_mul(ctx, a, b);
+          } else {
+            struct ggml_tensor* args[2] = {a, b};
+            gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+                a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+                args, 2, ggml_custom_bitwise_and, GGML_N_TASKS_MAX, nullptr);
+            pin_to_cpu(gt);
+          }
           break;
         }
         case ggml_ir::OpCode::BITWISE_OR: {
-          // or(a, b) = clamp(a + b, 0, 1)
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
-          if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-          if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
-          if (!resolve_broadcast(a, b, "BITWISE_OR")) { ggml_free(ctx); return Error::InvalidArgument; }
-          gt = ggml_clamp(ctx, ggml_add(ctx, a, b), 0.0f, 1.0f);
+          if (use_native_cmp_ops) {
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (!resolve_broadcast(a, b, "BITWISE_OR")) { ggml_free(ctx); return Error::InvalidArgument; }
+            gt = ggml_clamp(ctx, ggml_add(ctx, a, b), 0.0f, 1.0f);
+          } else {
+            struct ggml_tensor* args[2] = {a, b};
+            gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+                a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+                args, 2, ggml_custom_bitwise_or, GGML_N_TASKS_MAX, nullptr);
+            pin_to_cpu(gt);
+          }
           break;
         }
         case ggml_ir::OpCode::LOGICAL_NOT: {
-          // not(x) = 1 - x  (x in {0.0, 1.0})
           struct ggml_tensor* x = srcs[0];
-          if (x->type != GGML_TYPE_F32) x = safe_ggml_cast(ctx, x, GGML_TYPE_F32);
-          gt = ggml_add(ctx, ggml_neg(ctx, x), make_f32_scalar(ctx, 1.0f));
+          if (use_native_cmp_ops) {
+            if (x->type != GGML_TYPE_F32) x = safe_ggml_cast(ctx, x, GGML_TYPE_F32);
+            gt = ggml_add(ctx, ggml_neg(ctx, x), make_f32_scalar(ctx, 1.0f));
+          } else {
+            struct ggml_tensor* args[1] = {x};
+            gt = ggml_custom_4d(ctx, GGML_TYPE_I32,
+                x->ne[0], x->ne[1], x->ne[2], x->ne[3],
+                args, 1, ggml_custom_logical_not, GGML_N_TASKS_MAX, nullptr);
+            pin_to_cpu(gt);
+          }
           break;
         }
 
@@ -3254,29 +3339,52 @@ static Error build_graph(
           // For ggml, the BN input x has layout [innermost, ..., C, batch]
           // where C is ne[ggml_axis]. For 1D input [batch, C, L] → ggml [L, C, batch, 1]
           // and for 2D [batch, C, H, W] → ggml [W, H, C, batch].
-          // The 1D scale/shift [C] → ggml [C, 1, 1, 1].
-          // ggml_mul/ggml_add broadcast when the smaller tensor divides the larger.
-          // We need scale as [1, C, 1, 1] to match axis 1 (C channel).
           // Reshape scale/shift to [1, C, 1, 1] for correct broadcasting.
 
-          struct ggml_tensor* var_eps = ggml_add1(ctx, var, make_f32_scalar(ctx, eps));
-          struct ggml_tensor* inv_std = ggml_sqrt(ctx, var_eps);
-          // 1/inv_std
-          struct ggml_tensor* one = make_f32_scalar(ctx, 1.0f);
-          struct ggml_tensor* one_rep = ggml_repeat(ctx, one, inv_std);
-          struct ggml_tensor* recip_std = ggml_div(ctx, one_rep, inv_std);
+          // Fast path: all 4 param tensors are constant F32 leaves — precompute in C++.
+          if (weight->data && bias->data && mean->data && var->data &&
+              weight->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32 &&
+              mean->type == GGML_TYPE_F32 && var->type == GGML_TYPE_F32) {
+            const int64_t C = weight->ne[0];
+            const float* w_data = (const float*)weight->data;
+            const float* b_data = (const float*)bias->data;
+            const float* m_data = (const float*)mean->data;
+            const float* v_data = (const float*)var->data;
 
-          struct ggml_tensor* scale = ggml_mul(ctx, weight, recip_std);
-          struct ggml_tensor* mean_scaled = ggml_mul(ctx, mean, scale);
-          struct ggml_tensor* shift = ggml_sub(ctx, bias, mean_scaled);
+            // Allocate pre-filled leaf tensors [1, C, 1, 1]
+            ggml_set_no_alloc(ctx, false);
+            struct ggml_tensor* scale4 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, C, 1, 1);
+            struct ggml_tensor* shift4 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, C, 1, 1);
+            ggml_set_no_alloc(ctx, true);
 
-          // Reshape scale/shift for broadcasting: [C] → [1, C, 1, 1]
-          int64_t C = scale->ne[0];
-          struct ggml_tensor* scale4 = ggml_reshape_4d(ctx, scale, 1, C, 1, 1);
-          struct ggml_tensor* shift4 = ggml_reshape_4d(ctx, shift, 1, C, 1, 1);
+            float* s_data = (float*)scale4->data;
+            float* sh_data = (float*)shift4->data;
+            for (int64_t c = 0; c < C; ++c) {
+              float sc = w_data[c] / sqrtf(v_data[c] + eps);
+              s_data[c] = sc;
+              sh_data[c] = b_data[c] - m_data[c] * sc;
+            }
 
-          gt = ggml_mul(ctx, x, ggml_repeat(ctx, scale4, x));
-          gt = ggml_add(ctx, gt, ggml_repeat(ctx, shift4, gt));
+            gt = ggml_add(ctx, ggml_mul(ctx, x, scale4), shift4);  // 2 nodes, native broadcast
+          } else {
+            // Fallback: graph-based decomposition for non-constant params.
+            struct ggml_tensor* var_eps = ggml_add1(ctx, var, make_f32_scalar(ctx, eps));
+            struct ggml_tensor* inv_std = ggml_sqrt(ctx, var_eps);
+            struct ggml_tensor* one = make_f32_scalar(ctx, 1.0f);
+            struct ggml_tensor* one_rep = ggml_repeat(ctx, one, inv_std);
+            struct ggml_tensor* recip_std = ggml_div(ctx, one_rep, inv_std);
+
+            struct ggml_tensor* scale = ggml_mul(ctx, weight, recip_std);
+            struct ggml_tensor* mean_scaled = ggml_mul(ctx, mean, scale);
+            struct ggml_tensor* shift = ggml_sub(ctx, bias, mean_scaled);
+
+            int64_t C = scale->ne[0];
+            struct ggml_tensor* scale4 = ggml_reshape_4d(ctx, scale, 1, C, 1, 1);
+            struct ggml_tensor* shift4 = ggml_reshape_4d(ctx, shift, 1, C, 1, 1);
+
+            gt = ggml_mul(ctx, x, ggml_repeat(ctx, scale4, x));
+            gt = ggml_add(ctx, gt, ggml_repeat(ctx, shift4, gt));
+          }
           break;
         }
 
@@ -3376,7 +3484,7 @@ static Error build_graph(
             gt = safe_ggml_cast(ctx, gt, GGML_TYPE_F32);
           }
 
-          // Add bias if present
+          // Add bias if present — ggml_add natively broadcasts.
           if (bias && gt) {
             // Conv1d output layout in ggml: [L_out, C_out, batch, 1]
             // Bias is 1D [C_out] → reshape to [1, C_out, 1, 1] for broadcast
@@ -3389,11 +3497,10 @@ static Error build_graph(
               ggml_free(ctx);
               return Error::InvalidArgument;
             }
-            struct ggml_tensor* bias_rep = ggml_repeat(ctx, bias4, gt);
-            if (bias_rep->type == GGML_TYPE_F16) {
-              bias_rep = safe_ggml_cast(ctx, bias_rep, GGML_TYPE_F32);
+            if (bias4->type == GGML_TYPE_F16) {
+              bias4 = safe_ggml_cast(ctx, bias4, GGML_TYPE_F32);
             }
-            gt = ggml_add(ctx, gt, bias_rep);
+            gt = ggml_add(ctx, gt, bias4);
           }
           break;
         }
