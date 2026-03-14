@@ -59,6 +59,7 @@ class OpCode(object):
     LOGICAL_NOT = 72
     ANY = 73
     UPDATE_CACHE = 74
+    GELU = 75
     CONV_1D = 80
     CONV_1D_DW = 81
     PAD = 82

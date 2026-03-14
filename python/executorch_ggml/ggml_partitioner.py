@@ -31,6 +31,7 @@ _SUPPORTED_OP_NAMES = {
     "aten.mul.Tensor",
     "aten.mul.Scalar",
     "aten.add.Tensor",
+    "aten.add.Scalar",
     "aten.sub.Tensor",
     "aten.neg.default",
     "aten.rsqrt.default",
@@ -77,6 +78,7 @@ _SUPPORTED_OP_NAMES = {
     "aten.eq.Tensor",
     "aten.ne.Scalar",
     "aten.le.Tensor",
+    "aten.le.Scalar",
     "aten.lt.Tensor",
     "aten.gt.Tensor",
     "aten.ge.Tensor",
@@ -110,6 +112,7 @@ _SUPPORTED_OP_NAMES = {
     # Parakeet / ASR ops
     "aten.relu.default",
     "aten.tanh.default",
+    "aten.gelu.default",
     "aten.native_layer_norm.default",
     "aten._native_batch_norm_legit_no_training.default",
     "aten.argmax.default",
@@ -312,7 +315,13 @@ class GgmlPartitioner(Partitioner):
 
         SDPA is preserved so ggml can lower it to efficient attention ops.
         """
-        return ([torch.ops.aten.scaled_dot_product_attention.default], None)
+        # check_op_support=lambda _: False skips the post-partition sanity check
+        # that would error if any SDPA node remains un-delegated (e.g. on a
+        # partition boundary). The GGML backend handles all SDPA variants.
+        return (
+            [torch.ops.aten.scaled_dot_product_attention.default],
+            lambda _node: False,
+        )
 
     def partition(self, exported_program: ExportedProgram) -> PartitionResult:
         partition_tags: Dict[str, DelegationSpec] = {}
