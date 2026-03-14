@@ -1144,12 +1144,6 @@ static Error build_graph(
   static int s_n_tensors = 0;
   s_last_processed = -1;
   s_n_tensors = n_tensors;
-  // Temporary SIGABRT handler to catch ggml assertions
-  static auto old_handler = signal(SIGABRT, [](int) {
-    fprintf(stderr, "\n[ggml_backend] SIGABRT caught! last_processed=%d/%d\n", s_last_processed, s_n_tensors);
-    fflush(stderr);
-    std::quick_exit(1);
-  });
   int last_processed = -1;
   for (int i = 0; i < n_tensors; ++i) {
     const auto* t = fb_tensors->Get(i);

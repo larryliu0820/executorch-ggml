@@ -4,20 +4,17 @@ Setup configuration for executorch-ggml.
 Metadata and dependencies are defined in pyproject.toml (PEP 621).
 This file only handles the custom CMake build logic for the native extension.
 
-To build the native extension during pip install, set:
-  - EXECUTORCH_GGML_BUILD_NATIVE=1
+The native extension is always built when dependencies are available.
+Dependencies are discovered automatically from third-party/ submodules, or
+can be specified explicitly via environment variables:
   - LLAMA_CPP_DIR=/path/to/llama.cpp
   - EXECUTORCH_DIR=/path/to/executorch (repo root containing executorch/)
-
-Example:
-  LLAMA_CPP_DIR=... EXECUTORCH_DIR=... EXECUTORCH_GGML_BUILD_NATIVE=1 pip install .
 """
 
 from __future__ import annotations
 
 import os
 import pathlib
-import shutil
 import sys
 from typing import List
 
@@ -49,27 +46,6 @@ class CMakeBuild(build_ext):
 
         root = pathlib.Path(__file__).resolve().parent
 
-        # Skip CMake build unless explicitly requested.  When the .so is
-        # already built (e.g. via a manual cmake invocation), a plain
-        # ``pip install -e .`` should just create the editable link without
-        # re-running the full native build.
-        if not os.environ.get("EXECUTORCH_GGML_BUILD_NATIVE"):
-            # Check if the .so already exists in the source tree.
-            pkg_dir = root / "python" / "executorch_ggml"
-            so_files = list(pkg_dir.glob("_ggml_backend*.so")) + list(
-                pkg_dir.glob("_ggml_backend*.dylib")
-            )
-            if so_files:
-                print(
-                    f"[executorch-ggml] Pre-built native extension found ({so_files[0].name}); "
-                    "skipping CMake build. Set EXECUTORCH_GGML_BUILD_NATIVE=1 to force rebuild."
-                )
-                return
-            print(
-                "[executorch-ggml] No pre-built native extension found and "
-                "EXECUTORCH_GGML_BUILD_NATIVE is not set; attempting CMake build."
-            )
-
         # Prefer deps vendored under this repo's third-party/ if present.
         llama_dir = self._discover_dep(
             "LLAMA_CPP_DIR",
@@ -88,7 +64,7 @@ class CMakeBuild(build_ext):
             )
             return
 
-        build_temp = pathlib.Path(self.build_temp)
+        build_temp = root / "build"
         build_temp.mkdir(parents=True, exist_ok=True)
 
         # Auto-discover python interpreter: use the one running setup.py
@@ -100,41 +76,14 @@ class CMakeBuild(build_ext):
             f"-DPython3_EXECUTABLE={python_exe}",
             f"-DLLAMA_CPP_DIR={llama_dir}",
             f"-DEXECUTORCH_DIR={et_dir}",
-            "-DEXECUTORCH_GGML_BUILD_PYTHON_EXTENSION=ON",
         ]
 
         env = os.environ.copy()
 
-        # Ensure we use a real flatc binary (not the ExecuTorch python wrapper).
-        def pick_flatc() -> str | None:
-            candidates = []
-            w = shutil.which("flatc")
-            if w:
-                candidates.append(w)
-            # common locations (brew/system)
-            candidates += ["/opt/homebrew/bin/flatc", "/usr/local/bin/flatc", "/usr/bin/flatc"]
-
-            for c in candidates:
-                if not c:
-                    continue
-                p = pathlib.Path(c)
-                if not p.exists():
-                    continue
-                # avoid venv/python wrapper scripts
-                if str(p).startswith(str(pathlib.Path(sys.executable).parent)):
-                    continue
-                return str(p)
-            return None
-
-        flatc = pick_flatc()
-        if flatc:
-            env["FLATC"] = flatc
-        else:
-            print("[executorch-ggml] Warning: could not locate system flatc; CMake may fail")
-
         subprocess.check_call(["cmake", "-S", str(root), "-B", str(build_temp), *cmake_args], env=env)
         subprocess.check_call(
-            ["cmake", "--build", str(build_temp), "--target", "executorch_ggml_backend_py"],
+            ["cmake", "--build", str(build_temp), "--target", "executorch_ggml_backend_py",
+             "--parallel", str(os.cpu_count() or 4)],
             env=env,
         )
 

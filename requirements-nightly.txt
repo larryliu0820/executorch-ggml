@@ -1,2 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/nightly/cpu/
 executorch==1.2.0.dev20260305
+--extra-index-url https://download.pytorch.org/whl/nightly/cu126 
+torch==2.12.0.dev20260305
+torchaudio==2.11.0.dev20260305
+torchcodec==0.11.0.dev20260305

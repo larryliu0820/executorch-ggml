@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Export nvidia/parakeet-tdt-0.6b-v3 with Q8_0 quantization and test transcription.
+"""Export nvidia/parakeet-tdt-0.6b-v3 with configurable quantization and test transcription.
 
 Usage:
     source .venv/bin/activate
-    python runner/export_parakeet_q8.py [--audio test_audio.wav]
+    python runner/export_parakeet.py [--dtype Q8_0|F32] [--audio test_audio.wav]
 """
 
 import argparse
@@ -36,15 +36,14 @@ from export_parakeet_tdt import greedy_decode_executorch, transcribe_eager, load
 from executorch.exir import EdgeCompileConfig, ExecutorchBackendConfig
 from executorch.exir.passes import MemoryPlanningPass
 
-from executorch_ggml import GgmlPartitioner, GgmlQuantConfig, to_edge_rewrite_and_lower
+from executorch_ggml import GgmlPartitioner, GgmlQuantConfig, GgmlQuantType, to_edge_rewrite_and_lower
 from executorch_ggml.passes.replace_copy_ops_pass import ReplaceCopyOpsPass
 
 
-def lower_to_ggml_q8(programs, metadata=None):
-    """Lower exported programs to ExecuTorch with GGML backend + Q8_0."""
-    print("\nLowering to ExecuTorch with GGML backend (Q8_0)...")
-
-    quant_config = GgmlQuantConfig()
+def lower_to_ggml(programs, quant_config=None, metadata=None):
+    """Lower exported programs to ExecuTorch with GGML backend."""
+    dtype_label = quant_config.quant_type.value.upper() if quant_config else "F32"
+    print(f"\nLowering to ExecuTorch with GGML backend ({dtype_label})...")
 
     partitioner = {}
     for key in programs.keys():
@@ -84,9 +83,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="./parakeet_ggml")
     parser.add_argument("--audio", type=str, default="test_audio.wav")
+    parser.add_argument(
+        "--dtype",
+        default="Q8_0",
+        choices=["F32"] + [t.value.upper() for t in GgmlQuantType],
+        help="Weight dtype / quantization format (default: Q8_0)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.dtype == "F32":
+        quant_config = None
+    else:
+        quant_config = GgmlQuantConfig(quant_type=GgmlQuantType(args.dtype.lower()))
 
     print("Extracting tokenizer...")
     extract_tokenizer(args.output_dir)
@@ -98,29 +108,23 @@ def main():
     programs, metadata = export_all_ggml(model)
 
     t0 = time.time()
-    et = lower_to_ggml_q8(programs, metadata=metadata)
+    et = lower_to_ggml(programs, quant_config=quant_config, metadata=metadata)
     t1 = time.time()
     print(f"Lowering took {t1 - t0:.1f}s")
 
-    q8_path = os.path.join(args.output_dir, "model_q8_0.pte")
-    print(f"\nSaving Q8_0 .pte to: {q8_path}")
-    with open(q8_path, "wb") as f:
+    out_filename = f"model_{args.dtype.lower()}.pte"
+    out_path = os.path.join(args.output_dir, out_filename)
+    print(f"\nSaving {args.dtype} .pte to: {out_path}")
+    with open(out_path, "wb") as f:
         et.write_to_file(f)
-    q8_size = os.path.getsize(q8_path) / (1024 * 1024)
-    print(f"Q8_0 size: {q8_size:.1f} MB")
-
-    f32_path = os.path.join(args.output_dir, "model.pte")
-    if os.path.exists(f32_path):
-        f32_size = os.path.getsize(f32_path) / (1024 * 1024)
-        print(f"F32 size:  {f32_size:.1f} MB")
-        print(f"Compression: {f32_size / q8_size:.2f}x")
+    out_size = os.path.getsize(out_path) / (1024 * 1024)
+    print(f"{args.dtype} size: {out_size:.1f} MB")
 
     if args.audio and os.path.exists(args.audio):
         print("\n" + "=" * 60)
         print("Testing transcription...")
         print("=" * 60)
 
-        # Load audio with scipy (works reliably without torchcodec)
         import scipy.io.wavfile as wavfile
         import numpy as np
         sr_file, audio_np = wavfile.read(args.audio)
@@ -164,18 +168,7 @@ def main():
 
         from executorch.runtime import Runtime
         runtime = Runtime.get()
-
-        q8_text = _transcribe_et(runtime.load_program(et.buffer), "Q8_0")
-
-        if os.path.exists(f32_path):
-            with open(f32_path, "rb") as f:
-                f32_buf = f.read()
-            f32_text = _transcribe_et(runtime.load_program(f32_buf), "F32")
-
-            if q8_text.lower().strip() == f32_text.lower().strip():
-                print("\nTranscriptions match!")
-            else:
-                print(f"\nTranscriptions differ.")
+        _transcribe_et(runtime.load_program(et.buffer), args.dtype)
 
     print("\nDone!")
 

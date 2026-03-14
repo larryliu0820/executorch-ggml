@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run Parakeet Q8_0 and F32 transcription comparison.
+"""Run Parakeet transcription from a .pte model file.
 
 Usage:
     source .venv/bin/activate
-    python runner/run_parakeet_q8.py [--audio test_audio.wav]
+    python runner/run_parakeet.py --model parakeet_ggml/model_q8_0.pte [--audio test_audio.wav]
 """
 
 import argparse
@@ -67,14 +67,11 @@ def transcribe(program, audio_tensor, model):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", default="test_audio.wav")
-    parser.add_argument("--model-dir", default="./parakeet_ggml")
+    parser.add_argument("--model", required=True, help="Path to .pte model file")
     args = parser.parse_args()
 
-    q8_path = os.path.join(args.model_dir, "model_q8_0.pte")
-    f32_path = os.path.join(args.model_dir, "model.pte")
-
-    if not os.path.exists(q8_path):
-        print(f"Q8_0 model not found at {q8_path}. Run export first.")
+    if not os.path.exists(args.model):
+        print(f"Model not found at {args.model}. Run export first.")
         return
 
     print("Loading NeMo model (for tokenizer)...")
@@ -83,10 +80,10 @@ def main():
     audio = load_wav(args.audio, target_sr=model.preprocessor._cfg.sample_rate)
     print(f"Audio: {args.audio} ({audio.shape[0] / model.preprocessor._cfg.sample_rate:.1f}s)\n")
 
-    # Eager baseline first
+    # Eager baseline
     print("--- Eager PyTorch ---")
     with torch.no_grad():
-        waveform_2d = audio.unsqueeze(0)  # [1, samples]
+        waveform_2d = audio.unsqueeze(0)
         mel, mel_len = model.preprocessor(
             input_signal=waveform_2d,
             length=torch.tensor([waveform_2d.shape[1]])
@@ -94,35 +91,20 @@ def main():
         encoded, encoded_len = model.encoder(audio_signal=mel, length=mel_len)
         from export_parakeet_tdt import greedy_decode_eager
         tokens = greedy_decode_eager(encoded, encoded_len, model)
-        eager_text = model.tokenizer.ids_to_text(tokens)
-        print(f"  {eager_text}\n")
+        print(f"  {model.tokenizer.ids_to_text(tokens)}\n")
 
     from executorch.runtime import Runtime
     runtime = Runtime.get()
 
-    # Q8_0
-    print(f"--- Q8_0 ({os.path.getsize(q8_path) / (1024*1024):.0f} MB) ---")
+    label = os.path.splitext(os.path.basename(args.model))[0]
+    size_mb = os.path.getsize(args.model) / (1024 * 1024)
+    print(f"--- {label} ({size_mb:.0f} MB) ---")
     t0 = time.time()
-    prog_q8 = runtime.load_program(open(q8_path, "rb").read())
-    q8_text = transcribe(prog_q8, audio, model)
+    prog = runtime.load_program(open(args.model, "rb").read())
+    text = transcribe(prog, audio, model)
     t1 = time.time()
-    print(f"  {q8_text}")
+    print(f"  {text}")
     print(f"  ({t1-t0:.1f}s)")
-
-    # F32
-    if os.path.exists(f32_path):
-        print(f"\n--- F32 ({os.path.getsize(f32_path) / (1024*1024):.0f} MB) ---")
-        t0 = time.time()
-        prog_f32 = runtime.load_program(open(f32_path, "rb").read())
-        f32_text = transcribe(prog_f32, audio, model)
-        t1 = time.time()
-        print(f"  {f32_text}")
-        print(f"  ({t1-t0:.1f}s)")
-
-        if q8_text.strip().lower() == f32_text.strip().lower():
-            print("\nTranscriptions match!")
-        else:
-            print("\nTranscriptions differ.")
 
 
 if __name__ == "__main__":

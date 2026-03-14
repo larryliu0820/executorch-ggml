@@ -15,14 +15,47 @@ message("LLAMA_CPP_DIR being set to ${LLAMA_CPP_DIR}")
 message("EXECUTORCH_DIR being set to ${EXECUTORCH_DIR}")
 
 # ---------------------------------------------------------------------------
-# FlatBuffers – C++ header from schema
+# FlatBuffers / flatc – build from source or find on PATH
 # ---------------------------------------------------------------------------
-# We check in schema/ggml_ir_generated.h so builds (including pip build
-# isolation) do not require a working `flatc` binary.
-#
-# If you want to regenerate it, run:
-#   flatc --cpp -o schema schema/ggml_ir.fbs
-add_custom_target(ggml_ir_gen)
+# Prefer building flatc from the flatbuffers source bundled inside the
+# ExecuTorch submodule.  This makes the build self-contained: after
+#   git submodule update --init --recursive
+# no system flatc is required.
+set(FLATBUFFERS_SOURCE_DIR "${EXECUTORCH_DIR}/third-party/flatbuffers")
+if(EXISTS "${FLATBUFFERS_SOURCE_DIR}/CMakeLists.txt")
+  set(FLATBUFFERS_BUILD_FLATC ON CACHE BOOL "" FORCE)
+  set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(FLATBUFFERS_INSTALL OFF CACHE BOOL "" FORCE)
+  set(FLATBUFFERS_BUILD_FLATHASH OFF CACHE BOOL "" FORCE)
+  add_subdirectory("${FLATBUFFERS_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/flatbuffers" EXCLUDE_FROM_ALL)
+  set(FLATC_EXECUTABLE $<TARGET_FILE:flatc>)
+  message(STATUS "flatc: building from source (${FLATBUFFERS_SOURCE_DIR})")
+else()
+  find_program(FLATC_EXECUTABLE flatc)
+  if(FLATC_EXECUTABLE)
+    message(STATUS "flatc: using system binary (${FLATC_EXECUTABLE})")
+  else()
+    message(WARNING
+      "flatc not found and ${FLATBUFFERS_SOURCE_DIR} does not exist. "
+      "Run: git submodule update --init --recursive  "
+      "schema/ggml_ir_generated.h will not be regenerated.")
+  endif()
+endif()
+
+if(FLATC_EXECUTABLE)
+  add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/schema/ggml_ir_generated.h"
+    COMMAND "${FLATC_EXECUTABLE}" --cpp -o "${CMAKE_CURRENT_SOURCE_DIR}/schema"
+            "${CMAKE_CURRENT_SOURCE_DIR}/schema/ggml_ir.fbs"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/schema/ggml_ir.fbs" flatc
+    COMMENT "Regenerating schema/ggml_ir_generated.h"
+  )
+  add_custom_target(ggml_ir_gen
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/schema/ggml_ir_generated.h"
+  )
+else()
+  add_custom_target(ggml_ir_gen)
+endif()
 
 # ---------------------------------------------------------------------------
 # ggml (from llama.cpp)
@@ -53,7 +86,24 @@ check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
   enable_language(CUDA)
   set(GGML_CUDA ON CACHE BOOL "ggml: use CUDA" FORCE)
-  message(STATUS "CUDA detected (${CMAKE_CUDA_COMPILER}) – enabling ggml-cuda")
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    execute_process(
+      COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+      OUTPUT_VARIABLE _gpu_compute_cap
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(_gpu_compute_cap)
+      string(REGEX REPLACE "\n.*" "" _gpu_compute_cap "${_gpu_compute_cap}")
+      string(REPLACE "." "" _cuda_arch "${_gpu_compute_cap}")
+      set(CMAKE_CUDA_ARCHITECTURES ${_cuda_arch})
+    elseif(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+      set(CMAKE_CUDA_ARCHITECTURES native)
+    else()
+      message(WARNING "Could not auto-detect CUDA arch; set CMAKE_CUDA_ARCHITECTURES manually")
+    endif()
+  endif()
+  message(STATUS "CUDA detected (${CMAKE_CUDA_COMPILER}) – enabling ggml-cuda (arch=${CMAKE_CUDA_ARCHITECTURES})")
 else()
   message(STATUS "CUDA not found – ggml-cuda disabled")
 endif()

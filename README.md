@@ -155,18 +155,23 @@ pip install optimum[executorch]
 
 ### Parakeet TDT 0.6B (Speech Recognition)
 
+**Get test audio (30s LibriSpeech clip):**
+```bash
+python -c "from datasets import load_dataset; import soundfile as sf; s = load_dataset('hf-internal-testing/librispeech_asr_demo', 'clean', split='validation')[0]['audio']; sf.write('test_audio.wav', s['array'][:s['sampling_rate']*30], s['sampling_rate'])"
+```
+
 **Export:**
 ```bash
 # F32 model
-python export_parakeet_ggml.py --output-dir ./parakeet_ggml --audio test_audio.wav
+python runner/export_parakeet.py --dtype F32 --audio test_audio.wav
 
-# Q8_0 model (also exports F32 comparison)
-python runner/export_parakeet_q8.py --audio test_audio.wav
+# Q8_0 model (default)
+python runner/export_parakeet.py --dtype Q8_0 --audio test_audio.wav
 ```
 
 **Run:**
 ```bash
-python runner/run_parakeet_q8.py --audio test_audio.wav
+python runner/run_parakeet.py --model parakeet_ggml/model_q8_0.pte --audio test_audio.wav
 ```
 
 This runs eager PyTorch, Q8_0, and F32 side by side and compares transcriptions.
@@ -178,7 +183,7 @@ pip install nemo_toolkit[asr]
 
 To force CPU-only execution (no Metal GPU):
 ```bash
-GGML_BACKEND_DEVICE=cpu python runner/run_parakeet_q8.py --audio test_audio.wav
+GGML_BACKEND_DEVICE=cpu python runner/run_parakeet.py --model parakeet_ggml/model_q8_0.pte --audio test_audio.wav
 ```
 
 ### C++ (runtime)
