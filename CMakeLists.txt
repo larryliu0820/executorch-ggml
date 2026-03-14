@@ -279,3 +279,4 @@ endif()
 # Runner executables
 # ---------------------------------------------------------------------------
 add_subdirectory(runner)
+add_subdirectory(runner/parakeet)

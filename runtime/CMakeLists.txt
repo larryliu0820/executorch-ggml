@@ -28,6 +28,15 @@ execute_process(
 if(NOT EXISTS "${TORCH_INCLUDE_DIR}/c10")
   set(TORCH_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.venv/lib/python3.13/site-packages/torch/include")
 endif()
+# Fallback: ExecuTorch portable c10 headers
+if(NOT EXISTS "${TORCH_INCLUDE_DIR}/c10")
+  set(TORCH_INCLUDE_DIR "${EXECUTORCH_DIR}/runtime/core/portable_type/c10")
+  set(_USING_PORTABLE_C10 TRUE)
+endif()
+
+if(_USING_PORTABLE_C10)
+  target_compile_definitions(executorch_ggml_runtime PRIVATE C10_USING_CUSTOM_GENERATED_MACROS)
+endif()
 
 target_include_directories(executorch_ggml_runtime PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
