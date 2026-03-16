@@ -1749,6 +1749,7 @@ static Error build_graph(
           if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
 
           if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+          // CPU binary ops require contiguous innermost rows (e.g. RoPE after permute).
           a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
 
           if (a->type != b->type) {
@@ -1795,6 +1796,7 @@ static Error build_graph(
             std::swap(a, b);
           }
           if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+          // ggml CPU MUL requires contiguous innermost rows (e.g. after permute in RoPE).
           a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
           if (!resolve_broadcast(a, b, "MUL")) {
             ggml_free(ctx);
@@ -1813,7 +1815,7 @@ static Error build_graph(
             break;
           }
           if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
-          a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
+
           if (!resolve_broadcast(a, b, "DIV")) {
             ggml_free(ctx);
             return Error::InvalidArgument;
@@ -2914,7 +2916,7 @@ static Error build_graph(
             if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
             if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
             if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
-            a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
+  
             if (!resolve_broadcast(a, b, "SUB")) {
               ggml_free(ctx);
               return Error::InvalidArgument;
