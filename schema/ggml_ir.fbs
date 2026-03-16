@@ -147,6 +147,11 @@ table Tensor {
     //   resolved_ne[0] * ne[1] * ne[2] * ne[3] * elem_size
     // Uses the tensor's own ne/sym_dim_ids/sym_dim_exprs for shape resolution.
     elem_size:uint8 = 0;
+
+    // True for mutable buffers (KV caches) that persist across calls.
+    // The runtime places these in a dedicated mutable_buf (not the scheduler
+    // pool) so they survive graph rebuilds and aren't corrupted by the allocator.
+    is_mutable:bool = false;
 }
 
 table GgmlGraph {

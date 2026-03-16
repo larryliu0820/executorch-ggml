@@ -314,7 +314,8 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_INPUT_INDEX = 22,
     VT_SYM_DIM_IDS = 24,
     VT_SYM_DIM_EXPRS = 26,
-    VT_ELEM_SIZE = 28
+    VT_ELEM_SIZE = 28,
+    VT_IS_MUTABLE = 30
   };
   int32_t id() const {
     return GetField<int32_t>(VT_ID, 0);
@@ -355,6 +356,9 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   uint8_t elem_size() const {
     return GetField<uint8_t>(VT_ELEM_SIZE, 0);
   }
+  bool is_mutable() const {
+    return GetField<uint8_t>(VT_IS_MUTABLE, 0) != 0;
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<int32_t>(verifier, VT_ID, 4) &&
@@ -376,6 +380,7 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyOffset(verifier, VT_SYM_DIM_EXPRS) &&
            verifier.VerifyVector(sym_dim_exprs()) &&
            VerifyField<uint8_t>(verifier, VT_ELEM_SIZE, 1) &&
+           VerifyField<uint8_t>(verifier, VT_IS_MUTABLE, 1) &&
            verifier.EndTable();
   }
 };
@@ -423,6 +428,9 @@ struct TensorBuilder {
   void add_elem_size(uint8_t elem_size) {
     fbb_.AddElement<uint8_t>(Tensor::VT_ELEM_SIZE, elem_size, 0);
   }
+  void add_is_mutable(bool is_mutable) {
+    fbb_.AddElement<uint8_t>(Tensor::VT_IS_MUTABLE, static_cast<uint8_t>(is_mutable), 0);
+  }
   explicit TensorBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -448,7 +456,8 @@ inline ::flatbuffers::Offset<Tensor> CreateTensor(
     int32_t input_index = -1,
     ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> sym_dim_ids = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> sym_dim_exprs = 0,
-    uint8_t elem_size = 0) {
+    uint8_t elem_size = 0,
+    bool is_mutable = false) {
   TensorBuilder builder_(_fbb);
   builder_.add_sym_dim_exprs(sym_dim_exprs);
   builder_.add_sym_dim_ids(sym_dim_ids);
@@ -460,6 +469,7 @@ inline ::flatbuffers::Offset<Tensor> CreateTensor(
   builder_.add_ne(ne);
   builder_.add_type(type);
   builder_.add_id(id);
+  builder_.add_is_mutable(is_mutable);
   builder_.add_elem_size(elem_size);
   builder_.add_is_output(is_output);
   builder_.add_is_input(is_input);
@@ -480,7 +490,8 @@ inline ::flatbuffers::Offset<Tensor> CreateTensorDirect(
     int32_t input_index = -1,
     const std::vector<int32_t> *sym_dim_ids = nullptr,
     const std::vector<uint8_t> *sym_dim_exprs = nullptr,
-    uint8_t elem_size = 0) {
+    uint8_t elem_size = 0,
+    bool is_mutable = false) {
   auto ne__ = ne ? _fbb.CreateVector<int64_t>(*ne) : 0;
   auto src_ids__ = src_ids ? _fbb.CreateVector<int32_t>(*src_ids) : 0;
   auto op_params__ = op_params ? _fbb.CreateVector<uint8_t>(*op_params) : 0;
@@ -501,7 +512,8 @@ inline ::flatbuffers::Offset<Tensor> CreateTensorDirect(
       input_index,
       sym_dim_ids__,
       sym_dim_exprs__,
-      elem_size);
+      elem_size,
+      is_mutable);
 }
 
 struct GgmlGraph FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {

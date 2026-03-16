@@ -11,7 +11,7 @@ from executorch.exir.backend.partitioner import (
     Partitioner,
     PartitionResult,
 )
-from executorch.exir.backend.utils import tag_constant_data
+from executorch.exir.backend.utils import tag_constant_data, tag_mutated_buffer
 
 if TYPE_CHECKING:
     from executorch_ggml.quantize import GgmlQuantConfig
@@ -314,13 +314,13 @@ class GgmlPartitioner(Partitioner):
         """Return ops that should not be decomposed during to_edge().
 
         SDPA is preserved so ggml can lower it to efficient attention ops.
+        Returning check_op_support=None enables the simpler preservation path
+        in to_edge_transform_and_lower (avoids the EDGE_DO_NOT_DECOMP path
+        which re-decomposes SDPA in a second pass).
         """
-        # check_op_support=lambda _: False skips the post-partition sanity check
-        # that would error if any SDPA node remains un-delegated (e.g. on a
-        # partition boundary). The GGML backend handles all SDPA variants.
         return (
             [torch.ops.aten.scaled_dot_product_attention.default],
-            lambda _node: False,
+            None,
         )
 
     def partition(self, exported_program: ExportedProgram) -> PartitionResult:
@@ -400,8 +400,29 @@ class GgmlPartitioner(Partitioner):
                 node.meta["delegation_tag"] = tag
             partition_tags[tag] = self.delegation_spec
 
-        # Tag constant data (params, buffers) used exclusively by tagged nodes
+        # Tag constant data (params, buffers) used exclusively by tagged nodes.
+        # tag_mutated_buffer claims mutable buffers (KV caches) so the
+        # delegate owns them and can update in-place without ET copies.
         tag_constant_data(exported_program)
+
+        # Don't tag mutated buffers whose mutation output node is ALSO
+        # used as a USER_OUTPUT — ET's framework doesn't support the same
+        # output being both BUFFER_MUTATION and USER_OUTPUT.
+        sig = exported_program.graph_signature
+        from torch.export.graph_signature import OutputKind
+        mutation_output_nodes = set()
+        user_output_nodes = set()
+        for spec in getattr(sig, "output_specs", []):
+            name = getattr(spec.arg, "name", None)
+            if name is None:
+                continue
+            if spec.kind == OutputKind.BUFFER_MUTATION:
+                mutation_output_nodes.add(name)
+            elif spec.kind == OutputKind.USER_OUTPUT:
+                user_output_nodes.add(name)
+        dual_outputs = mutation_output_nodes & user_output_nodes
+        if not dual_outputs:
+            tag_mutated_buffer(exported_program)
 
         return PartitionResult(
             tagged_exported_program=exported_program,

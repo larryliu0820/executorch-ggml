@@ -137,6 +137,7 @@ class IrTensor:
         "sym_dim_ids",
         "sym_dim_exprs",
         "elem_size",
+        "is_mutable",
     )
 
     def __init__(
@@ -154,6 +155,7 @@ class IrTensor:
         sym_dim_ids: Optional[List[int]] = None,
         sym_dim_exprs: Optional[bytes] = None,
         elem_size: int = 0,
+        is_mutable: bool = False,
     ):
         self.id = tensor_id
         self.tensor_type = tensor_type
@@ -168,6 +170,7 @@ class IrTensor:
         self.sym_dim_ids = sym_dim_ids or []
         self.sym_dim_exprs = sym_dim_exprs or b""
         self.elem_size = elem_size
+        self.is_mutable = is_mutable
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +229,8 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
             sym_exprs_vec = None
 
         # Build the Tensor table
-        # Start table with the right number of fields (13 fields)
-        builder.StartObject(13)
+        # Start table with the right number of fields (14 fields)
+        builder.StartObject(14)
 
         builder.PrependInt32Slot(0, t.id, 0)           # id
         builder.PrependInt32Slot(1, t.tensor_type, 0)  # type
@@ -249,6 +252,7 @@ def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
             builder.PrependUOffsetTRelativeSlot(11, sym_exprs_vec, 0)  # sym_dim_exprs
         if t.elem_size > 0:
             builder.PrependUint8Slot(12, t.elem_size, 0)  # elem_size
+        builder.PrependBoolSlot(13, t.is_mutable, False)   # is_mutable
 
         tensor_offsets.append(builder.EndObject())
 
