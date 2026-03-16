@@ -755,20 +755,60 @@ void ggml_custom_index_put_inplace(
   }
 }
 
+// ---------------------------------------------------------------------------
+// HostDataAccessor — safe host-side access to tensor data that may live on GPU.
+//
+// When const_buf is on a non-host backend (e.g. CUDA), tensor->data is a
+// device pointer that cannot be dereferenced from the host.  This helper
+// transparently copies the data to a host-side staging buffer when needed,
+// while returning the original pointer directly for host-resident tensors.
+// ---------------------------------------------------------------------------
+class HostDataAccessor {
+public:
+  const void* get(const struct ggml_tensor* t) {
+    if (!t || !t->data) return nullptr;
+    if (!t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
+      return t->data;
+    }
+    size_t nb = ggml_nbytes(t);
+    staging_.resize(nb);
+    ggml_backend_tensor_get(t, staging_.data(), 0, nb);
+    return staging_.data();
+  }
+
+  float read_f32(const struct ggml_tensor* t) {
+    const void* p = get(t);
+    return p ? *static_cast<const float*>(p) : 0.0f;
+  }
+  int32_t read_i32(const struct ggml_tensor* t) {
+    const void* p = get(t);
+    return p ? *static_cast<const int32_t*>(p) : 0;
+  }
+  int64_t read_i64(const struct ggml_tensor* t) {
+    const void* p = get(t);
+    return p ? *static_cast<const int64_t*>(p) : 0;
+  }
+
+private:
+  std::vector<uint8_t> staging_;
+};
+
 // Eager integer casts on the CPU context.  ggml's CPU backend doesn't support
 // GGML_OP_CPY for I64 or I32↔I64, so we must perform these conversions at
 // graph-build time (data is available because we use no_alloc=false).
 // Returns a new tensor with op=GGML_OP_NONE (treated as a constant leaf).
 struct ggml_tensor* eager_cast_i64_to_i32(
     struct ggml_context* ctx,
-    struct ggml_tensor* src) {
+    struct ggml_tensor* src,
+    HostDataAccessor* acc = nullptr) {
   ggml_set_no_alloc(ctx, false);
   struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_I32, GGML_MAX_DIMS, src->ne);
   ggml_set_no_alloc(ctx, true);
   dst->op = GGML_OP_NONE;
   if (src->data && dst->data) {
     const size_t n = ggml_nelements(src);
-    const int64_t* s = static_cast<const int64_t*>(src->data);
+    const int64_t* s = acc ? static_cast<const int64_t*>(acc->get(src))
+                           : static_cast<const int64_t*>(src->data);
     int32_t* d = static_cast<int32_t*>(dst->data);
     for (size_t i = 0; i < n; ++i) d[i] = static_cast<int32_t>(s[i]);
   }
@@ -777,14 +817,16 @@ struct ggml_tensor* eager_cast_i64_to_i32(
 
 struct ggml_tensor* eager_cast_i32_to_i64(
     struct ggml_context* ctx,
-    struct ggml_tensor* src) {
+    struct ggml_tensor* src,
+    HostDataAccessor* acc = nullptr) {
   ggml_set_no_alloc(ctx, false);
   struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_I64, GGML_MAX_DIMS, src->ne);
   ggml_set_no_alloc(ctx, true);
   dst->op = GGML_OP_NONE;
   if (src->data && dst->data) {
     const size_t n = ggml_nelements(src);
-    const int32_t* s = static_cast<const int32_t*>(src->data);
+    const int32_t* s = acc ? static_cast<const int32_t*>(acc->get(src))
+                           : static_cast<const int32_t*>(src->data);
     int64_t* d = static_cast<int64_t*>(dst->data);
     for (size_t i = 0; i < n; ++i) d[i] = static_cast<int64_t>(s[i]);
   }
@@ -797,30 +839,31 @@ struct ggml_tensor* eager_cast_i32_to_i64(
 struct ggml_tensor* safe_ggml_cast(
     struct ggml_context* ctx,
     struct ggml_tensor* src,
-    ggml_type target) {
+    ggml_type target,
+    HostDataAccessor* acc = nullptr) {
   if (src->type == target) return src;
   // I64 source: eager CPU conversion
-  if (src->type == GGML_TYPE_I64 && target == GGML_TYPE_I32) return eager_cast_i64_to_i32(ctx, src);
+  if (src->type == GGML_TYPE_I64 && target == GGML_TYPE_I32) return eager_cast_i64_to_i32(ctx, src, acc);
   if (src->type == GGML_TYPE_I64) {
     // I64 → F32 eager, then F32 → target via ggml_cast
-    auto* i32 = eager_cast_i64_to_i32(ctx, src);
-    return (target == GGML_TYPE_F32) ? safe_ggml_cast(ctx, i32, GGML_TYPE_F32)
-                                     : safe_ggml_cast(ctx, safe_ggml_cast(ctx, i32, GGML_TYPE_F32), target);
+    auto* i32 = eager_cast_i64_to_i32(ctx, src, acc);
+    return (target == GGML_TYPE_F32) ? safe_ggml_cast(ctx, i32, GGML_TYPE_F32, acc)
+                                     : safe_ggml_cast(ctx, safe_ggml_cast(ctx, i32, GGML_TYPE_F32, acc), target, acc);
   }
   // I32 source: only I32→F32 is native in ggml_cast
-  if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_I64) return eager_cast_i32_to_i64(ctx, src);
+  if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_I64) return eager_cast_i32_to_i64(ctx, src, acc);
   if (src->type == GGML_TYPE_I32 && target != GGML_TYPE_F32) {
-    return safe_ggml_cast(ctx, safe_ggml_cast(ctx, src, GGML_TYPE_F32), target);
+    return safe_ggml_cast(ctx, safe_ggml_cast(ctx, src, GGML_TYPE_F32, acc), target, acc);
   }
   // F32/F16/BF16 → I64: go through I32 first, then eager I32→I64
   if (target == GGML_TYPE_I64) {
-    auto* i32 = safe_ggml_cast(ctx, src, GGML_TYPE_I32);
-    return eager_cast_i32_to_i64(ctx, i32);
+    auto* i32 = safe_ggml_cast(ctx, src, GGML_TYPE_I32, acc);
+    return eager_cast_i32_to_i64(ctx, i32, acc);
   }
   // Eager scalar cast for I32→F32 (enc_len computation chains).
   if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_F32 &&
       ggml_nelements(src) == 1 && src->data) {
-    int32_t ival = *(const int32_t*)src->data;
+    int32_t ival = acc ? acc->read_i32(src) : *(const int32_t*)src->data;
     ggml_set_no_alloc(ctx, false);
     struct ggml_tensor* dst = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1);
     ggml_set_no_alloc(ctx, true);
@@ -1031,18 +1074,19 @@ static struct ggml_tensor* make_f32_scalar(struct ggml_context* ctx, float value
   return t;
 }
 
+// ---------------------------------------------------------------------------
 // Eagerly compute a binary f32 scalar op during build_graph.
 // Returns a new GGML_OP_NONE tensor with the result, or nullptr if not applicable.
 static struct ggml_tensor* try_eager_scalar_binop(
     struct ggml_context* ctx,
     struct ggml_tensor* a, struct ggml_tensor* b,
-    char op_char) {
+    char op_char, HostDataAccessor& acc) {
   // Only for scalar f32 tensors where both have data available.
   if (ggml_nelements(a) != 1 || ggml_nelements(b) != 1) return nullptr;
   if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) return nullptr;
   if (!a->data || !b->data) return nullptr;
-  float va = *(const float*)a->data;
-  float vb = *(const float*)b->data;
+  float va = acc.read_f32(a);
+  float vb = acc.read_f32(b);
   float result;
   switch (op_char) {
     case '+': result = va + vb; break;
@@ -1363,6 +1407,8 @@ static Error build_graph(
   }
   const char* cmp_env = std::getenv("GGML_NATIVE_CMP_OPS");
   if (cmp_env) use_native_cmp_ops = (std::string(cmp_env) != "0");
+  // Host-side accessor for reading tensor data that may live on a device buffer.
+  HostDataAccessor host_acc;
   int last_processed = -1;
   for (int i = 0; i < n_tensors; ++i) {
     const auto* t = fb_tensors->Get(i);
@@ -1705,7 +1751,7 @@ static Error build_graph(
           struct ggml_tensor* b = srcs[1];
 
           // Eager scalar path for enc_len-style computations.
-          if (auto* eager = try_eager_scalar_binop(ctx, a, b, '+')) {
+          if (auto* eager = try_eager_scalar_binop(ctx, a, b, '+', host_acc)) {
             gt = eager;
             break;
           }
@@ -1719,12 +1765,12 @@ static Error build_graph(
             for (int d = 0; d < 4; ++d) {
               out_ne[d] = std::max(a->ne[d], b->ne[d]);
             }
+            const int64_t* a_data = static_cast<const int64_t*>(host_acc.get(a));
+            const int64_t* b_data = static_cast<const int64_t*>(host_acc.get(b));
             ggml_set_no_alloc(ctx, false);
             gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I64, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
             ggml_set_no_alloc(ctx, true);
             int64_t* out_data = static_cast<int64_t*>(gt->data);
-            const int64_t* a_data = static_cast<const int64_t*>(a->data);
-            const int64_t* b_data = static_cast<const int64_t*>(b->data);
             for (int64_t d3 = 0; d3 < out_ne[3]; ++d3) {
               for (int64_t d2 = 0; d2 < out_ne[2]; ++d2) {
                 for (int64_t d1 = 0; d1 < out_ne[1]; ++d1) {
@@ -1745,8 +1791,8 @@ static Error build_graph(
             break;
           }
           // Non-constant I64: cast to F32 and use ggml_add.
-          if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-          if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+          if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
+          if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
 
           if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
           // CPU binary ops require contiguous innermost rows (e.g. RoPE after permute).
@@ -1756,8 +1802,8 @@ static Error build_graph(
             ggml_type tgt = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32)
                                 ? GGML_TYPE_F32
                                 : a->type;
-            if (a->type != tgt) a = safe_ggml_cast(ctx, a, tgt);
-            if (b->type != tgt) b = safe_ggml_cast(ctx, b, tgt);
+            if (a->type != tgt) a = safe_ggml_cast(ctx, a, tgt, &host_acc);
+            if (b->type != tgt) b = safe_ggml_cast(ctx, b, tgt, &host_acc);
           }
 
           if (!resolve_broadcast(a, b, "ADD")) {
@@ -1778,18 +1824,18 @@ static Error build_graph(
           // Swap if needed so the larger tensor is first.
           struct ggml_tensor* a = srcs[0];
           struct ggml_tensor* b = srcs[1];
-          if (auto* eager = try_eager_scalar_binop(ctx, a, b, '*')) {
+          if (auto* eager = try_eager_scalar_binop(ctx, a, b, '*', host_acc)) {
             gt = eager;
             break;
           }
           // ggml_scale is a single op for scalar * tensor (avoids REPEAT).
           // ggml_scale requires padded input — ggml_cont ensures this.
           if (ggml_nelements(b) == 1 && b->data && b->type == GGML_TYPE_F32) {
-            gt = ggml_scale(ctx, ggml_cont(ctx, a), *(const float*)b->data);
+            gt = ggml_scale(ctx, ggml_cont(ctx, a), host_acc.read_f32(b));
             break;
           }
           if (ggml_nelements(a) == 1 && a->data && a->type == GGML_TYPE_F32) {
-            gt = ggml_scale(ctx, ggml_cont(ctx, b), *(const float*)a->data);
+            gt = ggml_scale(ctx, ggml_cont(ctx, b), host_acc.read_f32(a));
             break;
           }
           if (ggml_nelements(a) < ggml_nelements(b)) {
@@ -1810,7 +1856,7 @@ static Error build_graph(
           // ggml_div(a, b) requires ggml_can_repeat(b, a) — b broadcasts to a.
           struct ggml_tensor* a = srcs[0];
           struct ggml_tensor* b = srcs[1];
-          if (auto* eager = try_eager_scalar_binop(ctx, a, b, '/')) {
+          if (auto* eager = try_eager_scalar_binop(ctx, a, b, '/', host_acc)) {
             gt = eager;
             break;
           }
@@ -1948,9 +1994,9 @@ static Error build_graph(
           struct ggml_tensor* w = srcs[0];
           struct ggml_tensor* idx = srcs[1];
           if (idx->type == GGML_TYPE_I64) {
-            idx = eager_cast_i64_to_i32(ctx, idx);
+            idx = eager_cast_i64_to_i32(ctx, idx, &host_acc);
           } else if (idx->type != GGML_TYPE_I32) {
-            idx = safe_ggml_cast(ctx, idx, GGML_TYPE_I32);
+            idx = safe_ggml_cast(ctx, idx, GGML_TYPE_I32, &host_acc);
           }
           gt = ggml_get_rows(ctx, w, idx);
           break;
@@ -2044,7 +2090,7 @@ static Error build_graph(
           // Cast conv output to f32 to keep the rest of the graph in f32 and
           // avoid mixed-type binary ops (e.g. residual adds).
           if (gt && gt->type == GGML_TYPE_F16) {
-            gt = safe_ggml_cast(ctx, gt, GGML_TYPE_F32);
+            gt = safe_ggml_cast(ctx, gt, GGML_TYPE_F32, &host_acc);
           }
 
           // Add bias if present.
@@ -2062,7 +2108,7 @@ static Error build_graph(
               return Error::InvalidArgument;
             }
             if (bias4->type == GGML_TYPE_F16) {
-              bias4 = safe_ggml_cast(ctx, bias4, GGML_TYPE_F32);
+              bias4 = safe_ggml_cast(ctx, bias4, GGML_TYPE_F32, &host_acc);
             }
             gt = ggml_add(ctx, gt, bias4);
           }
@@ -2523,13 +2569,13 @@ static Error build_graph(
           struct ggml_tensor* x = srcs[0];
           struct ggml_tensor* idx = srcs[1];
           if (idx->type == GGML_TYPE_I64) {
-            idx = eager_cast_i64_to_i32(ctx, idx);
+            idx = eager_cast_i64_to_i32(ctx, idx, &host_acc);
           } else if (idx->type != GGML_TYPE_I32) {
-            idx = safe_ggml_cast(ctx, idx, GGML_TYPE_I32);
+            idx = safe_ggml_cast(ctx, idx, GGML_TYPE_I32, &host_acc);
           }
           // ggml_get_rows supports src0 types F32/I32/F16/... but not I8.
           if (x->type == GGML_TYPE_I8) {
-            x = safe_ggml_cast(ctx, x, GGML_TYPE_I32);
+            x = safe_ggml_cast(ctx, x, GGML_TYPE_I32, &host_acc);
           }
           // ggml_get_rows selects rows by indices.
           gt = ggml_get_rows(ctx, x, idx);
@@ -2593,7 +2639,7 @@ static Error build_graph(
             // Index tensors may be runtime inputs. Avoid eager I32->I64 casts here,
             // otherwise we'd freeze uninitialized build-time input data.
             if (idx->type != GGML_TYPE_I32 && idx->type != GGML_TYPE_I64) {
-              idx = safe_ggml_cast(ctx, idx, GGML_TYPE_I32);
+              idx = safe_ggml_cast(ctx, idx, GGML_TYPE_I32, &host_acc);
             }
             custom_args.push_back(idx);
           }
@@ -2662,12 +2708,12 @@ static Error build_graph(
 
           // Keep index tensors in runtime-safe integer types.
           if (idx->type != GGML_TYPE_I32 && idx->type != GGML_TYPE_I64) {
-            idx = safe_ggml_cast(ctx, idx, GGML_TYPE_I32);
+            idx = safe_ggml_cast(ctx, idx, GGML_TYPE_I32, &host_acc);
           }
 
           // Keep value/cache aligned for row writes in the callback.
           if (val->type != dst->type) {
-            val = safe_ggml_cast(ctx, val, dst->type);
+            val = safe_ggml_cast(ctx, val, dst->type, &host_acc);
           }
 
           // Check if dst lives in mutable_buf (KV cache).
@@ -2733,11 +2779,12 @@ static Error build_graph(
           // This is needed for enc_len computation chains where F32→I64
           // casts produce the final output scalar.
           if (ggml_nelements(src) == 1 && src->data) {
+            const void* src_host = host_acc.get(src);
             ggml_set_no_alloc(ctx, false);
             gt = ggml_new_tensor_4d(ctx, target_type, 1, 1, 1, 1);
             ggml_set_no_alloc(ctx, true);
             gt->op = GGML_OP_NONE;
-            double val = read_scalar_f64_ptr(static_cast<const char*>(src->data), src->type);
+            double val = read_scalar_f64_ptr(static_cast<const char*>(src_host), src->type);
             write_scalar_f64_ptr(static_cast<char*>(gt->data), target_type, val);
             break;
           }
@@ -2765,7 +2812,7 @@ static Error build_graph(
             } else if (src->data && gt->data) {
               // Constant source: convert now.
               const size_t nelem = ggml_nelements(src);
-              const int64_t* src_data = static_cast<const int64_t*>(src->data);
+              const int64_t* src_data = static_cast<const int64_t*>(host_acc.get(src));
               if (target_type == GGML_TYPE_I32) {
                 int32_t* dst_data = static_cast<int32_t*>(gt->data);
                 for (size_t i = 0; i < nelem; ++i) dst_data[i] = static_cast<int32_t>(src_data[i]);
@@ -2778,7 +2825,7 @@ static Error build_graph(
           } else {
             // All other casts go through safe_ggml_cast which handles
             // I32→F32, I32→other (via F32), and F16/BF16/F32 conversions.
-            gt = safe_ggml_cast(ctx, src, target_type);
+            gt = safe_ggml_cast(ctx, src, target_type, &host_acc);
           }
           break;
         }
@@ -2820,16 +2867,16 @@ static Error build_graph(
             // mask {-65504=don't attend, 0=attend} using graph ops that run on
             // Metal. Avoids CPU custom ops which cause cross-backend NaN.
             if (mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64) {
-              mask = safe_ggml_cast(ctx, mask, GGML_TYPE_F32);
+              mask = safe_ggml_cast(ctx, mask, GGML_TYPE_F32, &host_acc);
             }
             if (mask->type == GGML_TYPE_F32) {
               // mask * 65504 - 65504: {0,1} → {0-65504, 65504-65504} = {-65504, 0}
               struct ggml_tensor* scaled = ggml_scale(ctx, ggml_cont(ctx, mask), 65504.0f);
               mask = safe_ggml_cast(ctx,
                   ggml_add(ctx, scaled, make_f32_scalar(ctx, -65504.0f)),
-                  GGML_TYPE_F16);
+                  GGML_TYPE_F16, &host_acc);
             } else if (mask->type != GGML_TYPE_F16) {
-              mask = safe_ggml_cast(ctx, mask, GGML_TYPE_F16);
+              mask = safe_ggml_cast(ctx, mask, GGML_TYPE_F16, &host_acc);
             }
             if (!ggml_is_contiguous(mask)) {
               mask = ggml_cont(ctx, mask);
@@ -2876,7 +2923,7 @@ static Error build_graph(
         case ggml_ir::OpCode::SUB: {
           struct ggml_tensor* a = srcs[0];
           struct ggml_tensor* b = srcs[1];
-          if (auto* eager = try_eager_scalar_binop(ctx, a, b, '-')) {
+          if (auto* eager = try_eager_scalar_binop(ctx, a, b, '-', host_acc)) {
             gt = eager;
             break;
           }
@@ -2888,12 +2935,12 @@ static Error build_graph(
             for (int d = 0; d < 4; ++d) {
               out_ne[d] = std::max(a->ne[d], b->ne[d]);
             }
+            const int64_t* a_data = static_cast<const int64_t*>(host_acc.get(a));
+            const int64_t* b_data = static_cast<const int64_t*>(host_acc.get(b));
             ggml_set_no_alloc(ctx, false);
             gt = ggml_new_tensor_4d(ctx, GGML_TYPE_I64, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
             ggml_set_no_alloc(ctx, true);
             int64_t* out_data = static_cast<int64_t*>(gt->data);
-            const int64_t* a_data = static_cast<const int64_t*>(a->data);
-            const int64_t* b_data = static_cast<const int64_t*>(b->data);
             for (int64_t d3 = 0; d3 < out_ne[3]; ++d3) {
               for (int64_t d2 = 0; d2 < out_ne[2]; ++d2) {
                 for (int64_t d1 = 0; d1 < out_ne[1]; ++d1) {
@@ -2913,8 +2960,8 @@ static Error build_graph(
             }
           } else {
             // Non-constant I64: cast to F32 and use ggml_sub.
-            if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-            if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
+            if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
             if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
   
             if (!resolve_broadcast(a, b, "SUB")) {
@@ -3037,7 +3084,7 @@ static Error build_graph(
           // (for flash_attn additive bias). Clamp to [0, 1] to recover
           // proper boolean semantics for the arithmetic emulation below.
           if (cond->type != GGML_TYPE_F32) {
-            cond = safe_ggml_cast(ctx, cond, GGML_TYPE_F32);
+            cond = safe_ggml_cast(ctx, cond, GGML_TYPE_F32, &host_acc);
           }
           cond = ggml_clamp(ctx, cond, 0.0f, 1.0f);
 
@@ -3096,7 +3143,7 @@ static Error build_graph(
           gt = ggml_arange(ctx, (float)start, stop, (float)step);
 
           if (out_type == GGML_TYPE_F16) {
-            gt = safe_ggml_cast(ctx, gt, GGML_TYPE_F16);
+            gt = safe_ggml_cast(ctx, gt, GGML_TYPE_F16, &host_acc);
           }
           break;
         }
@@ -3125,7 +3172,7 @@ static Error build_graph(
                               ne[0], ne[1], ne[2], ne[3]);
 
           if (out_type == GGML_TYPE_F16) {
-            gt = safe_ggml_cast(ctx, gt, GGML_TYPE_F16);
+            gt = safe_ggml_cast(ctx, gt, GGML_TYPE_F16, &host_acc);
           }
           break;
         }
@@ -3147,7 +3194,7 @@ static Error build_graph(
 
           // I64 input: cast to I32 first (ggml has no I64 compute)
           if (out_type == GGML_TYPE_I64) {
-            src = safe_ggml_cast(ctx, src, GGML_TYPE_I32);
+            src = safe_ggml_cast(ctx, src, GGML_TYPE_I32, &host_acc);
             out_type = GGML_TYPE_I32;
           }
 
@@ -3179,8 +3226,8 @@ static Error build_graph(
             b = srcs[1];
           }
           if (use_native_cmp_ops) {
-            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
             if (!resolve_broadcast(a, b, "EQ")) { ggml_free(ctx); return Error::InvalidArgument; }
             struct ggml_tensor* diff = ggml_sub(ctx, a, b);
             struct ggml_tensor* ne_val = ggml_clamp(ctx, ggml_add(ctx, ggml_step(ctx, diff), ggml_step(ctx, ggml_neg(ctx, diff))), 0.0f, 1.0f);
@@ -3212,8 +3259,8 @@ static Error build_graph(
             b = srcs[1];
           }
           if (use_native_cmp_ops) {
-            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
             if (!resolve_broadcast(a, b, "NE")) { ggml_free(ctx); return Error::InvalidArgument; }
             struct ggml_tensor* diff = ggml_sub(ctx, a, b);
             gt = ggml_clamp(ctx, ggml_add(ctx, ggml_step(ctx, diff), ggml_step(ctx, ggml_neg(ctx, diff))), 0.0f, 1.0f);
@@ -3250,8 +3297,8 @@ static Error build_graph(
             b = srcs[1];
           }
           if (use_native_cmp_ops) {
-            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
             if (!resolve_broadcast(a, b, "LE")) { ggml_free(ctx); return Error::InvalidArgument; }
             gt = ggml_add(ctx, ggml_neg(ctx, ggml_step(ctx, ggml_sub(ctx, a, b))), make_f32_scalar(ctx, 1.0f));
           } else {
@@ -3266,8 +3313,8 @@ static Error build_graph(
         case ggml_ir::OpCode::LT: {
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
           if (use_native_cmp_ops) {
-            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
             if (!resolve_broadcast(a, b, "LT")) { ggml_free(ctx); return Error::InvalidArgument; }
             gt = ggml_step(ctx, ggml_neg(ctx, ggml_sub(ctx, a, b)));
           } else {
@@ -3282,8 +3329,8 @@ static Error build_graph(
         case ggml_ir::OpCode::GT: {
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
           if (use_native_cmp_ops) {
-            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
             if (!resolve_broadcast(a, b, "GT")) { ggml_free(ctx); return Error::InvalidArgument; }
             gt = ggml_step(ctx, ggml_sub(ctx, a, b));
           } else {
@@ -3298,8 +3345,8 @@ static Error build_graph(
         case ggml_ir::OpCode::GE: {
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
           if (use_native_cmp_ops) {
-            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
             if (!resolve_broadcast(a, b, "GE")) { ggml_free(ctx); return Error::InvalidArgument; }
             gt = ggml_add(ctx, ggml_neg(ctx, ggml_step(ctx, ggml_neg(ctx, ggml_sub(ctx, a, b)))), make_f32_scalar(ctx, 1.0f));
           } else {
@@ -3314,8 +3361,8 @@ static Error build_graph(
         case ggml_ir::OpCode::BITWISE_AND: {
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
           if (use_native_cmp_ops) {
-            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
             if (!resolve_broadcast(a, b, "BITWISE_AND")) { ggml_free(ctx); return Error::InvalidArgument; }
             gt = ggml_mul(ctx, a, b);
           } else {
@@ -3330,8 +3377,8 @@ static Error build_graph(
         case ggml_ir::OpCode::BITWISE_OR: {
           struct ggml_tensor* a = srcs[0]; struct ggml_tensor* b = srcs[1];
           if (use_native_cmp_ops) {
-            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
-            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
+            if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
             if (!resolve_broadcast(a, b, "BITWISE_OR")) { ggml_free(ctx); return Error::InvalidArgument; }
             gt = ggml_clamp(ctx, ggml_add(ctx, a, b), 0.0f, 1.0f);
           } else {
@@ -3346,7 +3393,7 @@ static Error build_graph(
         case ggml_ir::OpCode::LOGICAL_NOT: {
           struct ggml_tensor* x = srcs[0];
           if (use_native_cmp_ops) {
-            if (x->type != GGML_TYPE_F32) x = safe_ggml_cast(ctx, x, GGML_TYPE_F32);
+            if (x->type != GGML_TYPE_F32) x = safe_ggml_cast(ctx, x, GGML_TYPE_F32, &host_acc);
             gt = ggml_add(ctx, ggml_neg(ctx, x), make_f32_scalar(ctx, 1.0f));
           } else {
             struct ggml_tensor* args[1] = {x};
@@ -3374,6 +3421,7 @@ static Error build_graph(
 
           if (src->op == GGML_OP_NONE && src->data != nullptr) {
             // Eager path: source data available at build time.
+            const void* src_host = host_acc.get(src);
             int64_t any_ne[4] = {src->ne[0], src->ne[1], src->ne[2], src->ne[3]};
             any_ne[ggml_axis] = 1;
             ggml_set_no_alloc(ctx, false);
@@ -3389,7 +3437,7 @@ static Error build_graph(
             if (outer_size == 0) outer_size = 1;
 
             if (src->type == GGML_TYPE_F32) {
-              const float* in_data = static_cast<const float*>(src->data);
+              const float* in_data = static_cast<const float*>(src_host);
               for (int64_t outer = 0; outer < outer_size; ++outer) {
                 for (int64_t inner = 0; inner < stride; ++inner) {
                   float any_true = 0.0f;
@@ -3401,7 +3449,7 @@ static Error build_graph(
                 }
               }
             } else {
-              const int32_t* in_data = static_cast<const int32_t*>(src->data);
+              const int32_t* in_data = static_cast<const int32_t*>(src_host);
               for (int64_t outer = 0; outer < outer_size; ++outer) {
                 for (int64_t inner = 0; inner < stride; ++inner) {
                   float any_true = 0.0f;
@@ -3418,7 +3466,7 @@ static Error build_graph(
             // any(x, dim) = step(sum_rows(abs(x))) along the target axis.
             // ggml_sum_rows reduces dim 0, so permute target axis to dim 0 first.
             struct ggml_tensor* x = src;
-            if (x->type != GGML_TYPE_F32) x = safe_ggml_cast(ctx, x, GGML_TYPE_F32);
+            if (x->type != GGML_TYPE_F32) x = safe_ggml_cast(ctx, x, GGML_TYPE_F32, &host_acc);
             if (ggml_axis != 0) {
               // Permute to bring ggml_axis to dim 0.
               int axes[4] = {0, 1, 2, 3};
@@ -3472,9 +3520,9 @@ static Error build_graph(
           // Get start position value
           int64_t start_pos = 0;
           if (start_pos_tensor->type == GGML_TYPE_I64) {
-            start_pos = *(const int64_t*)start_pos_tensor->data;
+            start_pos = host_acc.read_i64(start_pos_tensor);
           } else if (start_pos_tensor->type == GGML_TYPE_I32) {
-            start_pos = *(const int32_t*)start_pos_tensor->data;
+            start_pos = host_acc.read_i32(start_pos_tensor);
           }
 
           // Use ggml_set_rows if we have indices, otherwise use a simple copy
@@ -3493,10 +3541,10 @@ static Error build_graph(
 
           // ggml_set_rows requires value (b) and cache (a) to be F32.
           if (value->type != GGML_TYPE_F32) {
-            value = safe_ggml_cast(ctx, value, GGML_TYPE_F32);
+            value = safe_ggml_cast(ctx, value, GGML_TYPE_F32, &host_acc);
           }
           if (cache->type != GGML_TYPE_F32) {
-            cache = safe_ggml_cast(ctx, cache, GGML_TYPE_F32);
+            cache = safe_ggml_cast(ctx, cache, GGML_TYPE_F32, &host_acc);
           }
 
           // Use ggml_set_rows to scatter values into cache
@@ -3592,10 +3640,10 @@ static Error build_graph(
               weight->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32 &&
               mean->type == GGML_TYPE_F32 && var->type == GGML_TYPE_F32) {
             const int64_t C = weight->ne[0];
-            const float* w_data = (const float*)weight->data;
-            const float* b_data = (const float*)bias->data;
-            const float* m_data = (const float*)mean->data;
-            const float* v_data = (const float*)var->data;
+            const float* w_data = (const float*)host_acc.get(weight);
+            const float* b_data = (const float*)host_acc.get(bias);
+            const float* m_data = (const float*)host_acc.get(mean);
+            const float* v_data = (const float*)host_acc.get(var);
 
             // Allocate pre-filled leaf tensors [1, C, 1, 1]
             ggml_set_no_alloc(ctx, false);
@@ -3727,7 +3775,7 @@ static Error build_graph(
 
           // Cast to f32 if output is f16
           if (gt && gt->type == GGML_TYPE_F16) {
-            gt = safe_ggml_cast(ctx, gt, GGML_TYPE_F32);
+            gt = safe_ggml_cast(ctx, gt, GGML_TYPE_F32, &host_acc);
           }
 
           // Add bias if present — ggml_add natively broadcasts.
@@ -3746,7 +3794,7 @@ static Error build_graph(
             // F16 bias needs F32 cast on all backends; BF16 only on Metal.
             if (bias4->type == GGML_TYPE_F16 ||
                 (metal_f32_binops && bias4->type == GGML_TYPE_BF16)) {
-              bias4 = safe_ggml_cast(ctx, bias4, GGML_TYPE_F32);
+              bias4 = safe_ggml_cast(ctx, bias4, GGML_TYPE_F32, &host_acc);
             }
             gt = ggml_add(ctx, gt, bias4);
           }
@@ -4178,6 +4226,15 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       id_to_cd[handle->constant_data[ci].ir_tensor_id] = ci;
     }
 
+    bool const_is_host = !handle->const_buf || ggml_backend_buffer_is_host(handle->const_buf);
+    bool mutable_is_host = !handle->mutable_buf || ggml_backend_buffer_is_host(handle->mutable_buf);
+
+    // For non-host buffers (e.g. CUDA), create a temporary ggml_tensor for
+    // ggml_backend_tensor_set() which dispatches host→device copies.
+    struct ggml_init_params tmp_params = { ggml_tensor_overhead() + 64, nullptr, true };
+    struct ggml_context* tmp_ctx = (!const_is_host || !mutable_is_host) ? ggml_init(tmp_params) : nullptr;
+    struct ggml_tensor* tmp_tensor = tmp_ctx ? ggml_new_tensor_1d(tmp_ctx, GGML_TYPE_I8, 1) : nullptr;
+
     for (int i = 0; i < n_tensors; ++i) {
       const auto* t = fb_tensors->Get(i);
       if (static_cast<ggml_ir::OpCode>(t->op()) != ggml_ir::OpCode::NONE) continue;
@@ -4207,6 +4264,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       bool is_mut = t->is_mutable();
       ggml_backend_buffer_t buf = is_mut ? handle->mutable_buf : handle->const_buf;
       size_t& offset = is_mut ? mutable_offset : const_offset;
+      bool is_host = is_mut ? mutable_is_host : const_is_host;
 
       handle->leaf_buf_map[t->id()] = {buf, offset, nbytes};
 
@@ -4214,23 +4272,29 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       auto cd_it = id_to_cd.find(t->id());
       if (cd_it != id_to_cd.end()) {
         const auto& cd = handle->constant_data[cd_it->second];
-        char* dst = static_cast<char*>(ggml_backend_buffer_get_base(buf)) + offset;
-        // Use ggml_backend_buffer_write for GPU buffers, memcpy for CPU
-        if (buf == handle->const_buf || buf == handle->mutable_buf) {
-          // For CPU backend, we can memcpy directly since get_base returns host memory.
-          // For GPU backends, ggml_backend_buffer_get_base may not be host-accessible,
-          // but the scheduler uses ggml_backend_tensor_set which handles the copy.
-          // Since we don't have a tensor object yet, use memcpy (works for CPU/Metal unified memory).
-          memcpy(dst, cd.data.data(), std::min(nbytes, cd.data.size()));
+        size_t copy_size = std::min(nbytes, cd.data.size());
+        if (is_host) {
+          char* dst = static_cast<char*>(ggml_backend_buffer_get_base(buf)) + offset;
+          memcpy(dst, cd.data.data(), copy_size);
+        } else {
+          tmp_tensor->ne[0] = nbytes;
+          tmp_tensor->nb[1] = nbytes;
+          tmp_tensor->buffer = buf;
+          tmp_tensor->data = static_cast<char*>(ggml_backend_buffer_get_base(buf)) + offset;
+          ggml_backend_tensor_set(tmp_tensor, cd.data.data(), 0, copy_size);
         }
       } else if (is_mut) {
-        // Mutable buffer with no initial data → zero-initialize.
-        char* dst = static_cast<char*>(ggml_backend_buffer_get_base(buf)) + offset;
-        memset(dst, 0, nbytes);
+        if (is_host) {
+          char* dst = static_cast<char*>(ggml_backend_buffer_get_base(buf)) + offset;
+          memset(dst, 0, nbytes);
+        } else {
+          ggml_backend_buffer_clear(buf, 0);
+        }
       }
 
       offset += padded;
     }
+    if (tmp_ctx) ggml_free(tmp_ctx);
 
     fprintf(stderr, "[ggml_backend] leaf_buf_map: %zu entries (const=%zu MB, mutable=%zu MB)\n",
             handle->leaf_buf_map.size(), const_offset / (1024*1024), mutable_offset / (1024*1024));
@@ -4376,6 +4440,7 @@ Error GgmlBackendInterface::execute(
   if (!active->sched) {
     return Error::InvalidState;
   }
+
   ggml_backend_sched_reset(active->sched);
   if (!ggml_backend_sched_alloc_graph(active->sched, active->graph)) {
     fprintf(stderr, "[ggml_backend] ERROR: scheduler alloc failed\n");

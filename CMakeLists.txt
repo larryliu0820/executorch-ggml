@@ -23,7 +23,13 @@ message("EXECUTORCH_DIR being set to ${EXECUTORCH_DIR}")
 # Falls back to a system flatc only when the submodule source is missing.
 set(FLATBUFFERS_SOURCE_DIR "${EXECUTORCH_DIR}/third-party/flatbuffers")
 
-if(EXISTS "${FLATBUFFERS_SOURCE_DIR}/CMakeLists.txt")
+# When building runners, ExecuTorch's subdirectory creates its own flatc
+# target.  Skip root-level flatbuffers to avoid a duplicate target conflict;
+# the checked-in schema/ggml_ir_generated.h is used as-is.
+if(EXECUTORCH_GGML_BUILD_LLAMA_RUNNER)
+  message(STATUS "flatc: skipped (runner build uses checked-in schema)")
+  add_custom_target(ggml_ir_gen)
+elseif(EXISTS "${FLATBUFFERS_SOURCE_DIR}/CMakeLists.txt")
   set(FLATBUFFERS_BUILD_FLATC ON CACHE BOOL "" FORCE)
   set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(FLATBUFFERS_INSTALL OFF CACHE BOOL "" FORCE)
@@ -48,7 +54,7 @@ else()
   endif()
 endif()
 
-if(FLATC_EXECUTABLE)
+if(NOT EXECUTORCH_GGML_BUILD_LLAMA_RUNNER AND FLATC_EXECUTABLE)
   set(_flatc_deps "${CMAKE_CURRENT_SOURCE_DIR}/schema/ggml_ir.fbs")
   if(FLATC_IS_TARGET)
     list(APPEND _flatc_deps flatc)
@@ -64,7 +70,7 @@ if(FLATC_EXECUTABLE)
   add_custom_target(ggml_ir_gen
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/schema/ggml_ir_generated.h"
   )
-else()
+elseif(NOT EXECUTORCH_GGML_BUILD_LLAMA_RUNNER)
   add_custom_target(ggml_ir_gen)
 endif()
 

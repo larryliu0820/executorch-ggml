@@ -54,20 +54,25 @@ try:
     if _et_so is not None:
         ctypes.CDLL(_et_so, mode=ctypes.RTLD_GLOBAL)
     else:
-        # No ExecuTorch .so loaded yet — try to import one with RTLD_GLOBAL.
-        # We attempt multiple modules because some ET wheel builds ship
-        # _portable_lib or _llm_runner but not both, and either may fail to
-        # load depending on how torch/ET were built.
-        _old_flags = sys.getdlopenflags()
-        sys.setdlopenflags(_old_flags | ctypes.RTLD_GLOBAL)
+        # No ExecuTorch .so loaded yet — import one, then promote it to
+        # RTLD_GLOBAL so _ggml_backend can resolve ET symbols.
+        #
+        # We must NOT use sys.setdlopenflags(RTLD_GLOBAL) for the import
+        # itself: _portable_lib and its transitive dependency data_loader.so
+        # both contain static kernel registrations with their own registry
+        # copies.  RTLD_GLOBAL causes symbol interposition that merges the
+        # registries, leading to duplicate "aten::sym_size.int" registration
+        # and an abort.  Instead, import normally then re-dlopen just the
+        # one .so with RTLD_GLOBAL (which promotes symbols without re-running
+        # static constructors).
         try:
-            from executorch.extension.pybindings import _portable_lib  # noqa: F401
+            from executorch.extension.pybindings import _portable_lib as _et_mod  # noqa: F401
         except Exception:
-            # _portable_lib may be broken (e.g. rpath mismatch); try the
-            # LLM runner which also contains the full ET runtime.
-            from executorch.extension.llm.runner import _llm_runner  # noqa: F401
+            from executorch.extension.llm.runner import _llm_runner as _et_mod  # noqa: F401
 
-        sys.setdlopenflags(_old_flags)
+        _et_mod_path = getattr(_et_mod, "__file__", None)
+        if _et_mod_path and os.path.isfile(_et_mod_path):
+            ctypes.CDLL(_et_mod_path, mode=ctypes.RTLD_GLOBAL)
 
     # This module is produced by the CMake target `executorch_ggml_backend_py`.
     # Import side-effect: registers backend via static init.

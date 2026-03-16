@@ -93,6 +93,11 @@ def main():
         tokens = greedy_decode_eager(encoded, encoded_len, model)
         print(f"  {model.tokenizer.ids_to_text(tokens)}\n")
 
+    # Free the NeMo eager model from GPU before loading the .pte program
+    # to reclaim VRAM for the GGML backend.
+    model.cpu()
+    torch.cuda.empty_cache()
+
     from executorch.runtime import Runtime
     runtime = Runtime.get()
 

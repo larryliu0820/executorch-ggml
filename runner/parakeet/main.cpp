@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <iomanip>
 #include <cstdint>
 #include <cstring>
@@ -50,16 +51,52 @@ struct RawTerminal {
     struct termios raw = orig;
     raw.c_lflag &= ~(ICANON | ECHO);
     raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 1; // 100ms timeout
+    raw.c_cc[VTIME] = 0; // non-blocking
     tcsetattr(STDIN_FILENO, TCSANOW, &raw);
   }
   ~RawTerminal() { tcsetattr(STDIN_FILENO, TCSANOW, &orig); }
 
-  bool key_pressed() {
-    char c;
-    return read(STDIN_FILENO, &c, 1) == 1;
+  // Read a key if available, returns 0 if none.
+  char read_key() {
+    char c = 0;
+    read(STDIN_FILENO, &c, 1);
+    return c;
   }
 };
+
+// ---------------------------------------------------------------------------
+// List ALSA capture devices
+// ---------------------------------------------------------------------------
+static void list_capture_devices() {
+  int card = -1;
+  std::cout << "Available capture devices:" << std::endl;
+  while (snd_card_next(&card) >= 0 && card >= 0) {
+    char* card_name = nullptr;
+    snd_card_get_name(card, &card_name);
+
+    snd_ctl_t* ctl;
+    std::string hw = "hw:" + std::to_string(card);
+    if (snd_ctl_open(&ctl, hw.c_str(), 0) < 0)
+      continue;
+
+    int dev = -1;
+    while (snd_ctl_pcm_next_device(ctl, &dev) >= 0 && dev >= 0) {
+      snd_pcm_info_t* pcm_info;
+      snd_pcm_info_alloca(&pcm_info);
+      snd_pcm_info_set_device(pcm_info, static_cast<unsigned int>(dev));
+      snd_pcm_info_set_subdevice(pcm_info, 0);
+      snd_pcm_info_set_stream(pcm_info, SND_PCM_STREAM_CAPTURE);
+      if (snd_ctl_pcm_info(ctl, pcm_info) < 0)
+        continue;
+      std::cout << "  --device " << card
+                << "  hw:" << card << "," << dev
+                << "  " << (card_name ? card_name : "?")
+                << " - " << snd_pcm_info_get_name(pcm_info) << std::endl;
+    }
+    snd_ctl_close(ctl);
+    free(card_name);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // ALSA microphone capture
@@ -67,14 +104,10 @@ struct RawTerminal {
 class MicCapture {
  public:
   MicCapture(int device_index, int sample_rate)
-      : handle_(nullptr), sample_rate_(sample_rate) {
-    std::string device = "hw:" + std::to_string(device_index);
+      : handle_(nullptr), sample_rate_(sample_rate), channels_(1) {
+    // Use plughw: which handles format/rate/channel conversion automatically
+    std::string device = "plughw:" + std::to_string(device_index);
     int err = snd_pcm_open(&handle_, device.c_str(), SND_PCM_STREAM_CAPTURE, 0);
-    if (err < 0) {
-      // Fallback: try plughw which handles format conversion
-      device = "plughw:" + std::to_string(device_index);
-      err = snd_pcm_open(&handle_, device.c_str(), SND_PCM_STREAM_CAPTURE, 0);
-    }
     if (err < 0) {
       std::cerr << "Cannot open audio device " << device_index << ": "
                 << snd_strerror(err) << std::endl;
@@ -103,7 +136,17 @@ class MicCapture {
                 << std::endl;
       snd_pcm_close(handle_);
       handle_ = nullptr;
+      return;
     }
+
+    // Query actual channel count (plughw may not downmix to mono)
+    unsigned int actual_channels = 0;
+    snd_pcm_hw_params_get_channels(params, &actual_channels);
+    channels_ = static_cast<int>(actual_channels);
+    if (channels_ < 1)
+      channels_ = 1;
+    std::cout << "Audio capture: " << rate << " Hz, " << channels_
+              << " channel(s)" << std::endl;
   }
 
   ~MicCapture() {
@@ -115,10 +158,10 @@ class MicCapture {
   bool is_open() const { return handle_ != nullptr; }
   int sample_rate() const { return sample_rate_; }
 
-  // Read a chunk of audio. Returns number of frames read, or -1 on error.
-  // Appends normalized float samples to `out`.
+  // Read a chunk of audio frames. Downmixes to mono and appends to `out`.
   int read_chunk(std::vector<float>& out, int frames) {
-    std::vector<int16_t> buf(static_cast<size_t>(frames));
+    // Each frame has `channels_` samples
+    std::vector<int16_t> buf(static_cast<size_t>(frames * channels_));
     snd_pcm_sframes_t n = snd_pcm_readi(handle_, buf.data(), frames);
     if (n == -EPIPE) {
       snd_pcm_prepare(handle_);
@@ -128,7 +171,18 @@ class MicCapture {
       return -1;
     }
     for (snd_pcm_sframes_t i = 0; i < n; ++i) {
-      out.push_back(static_cast<float>(buf[static_cast<size_t>(i)]) / 32768.0f);
+      if (channels_ == 1) {
+        out.push_back(
+            static_cast<float>(buf[static_cast<size_t>(i)]) / 32768.0f);
+      } else {
+        // Average all channels to mono
+        float sum = 0.0f;
+        for (int ch = 0; ch < channels_; ++ch) {
+          sum += static_cast<float>(
+              buf[static_cast<size_t>(i * channels_ + ch)]);
+        }
+        out.push_back(sum / (32768.0f * static_cast<float>(channels_)));
+      }
     }
     return static_cast<int>(n);
   }
@@ -136,7 +190,52 @@ class MicCapture {
  private:
   snd_pcm_t* handle_;
   int sample_rate_;
+  int channels_;
 };
+
+// ---------------------------------------------------------------------------
+// Save audio buffer as WAV file
+// ---------------------------------------------------------------------------
+static void save_wav(
+    const std::string& path,
+    const std::vector<float>& audio,
+    int sample_rate) {
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    std::cerr << "Cannot write " << path << std::endl;
+    return;
+  }
+  int32_t num_samples = static_cast<int32_t>(audio.size());
+  int16_t channels = 1;
+  int16_t bits = 16;
+  int32_t byte_rate = sample_rate * channels * bits / 8;
+  int16_t block_align = channels * bits / 8;
+  int32_t data_size = num_samples * block_align;
+  int32_t chunk_size = 36 + data_size;
+
+  f.write("RIFF", 4);
+  f.write(reinterpret_cast<const char*>(&chunk_size), 4);
+  f.write("WAVE", 4);
+  f.write("fmt ", 4);
+  int32_t fmt_size = 16;
+  f.write(reinterpret_cast<const char*>(&fmt_size), 4);
+  int16_t pcm = 1;
+  f.write(reinterpret_cast<const char*>(&pcm), 2);
+  f.write(reinterpret_cast<const char*>(&channels), 2);
+  f.write(reinterpret_cast<const char*>(&sample_rate), 4);
+  f.write(reinterpret_cast<const char*>(&byte_rate), 4);
+  f.write(reinterpret_cast<const char*>(&block_align), 2);
+  f.write(reinterpret_cast<const char*>(&bits), 2);
+  f.write("data", 4);
+  f.write(reinterpret_cast<const char*>(&data_size), 4);
+
+  for (float s : audio) {
+    float clamped = std::max(-1.0f, std::min(1.0f, s));
+    int16_t sample = static_cast<int16_t>(clamped * 32767.0f);
+    f.write(reinterpret_cast<const char*>(&sample), 2);
+  }
+  std::cout << "Saved audio to " << path << std::endl;
+}
 
 // ---------------------------------------------------------------------------
 // Model helper: query int64 constant method
@@ -333,13 +432,17 @@ static Args parse_args(int argc, char** argv) {
       a.device_index = std::stoi(argv[++i]);
     else if (arg == "--max_seconds" && i + 1 < argc)
       a.max_seconds = std::stoi(argv[++i]);
-    else if (arg == "--help" || arg == "-h") {
+    else if (arg == "--list-devices" || arg == "-l") {
+      list_capture_devices();
+      exit(0);
+    } else if (arg == "--help" || arg == "-h") {
       std::cout
           << "Usage: " << argv[0] << " [options]\n"
           << "  --model, -m PATH       Model .pte file (default: "
           << a.model_path << ")\n"
           << "  --tokenizer, -t PATH   Tokenizer .model file\n"
           << "  --device, -d INDEX     ALSA device index (default: 0)\n"
+          << "  --list-devices, -l     List capture devices and exit\n"
           << "  --max_seconds N        Max recording duration (default: 40)\n";
       exit(0);
     }
@@ -400,6 +503,7 @@ int main(int argc, char** argv) {
   }
 
   // Open microphone
+  list_capture_devices();
   MicCapture mic(args.device_index, static_cast<int>(sample_rate));
   if (!mic.is_open()) {
     std::cerr << "Failed to open microphone (device " << args.device_index
@@ -419,16 +523,15 @@ int main(int argc, char** argv) {
     // Wait for space or q
     bool quit = false;
     while (true) {
-      char c;
-      if (read(STDIN_FILENO, &c, 1) == 1) {
-        if (c == 'q' || c == 'Q') {
-          quit = true;
-          break;
-        }
-        if (c == ' ') {
-          break;
-        }
+      char c = term.read_key();
+      if (c == 'q' || c == 'Q') {
+        quit = true;
+        break;
       }
+      if (c == ' ') {
+        break;
+      }
+      usleep(10000); // 10ms idle poll
     }
     if (quit)
       break;
@@ -444,9 +547,8 @@ int main(int argc, char** argv) {
     auto rec_start = std::chrono::steady_clock::now();
 
     while (true) {
-      // Check for keypress to stop
-      char c;
-      if (read(STDIN_FILENO, &c, 1) == 1 && c == ' ') {
+      // Check for keypress to stop (non-blocking)
+      if (term.read_key() == ' ') {
         break;
       }
 
@@ -478,6 +580,10 @@ int main(int argc, char** argv) {
     std::cout << "Recorded " << audio.size() << " samples ("
               << std::fixed << std::setprecision(1) << rec_secs << "s)"
               << std::endl;
+
+    // Save recorded audio as WAV for debugging
+    std::string wav_path = "/tmp/parakeet_recording.wav";
+    save_wav(wav_path, audio, static_cast<int>(sample_rate));
 
     // Run inference
     std::cout << "Transcribing..." << std::endl;

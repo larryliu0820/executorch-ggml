@@ -39,10 +39,24 @@ endif()
 # Core link libraries
 set(_parakeet_libs executorch)
 
-# Ops — use portable ops (same as llm_main)
-if(TARGET portable_ops_lib)
+# Ops — prefer optimized ops (needed for preprocessor STFT/mel ops),
+# fall back to portable ops
+if(TARGET optimized_native_cpu_ops_lib)
+  list(APPEND _parakeet_libs optimized_native_cpu_ops_lib cpublas eigen_blas)
+  executorch_target_link_options_shared_lib(optimized_native_cpu_ops_lib)
+elseif(TARGET portable_ops_lib)
   list(APPEND _parakeet_libs portable_ops_lib portable_kernels)
   executorch_target_link_options_shared_lib(portable_ops_lib)
+endif()
+
+# Quantized + custom ops (needed for preprocessor on CPU-only builds)
+if(TARGET quantized_ops_lib)
+  list(APPEND _parakeet_libs quantized_ops_lib)
+  executorch_target_link_options_shared_lib(quantized_ops_lib)
+endif()
+if(TARGET custom_ops)
+  list(APPEND _parakeet_libs custom_ops)
+  executorch_target_link_options_shared_lib(custom_ops)
 endif()
 
 executorch_target_link_options_shared_lib(executorch)
