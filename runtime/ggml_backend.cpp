@@ -1134,8 +1134,9 @@ static Error build_graph(
 
   (void)n_overrides;
 
-  // GPU binary ops (Metal) require F32 inputs for ADD/SUB/MUL/DIV.
-  const bool has_gpu = handle->backend != handle->backend_cpu;
+  // Metal binary ops require F32 inputs for ADD/SUB/MUL/DIV.
+  // CUDA supports BF16 natively, so only gate on Metal.
+  const bool metal_f32_binops = ggml_backend_is_metal(handle->backend);
 
   // --- Tear down previous context (no-op on first call) ---
   // Preserve the scheduler — it will be reset+realloc'd in execute().
@@ -1747,7 +1748,7 @@ static Error build_graph(
           if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
           if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
 
-          if (has_gpu) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+          if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
 
           if (a->type != b->type) {
             // Prefer casting to f32 if either side is f32.
@@ -1793,7 +1794,7 @@ static Error build_graph(
           if (ggml_nelements(a) < ggml_nelements(b)) {
             std::swap(a, b);
           }
-          if (has_gpu) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+          if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
           if (!resolve_broadcast(a, b, "MUL")) {
             ggml_free(ctx);
             return Error::InvalidArgument;
@@ -1810,7 +1811,7 @@ static Error build_graph(
             gt = eager;
             break;
           }
-          if (has_gpu) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+          if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
           if (!resolve_broadcast(a, b, "DIV")) {
             ggml_free(ctx);
             return Error::InvalidArgument;
@@ -1931,7 +1932,7 @@ static Error build_graph(
               ggml_free(ctx);
               return Error::InvalidArgument;
             }
-            if (has_gpu) b = ensure_f32(ctx, b);
+            if (metal_f32_binops) b = ensure_f32(ctx, b);
             y = ggml_add(ctx, y, b);
           }
           gt = y;
@@ -2910,7 +2911,7 @@ static Error build_graph(
             // Non-constant I64: cast to F32 and use ggml_sub.
             if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
             if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
-            if (has_gpu) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+            if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
             if (!resolve_broadcast(a, b, "SUB")) {
               ggml_free(ctx);
               return Error::InvalidArgument;
@@ -3514,14 +3515,14 @@ static Error build_graph(
 
           if (has_weight && srcs.size() > 1) {
             struct ggml_tensor* w = srcs[1];
-            if (has_gpu) w = ensure_f32(ctx, w);
+            if (metal_f32_binops) w = ensure_f32(ctx, w);
             gt = ggml_mul(ctx, gt, w);
           }
           if (has_bias) {
             int bias_idx = has_weight ? 2 : 1;
             if ((int)srcs.size() > bias_idx) {
               struct ggml_tensor* b = srcs[bias_idx];
-              if (has_gpu) b = ensure_f32(ctx, b);
+              if (metal_f32_binops) b = ensure_f32(ctx, b);
               gt = ggml_add(ctx, gt, b);
             }
           }
@@ -3716,7 +3717,7 @@ static Error build_graph(
               ggml_free(ctx);
               return Error::InvalidArgument;
             }
-            if (has_gpu) bias4 = ensure_f32(ctx, bias4);
+            if (metal_f32_binops) bias4 = ensure_f32(ctx, bias4);
             gt = ggml_add(ctx, gt, bias4);
           }
           break;
