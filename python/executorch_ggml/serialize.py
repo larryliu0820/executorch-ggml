@@ -96,6 +96,7 @@ OP_DIV = 28
 OP_CONV_1D = 80
 OP_CONV_1D_DW = 81
 OP_PAD = 82
+OP_ROPE = 83
 
 # KV cache ops
 OP_UPDATE_CACHE = 74
@@ -558,3 +559,8 @@ def pack_update_cache_params(seq_dim: int = 1) -> bytes:
     For shape [batch, n_heads, seq_len, head_dim], seq_dim=2.
     """
     return struct.pack("<i", int(seq_dim))
+
+
+def pack_rope_params(n_dims: int, mode: int, freq_base: float) -> bytes:
+    """Pack rope parameters: n_dims (int32), mode (int32), freq_base (float32)."""
+    return struct.pack("<iif", int(n_dims), int(mode), float(freq_base))

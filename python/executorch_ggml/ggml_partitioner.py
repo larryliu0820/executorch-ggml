@@ -88,6 +88,8 @@ _SUPPORTED_OP_NAMES = {
     "aten.any.dim",
     # KV cache ops
     "llama.update_cache.default",
+    # Fused RoPE
+    "ggml.rope.default",
     # Additional ops for full model export
     "aten.arange.default",
     "aten.matmul.default",
@@ -319,10 +321,12 @@ class GgmlPartitioner(Partitioner):
         in to_edge_transform_and_lower (avoids the EDGE_DO_NOT_DECOMP path
         which re-decomposes SDPA in a second pass).
         """
-        return (
-            [torch.ops.aten.scaled_dot_product_attention.default],
-            None,
-        )
+        ops = [torch.ops.aten.scaled_dot_product_attention.default]
+        try:
+            ops.append(torch.ops.ggml.rope.default)
+        except AttributeError:
+            pass  # rope_op not imported — skip
+        return (ops, None)
 
     def partition(self, exported_program: ExportedProgram) -> PartitionResult:
         partition_tags: Dict[str, DelegationSpec] = {}

@@ -3782,6 +3782,29 @@ static Error build_graph(
           break;
         }
 
+        case ggml_ir::OpCode::ROPE: {
+          // src_ids: [x, positions]
+          // op_params: int32 n_dims, int32 mode, float32 freq_base
+          int32_t n_dims = 0;
+          int32_t mode = 0;
+          float freq_base = 10000.0f;
+          if (t->op_params() && t->op_params()->size() >= 12) {
+            const uint8_t* data = t->op_params()->data();
+            memcpy(&n_dims, data, sizeof(int32_t));
+            memcpy(&mode, data + 4, sizeof(int32_t));
+            memcpy(&freq_base, data + 8, sizeof(float));
+          }
+
+          struct ggml_tensor* x = ensure_cont(ctx, srcs[0]);
+          struct ggml_tensor* pos = srcs[1];
+          if (pos->type != GGML_TYPE_I32)
+            pos = safe_ggml_cast(ctx, pos, GGML_TYPE_I32);
+
+          gt = ggml_rope_ext(ctx, x, pos, NULL,
+              n_dims, mode, 0, freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+          break;
+        }
+
         default:
           fprintf(stderr, "[executorch-ggml] Unsupported OpCode %d\n", (int) op);
           ggml_free(ctx);

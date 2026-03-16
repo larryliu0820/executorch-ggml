@@ -73,6 +73,7 @@ from executorch_ggml.serialize import (
     OP_GELU,
     OP_RMS_NORM,
     OP_PAD,
+    OP_ROPE,
     # Types
     TYPE_F32,
     TYPE_F16,
@@ -113,6 +114,7 @@ from executorch_ggml.serialize import (
     pack_argmax_params,
     pack_conv1d_params,
     pack_pad_params,
+    pack_rope_params,
     pack_sdpa_params,
     serialize_graph,
 )
@@ -3118,6 +3120,36 @@ class GgmlBackend(BackendDetails):
                             op=OP_UPDATE_CACHE,
                             src_ids=[cache_id, value_id, start_pos_id],
                             op_params=pack_update_cache_params(seq_dim),
+                        )
+                    )
+                    node_to_id[node] = tid
+
+                elif "ggml.rope.default" in target_str:
+                    # ggml.rope(x, positions, n_dims, freq_base) -> Tensor
+                    x_node = node.args[0]
+                    pos_node = node.args[1]
+                    n_dims = int(node.args[2])
+                    freq_base = float(node.args[3])
+
+                    x_id = node_to_id[x_node]
+                    pos_id = node_to_id[pos_node]
+
+                    fake_val = node.meta.get("val")
+                    shape = _resolve_shape(fake_val)
+                    out_dtype = getattr(fake_val, "dtype", torch.float32)
+
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_ROPE,
+                            src_ids=[x_id, pos_id],
+                            op_params=pack_rope_params(n_dims, 0, freq_base),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
                         )
                     )
                     node_to_id[node] = tid
