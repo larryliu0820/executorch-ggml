@@ -86,15 +86,20 @@ def main():
         model_dtype = torch.bfloat16
 
     print(f"Loading model from {args.model_path}...")
-    # Use use_standard_attention=True to get F.scaled_dot_product_attention
-    # which the GGML partitioner can recognize and lower to LLAMA_ATTENTION.
+    # backend="cuda" gives F.scaled_dot_product_attention + StaticKVCache
+    # (index_copy_) which the GGML partitioner can recognize and lower.
     model = load_model(
         args.model_path,
         max_seq_len=args.max_seq_len,
         n_delay_tokens=args.delay_tokens,
         dtype=model_dtype,
-        use_standard_attention=True,
+        backend="cuda",
     )
+
+    # Fuse encoder RoPE into ggml_rope_ext
+    from executorch_ggml.modules.rope import swap_encoder_rope
+    swap_encoder_rope(model, freq_base=model.config.enc_rope_theta)
+    print("  Applied fused RoPE (swap_encoder_rope)")
 
     print(f"\nExporting components (dtype={args.dtype})...")
     if args.streaming:

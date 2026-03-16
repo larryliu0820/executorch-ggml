@@ -19,7 +19,7 @@ from torch.export import export
 import executorch_ggml.rope_op  # noqa: F401 — registers torch.ops.ggml.rope
 from executorch_ggml import GgmlPartitioner
 from executorch_ggml.edge_pipeline import to_edge_rewrite_and_lower
-from executorch_ggml.rope_module import GgmlEncoderAttention, swap_encoder_rope
+from executorch_ggml.modules.rope import GgmlEncoderAttention, swap_encoder_rope
 
 _NATIVE_AVAILABLE = False
 try:

@@ -84,7 +84,12 @@ def compute_mel(waveform: torch.Tensor) -> torch.Tensor:
 
 def run_offline(program, waveform: torch.Tensor, tokenizer, max_new_tokens: int = 512,
                 preprocessor_program=None, model_dtype=torch.bfloat16):
-    """Run offline (non-streaming) inference."""
+    """Run offline (non-streaming) inference.
+
+    Follows the Voxtral Realtime inference protocol: at each position,
+    the decoder input is the element-wise SUM of audio_embeds[pos] and
+    token_embedding(prev_token).  This matches the C++ runner.
+    """
 
     # 1. Preprocessor: waveform -> mel spectrogram
     if preprocessor_program is not None:
@@ -108,51 +113,53 @@ def run_offline(program, waveform: torch.Tensor, tokenizer, max_new_tokens: int 
     mel = mel.to(model_dtype).contiguous()
     audio_embeds = encoder.execute([mel])[0]
     t1 = time.time()
+    T_audio = audio_embeds.shape[1]
     print(f"    audio_embeds shape: {list(audio_embeds.shape)}, took {t1-t0:.2f}s")
 
-    # 3. Prefill: feed audio embeddings through decoder
-    print("  Prefilling decoder...")
-    T_audio = audio_embeds.shape[1]
-    cache_pos = torch.arange(T_audio, dtype=torch.long)
-
+    # 3. Autoregressive decode with audio+token embedding summation.
+    # At each position:
+    #   pos < T_audio: input = audio_embeds[pos] + token_embed(prev_token)
+    #   pos >= T_audio: input = token_embed(prev_token)
+    print("  Decoding (audio+token sum protocol)...")
     decoder = program.load_method("text_decoder")
-    t0 = time.time()
-    logits = decoder.execute([audio_embeds, cache_pos])[0]
-    t1 = time.time()
-    print(f"    prefill logits shape: {list(logits.shape)}, took {t1-t0:.2f}s")
-
-    # 4. Decode loop
-    print("  Decoding tokens...")
     tok_embed_method = program.load_method("token_embedding")
 
-    next_token = logits[:, -1:, :].argmax(dim=-1)  # (1, 1)
-    generated_tokens = [next_token.item()]
-    pos = T_audio
+    bos_id = 1  # Tekken BOS
+    eos_id = 2  # Tekken EOS
+    prev_token = torch.tensor([[bos_id]], dtype=torch.long)
+    max_pos = min(max_new_tokens + T_audio, 4096)
+    generated_tokens = []
 
     t0 = time.time()
-    eos_id = 2  # Mistral EOS token
-    for step in range(max_new_tokens):
-        token_id = next_token.item()
-        if token_id == eos_id:
+    for pos in range(max_pos):
+        # a. Token embedding for previous token
+        tok_embed = tok_embed_method.execute([prev_token])[0]  # (1, 1, dim)
+
+        # b. Sum with audio embedding if in audio range
+        if pos < T_audio:
+            audio_frame = audio_embeds[:, pos:pos+1, :]  # (1, 1, dim)
+            input_embeds = (audio_frame.float() + tok_embed.float()).to(model_dtype)
+        else:
+            input_embeds = tok_embed
+
+        # c. One decoder step
+        cache_pos = torch.tensor([pos], dtype=torch.long)
+        logits = decoder.execute([input_embeds, cache_pos])[0]
+
+        # d. Greedy sample
+        next_token_id = logits[:, -1, :].argmax(dim=-1).item()
+
+        # e. Decode and record
+        if next_token_id == eos_id:
             break
-
-        tok_embed = tok_embed_method.execute([next_token])[0]
-        cache_pos_step = torch.tensor([pos], dtype=torch.long)
-
-        logits = decoder.execute([tok_embed, cache_pos_step])[0]
-        next_token = logits[:, -1:, :].argmax(dim=-1)
-        generated_tokens.append(next_token.item())
-        pos += 1
+        generated_tokens.append(next_token_id)
+        prev_token = torch.tensor([[next_token_id]], dtype=torch.long)
 
     t1 = time.time()
     n_tokens = len(generated_tokens)
-    if n_tokens > 1:
-        tok_per_sec = (n_tokens - 1) / (t1 - t0)
+    if n_tokens > 0:
+        tok_per_sec = n_tokens / (t1 - t0)
         print(f"    Generated {n_tokens} tokens in {t1-t0:.2f}s ({tok_per_sec:.1f} tok/s)")
-
-    # Remove EOS if present
-    if generated_tokens and generated_tokens[-1] == eos_id:
-        generated_tokens = generated_tokens[:-1]
 
     return decode_tokens(tokenizer, generated_tokens)
 

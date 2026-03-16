@@ -48,6 +48,7 @@ GgmlBackendInterface       # C++ runtime: deserializes IR, builds ggml_cgraph,
 | Model | Type | Status | Notes |
 |-------|------|--------|-------|
 | [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | LLM | Full (F32 + Q8_0) | Text generation with KV cache, fused SDPA |
+| [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) | ASR | Full (BF16) | Audio encoder (fused RoPE + RMS norm) + text decoder with KV cache |
 | [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | ASR | Full (F32 + Q8_0) | Speech-to-text, FastConformer encoder + TDT decoder |
 | MobileNetV2 | Vision | Full | Requires `BatchNormFoldingRewritePass` for Conv+BN |
 | Linear + ReLU | MLP | Full | Basic MLP architectures |
@@ -83,7 +84,7 @@ pip install -e .
    pip install -e .
    ```
 
-These methods will install the latest `executorch` nightly version from PyTorch's nightly wheel server (currently 1.2.0.dev20260218).
+These methods will install the latest `executorch` nightly version from PyTorch's nightly wheel server.
 
 ### Python (ahead-of-time compilation)
 
@@ -184,6 +185,35 @@ pip install nemo_toolkit[asr]
 To force CPU-only execution (no Metal GPU):
 ```bash
 GGML_BACKEND_DEVICE=cpu python runner/run_parakeet.py --model parakeet_ggml/model_q8_0.pte --audio test_audio.wav
+```
+
+### Voxtral-Mini-4B-Realtime (Speech Recognition)
+
+**Export:**
+```bash
+python runner/export_voxtral_rt.py \
+  --model-path /path/to/Voxtral-Mini-4B-Realtime-2602 \
+  --dtype BF16
+```
+
+**Get test audio (30s LibriSpeech clip):**
+```bash
+python -c "from datasets import load_dataset; import soundfile as sf; s = load_dataset('distil-whisper/librispeech_long', 'clean', split='validation')[0]['audio']; sf.write('test_audio.wav', s['array'][:s['sampling_rate']*30], s['sampling_rate'])"
+```
+
+**Run:**
+```bash
+DYLD_LIBRARY_PATH=python/executorch_ggml python runner/run_voxtral_rt.py \
+  --model voxtral_ggml/model_bf16.pte \
+  --model-path /path/to/Voxtral-Mini-4B-Realtime-2602 \
+  --audio test_audio.wav
+```
+
+The encoder uses fused RoPE (`ggml_rope_ext`) and native RMS norm for the 32-layer causal whisper encoder. The decoder follows the Voxtral Realtime inference protocol: at each position, the input is the element-wise sum of `audio_embeds[pos]` and `token_embedding(prev_token)`.
+
+Requires `mistral-common` for the tokenizer:
+```bash
+pip install mistral-common
 ```
 
 ### C++ (runtime)
