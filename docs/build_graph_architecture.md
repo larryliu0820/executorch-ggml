@@ -146,7 +146,40 @@ graph_cache = {
 }
 ```
 
-Each `GraphInstance` has its own scheduler, so gallocr buffer pools are correctly sized for that shape. Switching shapes (prefill → decode) doesn't thrash or reallocate the other shape's buffers.
+**The cache does NOT avoid `build_graph()`** — that's called every `execute()` regardless. What the cache preserves is the **scheduler and its gallocr buffer pools**.
+
+### What the cache actually saves
+
+Each `ggml_backend_sched` owns a gallocr that manages GPU memory for intermediate tensors (activations, scratch space). On first use, `sched_alloc_graph()` allocates these buffers from the Metal backend. On subsequent calls for the same shape, `sched_reset()` + `sched_alloc_graph()` reuses the existing buffers — no GPU memory allocation.
+
+Without the cache, every shape transition would cause gallocr buffer churn:
+
+```
+execute(prefill T=4)  → allocate GPU buffers for T=4 activations
+execute(decode  T=1)  → FREE T=4 buffers, allocate new T=1 buffers
+execute(decode  T=1)  → FREE T=1 buffers, allocate new T=1 buffers  (same shape!)
+execute(prefill T=8)  → FREE T=1 buffers, allocate new T=8 buffers
+```
+
+With the cache, each shape keeps its own scheduler with pre-allocated buffers:
+
+```
+execute(prefill T=4)  → cache miss: build sched, alloc GPU buffers (first time)
+execute(decode  T=1)  → cache miss: build sched, alloc GPU buffers (first time)
+execute(decode  T=1)  → cache HIT:  sched_reset + reuse buffers   (free)
+execute(prefill T=8)  → cache miss: build sched, alloc GPU buffers (new shape)
+execute(prefill T=4)  → cache HIT:  sched_reset + reuse buffers   (free)
+```
+
+For a 26-layer decoder, the gallocr pool holds hundreds of MB of activation memory. Avoiding reallocation on every decode step is significant — GPU buffer allocation involves kernel calls and memory mapping that can take milliseconds, vs the ~0.001ms cost of `sched_reset()` on an existing pool.
+
+### Why per-shape schedulers?
+
+A single shared scheduler would also avoid reallocation for same-shape calls, but it causes a subtler problem: gallocr's internal buffer **splits** encode the graph's tensor lifetime analysis. Different shapes produce different lifetime patterns, so gallocr's split boundaries from shape A would be wrong for shape B, leading to either:
+- Incorrect memory reuse (data corruption), or
+- Conservative fallback to full reallocation anyway
+
+Per-shape schedulers avoid this entirely — each shape's gallocr has splits tuned to its own graph.
 
 ## Why Rebuild Every Call?
 
