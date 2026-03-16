@@ -20,13 +20,16 @@ BF16_UNSAFE_OP_NAMES = {
     "aten.native_layer_norm.default",
     "aten._softmax.default",
     "aten.constant_pad_nd.default",
+    "aten.pad.default",
     "aten.convolution.default",
+    "aten.conv1d.default",
 }
 
 # Positional indices of tensor arguments that need casting for each op.
 # Ops not listed here: only args[0] (the main input) is cast.
 _TENSOR_ARG_INDICES_BY_NAME = {
     "aten.convolution.default": [0, 1],
+    "aten.conv1d.default": [0, 1],
     "aten.native_layer_norm.default": [0, 1, 2],
 }
 

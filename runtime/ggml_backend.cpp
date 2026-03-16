@@ -942,6 +942,14 @@ static inline struct ggml_tensor* ensure_cont(struct ggml_context* ctx, struct g
   return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
 }
 
+// Cast BF16/F16 to F32 for Metal compatibility. No-op if already F32 or integer.
+// Only needed when GPU backend is active (Metal binary ops require F32).
+static inline struct ggml_tensor* ensure_f32(struct ggml_context* ctx, struct ggml_tensor* t) {
+  if (t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_F16)
+    return safe_ggml_cast(ctx, t, GGML_TYPE_F32);
+  return t;
+}
+
 struct GgmlDelegateHandle {
   // Primary backend (GPU when available, otherwise CPU)
   ggml_backend_t backend = nullptr;
@@ -1125,6 +1133,9 @@ static Error build_graph(
     bool verbose = true) {
 
   (void)n_overrides;
+
+  // GPU binary ops (Metal) require F32 inputs for ADD/SUB/MUL/DIV.
+  const bool has_gpu = handle->backend != handle->backend_cpu;
 
   // --- Tear down previous context (no-op on first call) ---
   // Preserve the scheduler — it will be reset+realloc'd in execute().
@@ -1736,6 +1747,8 @@ static Error build_graph(
           if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
           if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
 
+          if (has_gpu) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+
           if (a->type != b->type) {
             // Prefer casting to f32 if either side is f32.
             ggml_type tgt = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32)
@@ -1780,6 +1793,7 @@ static Error build_graph(
           if (ggml_nelements(a) < ggml_nelements(b)) {
             std::swap(a, b);
           }
+          if (has_gpu) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
           if (!resolve_broadcast(a, b, "MUL")) {
             ggml_free(ctx);
             return Error::InvalidArgument;
@@ -1796,6 +1810,7 @@ static Error build_graph(
             gt = eager;
             break;
           }
+          if (has_gpu) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
           if (!resolve_broadcast(a, b, "DIV")) {
             ggml_free(ctx);
             return Error::InvalidArgument;
@@ -1916,6 +1931,7 @@ static Error build_graph(
               ggml_free(ctx);
               return Error::InvalidArgument;
             }
+            if (has_gpu) b = ensure_f32(ctx, b);
             y = ggml_add(ctx, y, b);
           }
           gt = y;
@@ -2894,6 +2910,7 @@ static Error build_graph(
             // Non-constant I64: cast to F32 and use ggml_sub.
             if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
             if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
+            if (has_gpu) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
             if (!resolve_broadcast(a, b, "SUB")) {
               ggml_free(ctx);
               return Error::InvalidArgument;
@@ -3497,12 +3514,14 @@ static Error build_graph(
 
           if (has_weight && srcs.size() > 1) {
             struct ggml_tensor* w = srcs[1];
+            if (has_gpu) w = ensure_f32(ctx, w);
             gt = ggml_mul(ctx, gt, w);
           }
           if (has_bias) {
             int bias_idx = has_weight ? 2 : 1;
             if ((int)srcs.size() > bias_idx) {
               struct ggml_tensor* b = srcs[bias_idx];
+              if (has_gpu) b = ensure_f32(ctx, b);
               gt = ggml_add(ctx, gt, b);
             }
           }
@@ -3697,9 +3716,7 @@ static Error build_graph(
               ggml_free(ctx);
               return Error::InvalidArgument;
             }
-            if (bias4->type == GGML_TYPE_F16) {
-              bias4 = safe_ggml_cast(ctx, bias4, GGML_TYPE_F32);
-            }
+            if (has_gpu) bias4 = ensure_f32(ctx, bias4);
             gt = ggml_add(ctx, gt, bias4);
           }
           break;
