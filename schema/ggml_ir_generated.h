@@ -79,6 +79,7 @@ enum class OpCode : int32_t {
   ANY = 73,
   UPDATE_CACHE = 74,
   GELU = 75,
+  RMS_NORM = 76,
   CONV_1D = 80,
   CONV_1D_DW = 81,
   PAD = 82,
@@ -86,7 +87,7 @@ enum class OpCode : int32_t {
   MAX = PAD
 };
 
-inline const OpCode (&EnumValuesOpCode())[60] {
+inline const OpCode (&EnumValuesOpCode())[61] {
   static const OpCode values[] = {
     OpCode::NONE,
     OpCode::ADD,
@@ -145,6 +146,7 @@ inline const OpCode (&EnumValuesOpCode())[60] {
     OpCode::ANY,
     OpCode::UPDATE_CACHE,
     OpCode::GELU,
+    OpCode::RMS_NORM,
     OpCode::CONV_1D,
     OpCode::CONV_1D_DW,
     OpCode::PAD
@@ -230,7 +232,7 @@ inline const char * const *EnumNamesOpCode() {
     "ANY",
     "UPDATE_CACHE",
     "GELU",
-    "",
+    "RMS_NORM",
     "",
     "",
     "",

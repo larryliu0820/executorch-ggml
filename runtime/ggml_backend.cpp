@@ -3532,6 +3532,27 @@ static Error build_graph(
           break;
         }
 
+        case ggml_ir::OpCode::RMS_NORM: {
+          // src_ids: [x, weight?]
+          // op_params: float32 eps, int32 has_weight
+          float eps = 1e-5f;
+          int32_t has_weight = 0;
+          if (t->op_params() && t->op_params()->size() >= 8) {
+            const uint8_t* data = t->op_params()->data();
+            memcpy(&eps, data, sizeof(float));
+            memcpy(&has_weight, data + 4, sizeof(int32_t));
+          }
+
+          gt = ggml_rms_norm(ctx, ensure_cont(ctx, srcs[0]), eps);
+
+          if (has_weight && srcs.size() > 1) {
+            struct ggml_tensor* w = srcs[1];
+            if (metal_f32_binops) w = ensure_f32(ctx, w);
+            gt = ggml_mul(ctx, gt, w);
+          }
+          break;
+        }
+
         case ggml_ir::OpCode::BATCH_NORM: {
           // src_ids: [x, weight, bias, mean, var]
           // op_params: float32 eps
@@ -3720,7 +3741,11 @@ static Error build_graph(
               ggml_free(ctx);
               return Error::InvalidArgument;
             }
-            if (metal_f32_binops) bias4 = ensure_f32(ctx, bias4);
+            // F16 bias needs F32 cast on all backends; BF16 only on Metal.
+            if (bias4->type == GGML_TYPE_F16 ||
+                (metal_f32_binops && bias4->type == GGML_TYPE_BF16)) {
+              bias4 = safe_ggml_cast(ctx, bias4, GGML_TYPE_F32);
+            }
             gt = ggml_add(ctx, gt, bias4);
           }
           break;

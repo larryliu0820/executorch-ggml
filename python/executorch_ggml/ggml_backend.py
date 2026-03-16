@@ -71,6 +71,7 @@ from executorch_ggml.serialize import (
     OP_ARGMAX,
     OP_DIV,
     OP_GELU,
+    OP_RMS_NORM,
     OP_PAD,
     # Types
     TYPE_F32,
@@ -107,6 +108,7 @@ from executorch_ggml.serialize import (
     pack_any_params,
     pack_update_cache_params,
     pack_layer_norm_params,
+    pack_rms_norm_params,
     pack_batch_norm_params,
     pack_argmax_params,
     pack_conv1d_params,
@@ -3230,6 +3232,40 @@ class GgmlBackend(BackendDetails):
                         )
                     )
                     # Store as single int — getitem(0) will resolve to this
+                    node_to_id[node] = tid
+
+                elif "aten.rms_norm.default" in target_str:
+                    # rms_norm(input, normalized_shape, weight, eps)
+                    input_node = node.args[0]
+                    # normalized_shape = node.args[1]  # not needed for IR
+                    weight_node = node.args[2] if len(node.args) > 2 else None
+                    eps = float(node.args[3]) if len(node.args) > 3 and node.args[3] is not None else 1e-5
+
+                    input_id = node_to_id[input_node]
+                    has_weight = weight_node is not None and not isinstance(weight_node, type(None))
+
+                    src_ids = [input_id]
+                    if has_weight:
+                        src_ids.append(node_to_id[weight_node])
+
+                    fake_val = node.meta.get("val")
+                    shape = _resolve_shape(fake_val)
+                    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+
+                    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, sym_id_map)
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_RMS_NORM,
+                            src_ids=src_ids,
+                            op_params=pack_rms_norm_params(eps, has_weight),
+                            sym_dim_ids=_vsym,
+                            sym_dim_exprs=_vexprs,
+                        )
+                    )
                     node_to_id[node] = tid
 
                 elif "aten._native_batch_norm_legit_no_training.default" in target_str:

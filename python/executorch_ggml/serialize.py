@@ -100,6 +100,7 @@ OP_PAD = 82
 # KV cache ops
 OP_UPDATE_CACHE = 74
 OP_GELU = 75
+OP_RMS_NORM = 76
 
 # Fused attention (llama.cpp/ggml)
 OP_LLAMA_ATTENTION = 60
@@ -497,6 +498,11 @@ def pack_any_params(dim: int, ndim: int) -> bytes:
 def pack_layer_norm_params(eps: float, has_weight: bool, has_bias: bool) -> bytes:
     """Pack layer_norm parameters: eps (float32), has_weight (int32), has_bias (int32)."""
     return struct.pack("<fii", float(eps), int(has_weight), int(has_bias))
+
+
+def pack_rms_norm_params(eps: float, has_weight: bool) -> bytes:
+    """Pack rms_norm parameters: eps (float32), has_weight (int32)."""
+    return struct.pack("<fi", float(eps), int(has_weight))
 
 
 def pack_batch_norm_params(eps: float) -> bytes:

@@ -114,6 +114,7 @@ _SUPPORTED_OP_NAMES = {
     "aten.tanh.default",
     "aten.gelu.default",
     "aten.native_layer_norm.default",
+    "aten.rms_norm.default",
     "aten._native_batch_norm_legit_no_training.default",
     "aten.argmax.default",
     "aten.split_with_sizes_copy.default",
