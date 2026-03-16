@@ -1749,9 +1749,9 @@ static Error build_graph(
           if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
 
           if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+          a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
 
           if (a->type != b->type) {
-            // Prefer casting to f32 if either side is f32.
             ggml_type tgt = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32)
                                 ? GGML_TYPE_F32
                                 : a->type;
@@ -1795,6 +1795,7 @@ static Error build_graph(
             std::swap(a, b);
           }
           if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+          a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
           if (!resolve_broadcast(a, b, "MUL")) {
             ggml_free(ctx);
             return Error::InvalidArgument;
@@ -1812,6 +1813,7 @@ static Error build_graph(
             break;
           }
           if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+          a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
           if (!resolve_broadcast(a, b, "DIV")) {
             ggml_free(ctx);
             return Error::InvalidArgument;
@@ -2912,6 +2914,7 @@ static Error build_graph(
             if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32);
             if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32);
             if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+            a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
             if (!resolve_broadcast(a, b, "SUB")) {
               ggml_free(ctx);
               return Error::InvalidArgument;
@@ -2941,9 +2944,9 @@ static Error build_graph(
             memcpy(&exponent, t->op_params()->data(), sizeof(float));
           }
           if (exponent == 2.0f) {
-            gt = ggml_sqr(ctx, srcs[0]);
+            gt = ggml_sqr(ctx, ensure_cont(ctx, srcs[0]));
           } else if (exponent == 0.5f) {
-            gt = ggml_sqrt(ctx, srcs[0]);
+            gt = ggml_sqrt(ctx, ensure_cont(ctx, srcs[0]));
           } else {
             // General power: x^n = exp(n * log(x))
             // This won't work for negative x, but for RMSNorm (x^2) we use sqr above.
