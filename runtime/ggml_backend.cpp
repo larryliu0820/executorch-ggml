@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <deque>
 #include <limits>
 #include <string>
 #include <thread>
@@ -469,21 +470,12 @@ void ggml_custom_logical_not(
 // userdata = Conv1dDwParams* with stride, pad, dilation.
 struct Conv1dDwParams { int stride, pad, dilation; };
 
-void ggml_custom_conv_1d_dw_f32(
-    struct ggml_tensor* dst, int ith, int nth, void* userdata) {
-  const auto* p = static_cast<const Conv1dDwParams*>(userdata);
-  const struct ggml_tensor* weight = dst->src[0];
-  const struct ggml_tensor* input  = dst->src[1];
-  if (!weight || !input || !weight->data || !input->data || !dst->data) return;
-
-  const int64_t K     = weight->ne[0];
-  const int64_t C     = weight->ne[2];
-  const int64_t L_in  = input->ne[0];
-  const int64_t B     = input->ne[2];
-  const int64_t L_out = dst->ne[0];
-  const int s = p->stride, pad = p->pad, d = p->dilation;
-
-  // Parallelise over (batch, channel) pairs.
+static void conv_1d_dw_kernel(
+    const float* w_data, const float* x_data, float* y_data,
+    int64_t K, int64_t C, int64_t L_in, int64_t B, int64_t L_out,
+    const size_t* w_nb, const size_t* x_nb, const size_t* y_nb,
+    int s, int pad, int d,
+    int ith, int nth) {
   const int64_t total = B * C;
   const int64_t work  = (total + nth - 1) / nth;
   const int64_t i0 = work * ith, i1 = std::min<int64_t>(i0 + work, total);
@@ -491,10 +483,9 @@ void ggml_custom_conv_1d_dw_f32(
   for (int64_t bc = i0; bc < i1; ++bc) {
     const int64_t c = bc % C;
     const int64_t b = bc / C;
-    const float* w = (const float*)((const char*)weight->data + c * weight->nb[2]);
-    const float* x = (const float*)((const char*)input->data
-                     + c * input->nb[1] + b * input->nb[2]);
-    float* y = (float*)((char*)dst->data + c * dst->nb[1] + b * dst->nb[2]);
+    const float* w = (const float*)((const char*)w_data + c * w_nb[2]);
+    const float* x = (const float*)((const char*)x_data + c * x_nb[1] + b * x_nb[2]);
+    float* y = (float*)((char*)y_data + c * y_nb[1] + b * y_nb[2]);
     for (int64_t o = 0; o < L_out; ++o) {
       float sum = 0.0f;
       for (int64_t k = 0; k < K; ++k) {
@@ -505,6 +496,60 @@ void ggml_custom_conv_1d_dw_f32(
       }
       y[o] = sum;
     }
+  }
+}
+
+void ggml_custom_conv_1d_dw_f32(
+    struct ggml_tensor* dst, int ith, int nth, void* userdata) {
+  const auto* p = static_cast<const Conv1dDwParams*>(userdata);
+  const struct ggml_tensor* weight = dst->src[0];
+  const struct ggml_tensor* input  = dst->src[1];
+  if (!weight || !input) return;
+
+  const int64_t K     = weight->ne[0];
+  const int64_t C     = weight->ne[2];
+  const int64_t L_in  = input->ne[0];
+  const int64_t B     = input->ne[2];
+  const int64_t L_out = dst->ne[0];
+
+  // Check if tensors are on host memory
+  bool w_host = !weight->buffer || ggml_backend_buffer_is_host(weight->buffer);
+  bool x_host = !input->buffer  || ggml_backend_buffer_is_host(input->buffer);
+  bool y_host = !dst->buffer    || ggml_backend_buffer_is_host(dst->buffer);
+
+  if (w_host && x_host && y_host) {
+    // Host path: scheduler provided host buffers for the custom op.
+    if (!weight->data || !input->data || !dst->data) return;
+    conv_1d_dw_kernel(
+        (const float*)weight->data, (const float*)input->data, (float*)dst->data,
+        K, C, L_in, B, L_out,
+        weight->nb, input->nb, dst->nb,
+        p->stride, p->pad, p->dilation, ith, nth);
+  } else if (ith == 0) {
+    // Device path: copy data to host, compute, copy back (single-threaded)
+    fprintf(stderr, "[conv_dw] device path: w_host=%d x_host=%d y_host=%d\n",
+            w_host, x_host, y_host);
+    std::vector<float> w_buf(ggml_nelements(weight));
+    std::vector<float> x_buf(ggml_nelements(input));
+    std::vector<float> y_buf(ggml_nelements(dst), 0.0f);
+    ggml_backend_tensor_get(weight, w_buf.data(), 0, ggml_nbytes(weight));
+    ggml_backend_tensor_get(input, x_buf.data(), 0, ggml_nbytes(input));
+
+    // Compute strides for contiguous layout
+    size_t w_nb[4] = {sizeof(float), (size_t)(K*sizeof(float)),
+                       (size_t)(K*1*sizeof(float)), (size_t)(K*1*C*sizeof(float))};
+    size_t x_nb[4] = {sizeof(float), (size_t)(L_in*sizeof(float)),
+                       (size_t)(L_in*C*sizeof(float)), (size_t)(L_in*C*B*sizeof(float))};
+    size_t y_nb[4] = {sizeof(float), (size_t)(L_out*sizeof(float)),
+                       (size_t)(L_out*C*sizeof(float)), (size_t)(L_out*C*B*sizeof(float))};
+
+    conv_1d_dw_kernel(
+        w_buf.data(), x_buf.data(), y_buf.data(),
+        K, C, L_in, B, L_out,
+        w_nb, x_nb, y_nb,
+        p->stride, p->pad, p->dilation, 0, 1);
+
+    ggml_backend_tensor_set(dst, y_buf.data(), 0, ggml_nbytes(dst));
   }
 }
 
@@ -770,10 +815,11 @@ public:
     if (!t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
       return t->data;
     }
+    // Each call gets its own staging buffer so multiple pointers remain valid.
     size_t nb = ggml_nbytes(t);
-    staging_.resize(nb);
-    ggml_backend_tensor_get(t, staging_.data(), 0, nb);
-    return staging_.data();
+    staging_.emplace_back(nb);
+    ggml_backend_tensor_get(t, staging_.back().data(), 0, nb);
+    return staging_.back().data();
   }
 
   float read_f32(const struct ggml_tensor* t) {
@@ -790,7 +836,7 @@ public:
   }
 
 private:
-  std::vector<uint8_t> staging_;
+  std::deque<std::vector<uint8_t>> staging_;
 };
 
 // Eager integer casts on the CPU context.  ggml's CPU backend doesn't support
@@ -858,7 +904,12 @@ struct ggml_tensor* safe_ggml_cast(
   // F32/F16/BF16 → I64: go through I32 first, then eager I32→I64
   if (target == GGML_TYPE_I64) {
     auto* i32 = safe_ggml_cast(ctx, src, GGML_TYPE_I32, acc);
-    return eager_cast_i32_to_i64(ctx, i32, acc);
+    if (i32->data) {
+      return eager_cast_i32_to_i64(ctx, i32, acc);
+    }
+    // I32 is a graph node (no data yet) — return I32 since ggml can't do
+    // I32→I64 as a graph op.  The output copy in execute() handles I32→Long.
+    return i32;
   }
   // Eager scalar cast for I32→F32 (enc_len computation chains).
   if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_F32 &&
@@ -923,6 +974,8 @@ struct GraphInstance {
   std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>> deferred_i64_to_i32;
   std::vector<EagerConstant> eager_constants;
   std::vector<SharedLeaf> shared_leaves;  // leaf tensors in const_buf / mutable_buf
+  std::vector<struct ggml_tensor*> cpu_pinned;  // tensors pinned to CPU backend
+  ggml_backend_buffer_t eager_const_buf = nullptr;  // separate buffer for eager constants
 };
 
 // ---------------------------------------------------------------------------
@@ -978,6 +1031,79 @@ static void print_profile(const ProfileContext& ctx) {
             (double)p.total_us / p.count, pct);
   }
   fprintf(stderr, "\n");
+}
+
+// ---------------------------------------------------------------------------
+// Debug tensor dump (enabled by GGML_DEBUG_DUMP=<path> environment variable)
+// ---------------------------------------------------------------------------
+// Writes per-node stats (mean, std, min, max) to a file after each node
+// executes. Compare two files (CPU vs CUDA) to find divergence point.
+
+struct DebugDumpContext {
+  FILE* fp = nullptr;
+  int node_idx = 0;
+};
+
+static bool debug_dump_eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
+  if (ask) return true;
+  auto* ctx = static_cast<DebugDumpContext*>(user_data);
+  if (!ctx->fp) return true;
+
+  const size_t nelem = ggml_nelements(t);
+  if (nelem == 0 || t->type == GGML_TYPE_I32 || t->type == GGML_TYPE_I64) {
+    fprintf(ctx->fp, "node %4d  op=%-20s  type=%-6s  ne=[%lld,%lld,%lld,%lld]  (non-float)\n",
+            ctx->node_idx++, ggml_op_name(t->op), ggml_type_name(t->type),
+            (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+    return true;
+  }
+  // Read data to host
+  std::vector<float> buf(nelem);
+  if (t->type == GGML_TYPE_F32) {
+    ggml_backend_tensor_get(t, buf.data(), 0, nelem * sizeof(float));
+  } else if (t->type == GGML_TYPE_F16) {
+    std::vector<ggml_fp16_t> tmp(nelem);
+    ggml_backend_tensor_get(t, tmp.data(), 0, nelem * sizeof(ggml_fp16_t));
+    ggml_fp16_to_fp32_row(tmp.data(), buf.data(), (int64_t)nelem);
+  } else if (t->type == GGML_TYPE_BF16) {
+    std::vector<ggml_bf16_t> tmp(nelem);
+    ggml_backend_tensor_get(t, tmp.data(), 0, nelem * sizeof(ggml_bf16_t));
+    for (size_t i = 0; i < nelem; i++) buf[i] = ggml_bf16_to_fp32(tmp[i]);
+  } else {
+    fprintf(ctx->fp, "node %4d  op=%-20s  type=%-6s  (unsupported type)\n",
+            ctx->node_idx++, ggml_op_name(t->op), ggml_type_name(t->type));
+    return true;
+  }
+
+  double sum = 0, sum2 = 0;
+  float mn = buf[0], mx = buf[0];
+  for (size_t i = 0; i < nelem; i++) {
+    float v = buf[i];
+    sum += v; sum2 += (double)v * v;
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+  double mean = sum / nelem;
+  double var = sum2 / nelem - mean * mean;
+  double std = var > 0 ? std::sqrt(var) : 0;
+
+  fprintf(ctx->fp, "node %4d  op=%-20s  type=%-6s  ne=[%lld,%lld,%lld,%lld]  mean=%.6f  std=%.6f  min=%.6f  max=%.6f",
+          ctx->node_idx, ggml_op_name(t->op), ggml_type_name(t->type),
+          (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+          mean, std, (double)mn, (double)mx);
+  // For MUL, dump src info
+  if (t->op == GGML_OP_MUL && ctx->node_idx > 0) {
+    for (int si = 0; si < 2; si++) {
+      if (t->src[si]) {
+        fprintf(ctx->fp, "  src%d=[op=%s type=%s ne=%lldx%lld buf=%p data=%p]",
+                si, ggml_op_name(t->src[si]->op), ggml_type_name(t->src[si]->type),
+                (long long)t->src[si]->ne[0], (long long)t->src[si]->ne[1],
+                (void*)t->src[si]->buffer, t->src[si]->data);
+      }
+    }
+  }
+  fprintf(ctx->fp, "\n");
+  ctx->node_idx++;
+  return true;
 }
 
 // Ensure tensor is contiguous. No-op if already contiguous.
@@ -1180,7 +1306,11 @@ static Error build_graph(
 
   // Metal binary ops require F32 inputs for ADD/SUB/MUL/DIV.
   // CUDA supports BF16 natively, so only gate on Metal.
+#ifdef GGML_USE_METAL
   const bool metal_f32_binops = ggml_backend_is_metal(handle->backend);
+#else
+  const bool metal_f32_binops = false;
+#endif
 
   // --- Tear down previous context (no-op on first call) ---
   // Preserve the scheduler — it will be reset+realloc'd in execute().
@@ -1339,6 +1469,8 @@ static Error build_graph(
   std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>> deferred_i64_to_i32;
   // Leaf tensors placed in shared buffers (const_buf / mutable_buf).
   std::vector<SharedLeaf> shared_leaves;
+  // Tensors pinned to CPU (for custom ops on GPU backends).
+  std::vector<struct ggml_tensor*> cpu_pinned;
   // sym_dim_values already built above (Phase A, before ggml_init).
 
   // --- Shape resolution helper (shared by leaf and op passes) ---
@@ -1396,15 +1528,11 @@ static Error build_graph(
   static int s_n_tensors = 0;
   s_last_processed = -1;
   s_n_tensors = n_tensors;
-  // Decide whether comparison/bitwise/logical ops use native ggml decomposition
-  // (F32, stays on device) or custom CPU callbacks (I32, fewer graph nodes).
-  // Discrete GPUs (CUDA/Vulkan) have expensive PCIe copies at graph splits,
-  // so prefer native.  CPU-only and Metal (unified memory) prefer custom ops.
-  bool use_native_cmp_ops = false;
-  if (handle->backend != handle->backend_cpu) {
-    const char* name = ggml_backend_name(handle->backend);
-    use_native_cmp_ops = (strstr(name, "CUDA") || strstr(name, "Vulkan"));
-  }
+  // Always use native ggml decomposition for comparison/bitwise/logical ops.
+  // The custom CPU callbacks read values as int32_t, which gives wrong results
+  // when inputs are F32 (reinterprets float bit patterns as integers).
+  // Native decompositions cast inputs to F32 first, avoiding this bug.
+  bool use_native_cmp_ops = true;
   const char* cmp_env = std::getenv("GGML_NATIVE_CMP_OPS");
   if (cmp_env) use_native_cmp_ops = (std::string(cmp_env) != "0");
   // Host-side accessor for reading tensor data that may live on a device buffer.
@@ -1505,6 +1633,7 @@ static Error build_graph(
     auto pin_to_cpu = [&](struct ggml_tensor* x) {
       if (x && gi->sched && handle->backend_cpu) {
         ggml_backend_sched_set_tensor_backend(gi->sched, x, handle->backend_cpu);
+        cpu_pinned.push_back(x);
       }
     };
 
@@ -3760,15 +3889,20 @@ static Error build_graph(
             gt = ggml_cont(ctx, ggml_transpose(ctx, mm));
             // gt: [L, C_out, B, 1]
           } else if (op == ggml_ir::OpCode::CONV_1D_DW || groups > 1) {
-            // Use custom F32 depthwise conv to avoid ggml's im2col F16 path.
-            // weight ggml shape: [K, 1, C, 1], input ggml shape: [L, C, B, 1]
-            int64_t L_out = (input->ne[0] + 2 * pad - dilation * (weight->ne[0] - 1) - 1) / stride + 1;
-            auto* params = new Conv1dDwParams{stride, pad, dilation};
-            struct ggml_tensor* args[2] = {weight, input};
-            gt = ggml_custom_4d(ctx, GGML_TYPE_F32,
-                L_out, weight->ne[2], input->ne[2], 1,
-                args, 2, ggml_custom_conv_1d_dw_f32, GGML_N_TASKS_MAX, params);
-            pin_to_cpu(gt);
+            // Reshape 1D → 2D (H=1) and use native ggml_conv_2d_dw_direct
+            // which has CUDA/CPU/Vulkan support, avoiding custom op graph splits.
+            // weight: [K, 1, C, 1] → [K, 1, 1, C]
+            // input:  [L, C, B, 1] → [L, 1, C, B]
+            struct ggml_tensor* w2d = ggml_reshape_4d(ctx, weight,
+                weight->ne[0], 1, 1, weight->ne[2]);
+            struct ggml_tensor* inp2d = ggml_reshape_4d(ctx,
+                ensure_cont(ctx, input),
+                input->ne[0], 1, input->ne[1], input->ne[2]);
+            struct ggml_tensor* conv_out = ggml_conv_2d_dw_direct(ctx,
+                w2d, inp2d, stride, 1, pad, 0, dilation, 1);
+            // output: [L_out, 1, C, B] → [L_out, C, B, 1]
+            gt = ggml_reshape_4d(ctx, conv_out,
+                conv_out->ne[0], conv_out->ne[2], conv_out->ne[3], 1);
           } else {
             gt = ggml_conv_1d(ctx, weight, input, stride, pad, dilation);
           }
@@ -3981,6 +4115,7 @@ static Error build_graph(
   gi->deferred_i64_to_i32 = std::move(deferred_i64_to_i32);
   gi->eager_constants = std::move(eager_constants);
   gi->shared_leaves = std::move(shared_leaves);
+  gi->cpu_pinned = std::move(cpu_pinned);
 
   return Error::Ok;
 }
@@ -4063,6 +4198,10 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
   // gallocr / split state between graph instances of different shapes.
   auto cleanup_backends = [&]() {
     for (auto& [k, gi] : handle->graph_cache) {
+      if (gi && gi->eager_const_buf) {
+        ggml_backend_buffer_free(gi->eager_const_buf);
+        gi->eager_const_buf = nullptr;
+      }
       if (gi && gi->sched) {
         ggml_backend_sched_free(gi->sched);
         gi->sched = nullptr;
@@ -4442,16 +4581,53 @@ Error GgmlBackendInterface::execute(
   }
 
   ggml_backend_sched_reset(active->sched);
-  if (!ggml_backend_sched_alloc_graph(active->sched, active->graph)) {
-    fprintf(stderr, "[ggml_backend] ERROR: scheduler alloc failed\n");
-    return Error::MemoryAllocationFailed;
+
+  // Re-apply CPU pin assignments for custom ops (reset clears them).
+  for (auto* t : active->cpu_pinned) {
+    if (handle->backend_cpu && handle->backend_cpu != handle->backend) {
+      ggml_backend_sched_set_tensor_backend(active->sched, t, handle->backend_cpu);
+    }
   }
-  // Restore shared-buffer leaf tensors (const_buf / mutable_buf).
+
+  // Restore shared-buffer leaf tensors (const_buf / mutable_buf) BEFORE
+  // sched_alloc so the scheduler sees them as pre-allocated and skips them.
   for (auto& sl : active->shared_leaves) {
     sl.tensor->data = static_cast<char*>(ggml_backend_buffer_get_base(sl.buf)) + sl.offset;
     sl.tensor->buffer = sl.buf;
   }
-  // Restore eager constants (saved during build_graph before the clear).
+
+  // Restore eager constants into a dedicated buffer BEFORE sched_alloc.
+  // The scheduler's gallocr may alias eager constant memory with intermediate
+  // tensors if they're in the scheduler's pool. By assigning them to a
+  // separate buffer with data/buffer already set, the scheduler treats them
+  // like shared leaves and won't overlap them.
+  if (!active->eager_constants.empty()) {
+    const size_t alignment = 64;
+    size_t total = 0;
+    for (auto& ec : active->eager_constants) {
+      total += ((ec.data.size() + alignment - 1) / alignment) * alignment;
+    }
+    if (!active->eager_const_buf) {
+      active->eager_const_buf = ggml_backend_alloc_buffer(handle->backend, total);
+    }
+    if (active->eager_const_buf) {
+      char* base = static_cast<char*>(ggml_backend_buffer_get_base(active->eager_const_buf));
+      size_t offset = 0;
+      for (auto& ec : active->eager_constants) {
+        size_t nbytes = ec.data.size();
+        ec.tensor->data = base + offset;
+        ec.tensor->buffer = active->eager_const_buf;
+        offset += ((nbytes + alignment - 1) / alignment) * alignment;
+      }
+    }
+  }
+
+  if (!ggml_backend_sched_alloc_graph(active->sched, active->graph)) {
+    fprintf(stderr, "[ggml_backend] ERROR: scheduler alloc failed\n");
+    return Error::MemoryAllocationFailed;
+  }
+
+  // Copy eager constant data after sched_alloc (buffer is already assigned).
   for (auto& ec : active->eager_constants) {
     if (ec.tensor->buffer) {
       ggml_backend_tensor_set(ec.tensor, ec.data.data(), 0, ec.data.size());
@@ -4532,8 +4708,26 @@ Error GgmlBackendInterface::execute(
     ggml_backend_sched_set_eval_callback(active->sched, profile_eval_callback, &prof_ctx);
   }
 
+  // Debug tensor dump (GGML_DEBUG_DUMP=<path>)
+  DebugDumpContext debug_ctx;
+  {
+    const char* dump_path = std::getenv("GGML_DEBUG_DUMP");
+    if (dump_path && std::strlen(dump_path) > 0) {
+      debug_ctx.fp = fopen(dump_path, "w");
+      if (debug_ctx.fp) {
+        fprintf(debug_ctx.fp, "# nodes=%d\n", ggml_graph_n_nodes(active->graph));
+        ggml_backend_sched_set_eval_callback(active->sched, debug_dump_eval_callback, &debug_ctx);
+      }
+    }
+  }
+
   enum ggml_status status = ggml_backend_sched_graph_compute(active->sched, active->graph);
 
+  if (debug_ctx.fp) {
+    fclose(debug_ctx.fp);
+    debug_ctx.fp = nullptr;
+    ggml_backend_sched_set_eval_callback(active->sched, nullptr, nullptr);
+  }
   if (profile_mode) {
     ggml_backend_sched_set_eval_callback(active->sched, nullptr, nullptr);
     print_profile(prof_ctx);
@@ -4598,6 +4792,17 @@ Error GgmlBackendInterface::execute(
       for (size_t j = 0; j < nelem; ++j) {
         dst[j] = static_cast<int64_t>(tmp[j]);
       }
+    } else if (gt->type == GGML_TYPE_I64 && et_tensor.scalar_type() == executorch::aten::ScalarType::Long) {
+      ggml_backend_tensor_get(gt, et_tensor.mutable_data_ptr(), 0, ggml_nbytes(gt));
+    } else if (gt->type == GGML_TYPE_F32 && et_tensor.scalar_type() == executorch::aten::ScalarType::Long) {
+      // F32 graph output that ExecuTorch expects as Long (e.g. enc_len computed
+      // in F32 without a cast back to I64). Convert element-wise.
+      std::vector<float> tmp(nelem);
+      ggml_backend_tensor_get(gt, tmp.data(), 0, nelem * sizeof(float));
+      int64_t* dst = static_cast<int64_t*>(et_tensor.mutable_data_ptr());
+      for (size_t j = 0; j < nelem; ++j) {
+        dst[j] = static_cast<int64_t>(tmp[j]);
+      }
     } else {
       size_t copy_size = std::min(ggml_nbytes(gt), (size_t)et_tensor.nbytes());
       ggml_backend_tensor_get(gt, et_tensor.mutable_data_ptr(), 0, copy_size);
@@ -4612,6 +4817,9 @@ void GgmlBackendInterface::destroy(DelegateHandle* handle_raw) const {
   if (handle) {
     // Free all cached graph instances (schedulers + contexts) before backends.
     for (auto& [k, gi] : handle->graph_cache) {
+      if (gi && gi->eager_const_buf) {
+        ggml_backend_buffer_free(gi->eager_const_buf);
+      }
       if (gi && gi->sched) {
         ggml_backend_sched_free(gi->sched);
       }
