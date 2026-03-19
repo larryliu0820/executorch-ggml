@@ -48,6 +48,24 @@ int main(int argc, char** argv) {
   fprintf(stderr, "Loading %s ...\n", model_path);
   Module model(model_path);
 
+  // Verify model loaded and method exists
+  auto method_names = model.method_names();
+  if (!method_names.ok()) {
+    fprintf(stderr, "Failed to get method names: %d\n", (int)method_names.error());
+    return 1;
+  }
+  fprintf(stderr, "Methods:");
+  for (auto& name : *method_names) {
+    fprintf(stderr, " %s", name.c_str());
+  }
+  fprintf(stderr, "\n");
+
+  auto load_err = model.load_method("forward");
+  if (load_err != Error::Ok) {
+    fprintf(stderr, "load_method('forward') failed: %d (0x%x)\n", (int)load_err, (int)load_err);
+    return 1;
+  }
+
   // Build prompt token IDs [1, 2, 3, ..., prompt_len]
   std::vector<int64_t> prompt_ids(prompt_len);
   for (int i = 0; i < prompt_len; i++) prompt_ids[i] = i + 1;

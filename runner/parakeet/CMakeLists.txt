@@ -3,8 +3,16 @@
 
 if(EXECUTORCH_GGML_BUILD_LLAMA_RUNNER)
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(ALSA REQUIRED alsa)
+find_package(PkgConfig QUIET)
+if(NOT PkgConfig_FOUND)
+  message(STATUS "Skipping parakeet_live: pkg-config not found")
+  return()
+endif()
+pkg_check_modules(ALSA alsa)
+if(NOT ALSA_FOUND)
+  message(STATUS "Skipping parakeet_live: ALSA not found")
+  return()
+endif()
 
 include("${EXECUTORCH_DIR}/tools/cmake/Utils.cmake")
 
