@@ -88,6 +88,8 @@ _SUPPORTED_OP_NAMES = {
     "aten.any.dim",
     # KV cache ops
     "llama.update_cache.default",
+    "aten.index_copy_.default",
+    "aten.index_copy.default",
     # Fused RoPE
     "ggml.rope.default",
     # Additional ops for full model export
@@ -138,6 +140,13 @@ def _is_supported_target(target, node=None) -> bool:
     s = str(target)
     if "<built-in function getitem>" in s:
         return True
+    # auto_functionalized_v2 wraps inplace ops (index_copy_).
+    # Delegate if the wrapped op is supported.
+    if "auto_functionalized" in s:
+        if node is not None and node.args:
+            inner = str(node.args[0])
+            return any(name in inner for name in _SUPPORTED_OP_NAMES)
+        return False
     return any(name in s for name in _SUPPORTED_OP_NAMES)
 
 

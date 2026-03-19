@@ -1305,11 +1305,12 @@ static Error build_graph(
   (void)n_overrides;
 
   // Metal binary ops require F32 inputs for ADD/SUB/MUL/DIV.
-  // CUDA supports BF16 natively, so only gate on Metal.
+  // Metal and CUDA binary broadcast ops require F32 (CUDA supports F16 too
+  // but not BF16 for binary ops).  Gate on non-CPU backend to be safe.
 #ifdef GGML_USE_METAL
   const bool metal_f32_binops = ggml_backend_is_metal(handle->backend);
 #else
-  const bool metal_f32_binops = false;
+  const bool metal_f32_binops = (handle->backend != handle->backend_cpu);
 #endif
 
   // --- Tear down previous context (no-op on first call) ---
@@ -2229,6 +2230,13 @@ static Error build_graph(
             gt = ggml_conv_2d_dw_direct(ctx, weight, input, stride_w, stride_h, pad_w, pad_h, dilation_w, dilation_h);
           } else {
             // Regular convolution — uses im2col in the kernel's type.
+            // ggml im2col only supports F16/F32 kernels; cast BF16 to F32.
+            if (weight->type == GGML_TYPE_BF16) {
+              weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
+            }
+            if (input->type == GGML_TYPE_BF16) {
+              input = ggml_cast(ctx, input, GGML_TYPE_F32);
+            }
             gt = ggml_conv_2d(ctx, weight, input, stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w);
           }
 

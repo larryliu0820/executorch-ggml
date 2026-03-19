@@ -3058,36 +3058,22 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
-                elif "slice_scatter" in target_str:
-                    # aten.slice_scatter(self, src, dim, start, end) -> Tensor
-                    # Used for KV cache updates: cache = slice_scatter(cache, kv, seq_dim, start, end)
+                elif "index_copy" in target_str:
+                    # aten.index_copy_(self, dim, index, source) -> self
+                    # or aten.index_copy(self, dim, index, source) -> Tensor
+                    # Used for KV cache updates: cache.index_copy_(seq_dim, positions, kv)
                     cache_node = node.args[0]
-                    value_node = node.args[1]
-                    seq_dim = int(node.args[2]) if len(node.args) > 2 else 1
-                    # start is an int or node — we need the cache_position tensor
-                    # which is the start arg traced to its source tensor
-                    start_node = node.args[3] if len(node.args) > 3 else None
+                    seq_dim = int(node.args[1])
+                    index_node = node.args[2]
+                    value_node = node.args[3]
 
                     cache_id = node_to_id[cache_node]
                     value_id = node_to_id[value_node]
-
-                    # Trace start to a tensor for the position index
-                    def _trace_slice_scatter(n):
-                        if n is None:
-                            return None
-                        if n in node_to_id:
-                            return node_to_id[n]
-                        if hasattr(n, "target"):
-                            tname = str(n.target)
-                            if "item" in tname or "select" in tname:
-                                if n.args:
-                                    return _trace_slice_scatter(n.args[0])
-                        return None
-
-                    start_pos_id = _trace_slice_scatter(start_node)
+                    # index_node is the position tensor (input_pos)
+                    start_pos_id = node_to_id.get(index_node)
                     if start_pos_id is None:
                         raise RuntimeError(
-                            f"Could not find tensor for slice_scatter start: {start_node}"
+                            f"Could not find tensor for index_copy index: {index_node}"
                         )
 
                     fake_val = node.meta.get("val")

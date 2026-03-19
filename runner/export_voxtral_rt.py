@@ -98,6 +98,11 @@ def main():
     swap_encoder_rope(model, freq_base=model.config.enc_rope_theta)
     print("  Applied fused RoPE (swap_encoder_rope)")
 
+    # Replace llama custom ops with standard ATen ops for GGML export
+    from executorch_ggml.modules.voxtral_attention import swap_voxtral_attention
+    swap_voxtral_attention(model)
+    print("  Applied standard attention (swap_voxtral_attention)")
+
     print(f"\nExporting components (dtype={args.dtype})...")
     if args.streaming:
         programs, metadata = export_streaming_ggml(
