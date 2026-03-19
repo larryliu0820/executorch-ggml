@@ -1305,13 +1305,14 @@ static Error build_graph(
   (void)n_overrides;
 
   // Metal binary ops require F32 inputs for ADD/SUB/MUL/DIV.
-  // Metal and CUDA binary broadcast ops require F32 (CUDA supports F16 too
-  // but not BF16 for binary ops).  Gate on non-CPU backend to be safe.
+  // Metal binary ops require F32 inputs.  CUDA binary broadcast supports
+  // F32 and F16 but NOT BF16 — we handle BF16 casts inline below.
 #ifdef GGML_USE_METAL
   const bool metal_f32_binops = ggml_backend_is_metal(handle->backend);
 #else
-  const bool metal_f32_binops = (handle->backend != handle->backend_cpu);
+  const bool metal_f32_binops = false;
 #endif
+  const bool cuda_bf16_cast = (handle->backend != handle->backend_cpu) && !metal_f32_binops;
 
   // --- Tear down previous context (no-op on first call) ---
   // Preserve the scheduler — it will be reset+realloc'd in execute().
@@ -1371,6 +1372,7 @@ static Error build_graph(
   // from the context pool. Use serialized elem_size metadata to compute
   // accurate data sizes from resolved runtime shapes.
   size_t eager_data_estimate = 0;
+  std::unordered_set<uint64_t> seen_causal_masks;
   for (int i = 0; i < n_tensors; ++i) {
     const auto* t = fb_tensors->Get(i);
     uint8_t elem_size = t->elem_size();
@@ -1383,7 +1385,8 @@ static Error build_graph(
       continue;
     }
 
-    // Runtime special case: LLAMA_ATTENTION causal mask [T_kv, T_q] × F16
+    // Runtime special case: LLAMA_ATTENTION causal mask [T_kv, T_q] × F16.
+    // Masks are cached per unique (T_kv, T_q) shape, so only count once.
     if (static_cast<ggml_ir::OpCode>(t->op()) == ggml_ir::OpCode::LLAMA_ATTENTION) {
       bool is_causal = false;
       if (t->op_params() && t->op_params()->size() >= 4) {
@@ -1396,7 +1399,10 @@ static Error build_graph(
                          input_ne_overrides, sym_dim_values, q_ne, qnd);
         resolve_ir_shape(fb_tensors->Get(t->src_ids()->Get(1)),
                          input_ne_overrides, sym_dim_values, k_ne, knd);
-        eager_data_estimate += (size_t)k_ne[1] * q_ne[1] * sizeof(ggml_fp16_t);
+        uint64_t mask_key = ((uint64_t)k_ne[1] << 32) | (uint64_t)q_ne[1];
+        if (seen_causal_masks.insert(mask_key).second) {
+          eager_data_estimate += (size_t)k_ne[1] * q_ne[1] * sizeof(ggml_fp16_t);
+        }
       }
     }
   }
@@ -1538,6 +1544,8 @@ static Error build_graph(
   if (cmp_env) use_native_cmp_ops = (std::string(cmp_env) != "0");
   // Host-side accessor for reading tensor data that may live on a device buffer.
   HostDataAccessor host_acc;
+  // Cache causal attention masks so identical (T_kv, T_q) shapes reuse one allocation.
+  std::unordered_map<uint64_t, struct ggml_tensor*> causal_mask_cache;
   int last_processed = -1;
   for (int i = 0; i < n_tensors; ++i) {
     const auto* t = fb_tensors->Get(i);
@@ -1941,7 +1949,10 @@ static Error build_graph(
           if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
 
           if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
-          // CPU binary ops require contiguous innermost rows (e.g. RoPE after permute).
+          if (cuda_bf16_cast) {
+            if (a->type == GGML_TYPE_BF16) a = ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type == GGML_TYPE_BF16) b = ggml_cast(ctx, b, GGML_TYPE_F32);
+          }
           a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
 
           if (a->type != b->type) {
@@ -1988,6 +1999,10 @@ static Error build_graph(
             std::swap(a, b);
           }
           if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+          if (cuda_bf16_cast) {
+            if (a->type == GGML_TYPE_BF16) a = ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type == GGML_TYPE_BF16) b = ggml_cast(ctx, b, GGML_TYPE_F32);
+          }
           // ggml CPU MUL requires contiguous innermost rows (e.g. after permute in RoPE).
           a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
           if (!resolve_broadcast(a, b, "MUL")) {
@@ -2007,6 +2022,10 @@ static Error build_graph(
             break;
           }
           if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+          if (cuda_bf16_cast) {
+            if (a->type == GGML_TYPE_BF16) a = ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type == GGML_TYPE_BF16) b = ggml_cast(ctx, b, GGML_TYPE_F32);
+          }
 
           if (!resolve_broadcast(a, b, "DIV")) {
             ggml_free(ctx);
@@ -2129,6 +2148,7 @@ static Error build_graph(
               return Error::InvalidArgument;
             }
             if (metal_f32_binops) b = ensure_f32(ctx, b);
+            if (cuda_bf16_cast && b->type == GGML_TYPE_BF16) b = ggml_cast(ctx, b, GGML_TYPE_F32);
             y = ggml_add(ctx, y, b);
           }
           gt = y;
@@ -3038,21 +3058,29 @@ static Error build_graph(
           // Build causal mask at runtime when is_causal=true and no explicit mask.
           // Q is [D, T_q, H, B] in ggml layout. K is [D, T_kv, H, B].
           // Mask shape: [T_kv, T_q, 1, 1] — lower-triangular F16 additive.
+          // Cache the mask so identical shapes (e.g. all encoder layers) reuse it.
           if (is_causal && mask == nullptr) {
             int64_t T_q  = q->ne[1];
             int64_t T_kv = k->ne[1];
-            ggml_set_no_alloc(ctx, false);
-            struct ggml_tensor* causal = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, T_kv, T_q, 1, 1);
-            ggml_set_no_alloc(ctx, true);
-            const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
-            const ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-65504.0f);
-            ggml_fp16_t* d = (ggml_fp16_t*)causal->data;
-            for (int64_t row = 0; row < T_q; row++) {
-              for (int64_t col = 0; col < T_kv; col++) {
-                d[row * T_kv + col] = (col <= row + (T_kv - T_q)) ? zero_f16 : neg_inf_f16;
+            uint64_t mask_key = ((uint64_t)T_kv << 32) | (uint64_t)T_q;
+            auto cm_it = causal_mask_cache.find(mask_key);
+            if (cm_it != causal_mask_cache.end() && cm_it->second != nullptr) {
+              mask = cm_it->second;
+            } else {
+              ggml_set_no_alloc(ctx, false);
+              struct ggml_tensor* causal = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, T_kv, T_q, 1, 1);
+              ggml_set_no_alloc(ctx, true);
+              const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+              const ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-65504.0f);
+              ggml_fp16_t* d = (ggml_fp16_t*)causal->data;
+              for (int64_t row = 0; row < T_q; row++) {
+                for (int64_t col = 0; col < T_kv; col++) {
+                  d[row * T_kv + col] = (col <= row + (T_kv - T_q)) ? zero_f16 : neg_inf_f16;
+                }
               }
+              causal_mask_cache[mask_key] = causal;
+              mask = causal;
             }
-            mask = causal;
           }
 
           // scale = 1/sqrt(head_dim). head_dim is ne0 in ggml layout when tensors are [D, T_q, H, B]
@@ -3116,6 +3144,10 @@ static Error build_graph(
             if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
             if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(ctx, b, GGML_TYPE_F32, &host_acc);
             if (metal_f32_binops) { a = ensure_f32(ctx, a); b = ensure_f32(ctx, b); }
+          if (cuda_bf16_cast) {
+            if (a->type == GGML_TYPE_BF16) a = ggml_cast(ctx, a, GGML_TYPE_F32);
+            if (b->type == GGML_TYPE_BF16) b = ggml_cast(ctx, b, GGML_TYPE_F32);
+          }
   
             if (!resolve_broadcast(a, b, "SUB")) {
               ggml_free(ctx);
@@ -3722,6 +3754,7 @@ static Error build_graph(
           if (has_weight && srcs.size() > 1) {
             struct ggml_tensor* w = srcs[1];
             if (metal_f32_binops) w = ensure_f32(ctx, w);
+            if (cuda_bf16_cast && w->type == GGML_TYPE_BF16) w = ggml_cast(ctx, w, GGML_TYPE_F32);
             gt = ggml_mul(ctx, gt, w);
           }
           if (has_bias) {
@@ -3729,6 +3762,7 @@ static Error build_graph(
             if ((int)srcs.size() > bias_idx) {
               struct ggml_tensor* b = srcs[bias_idx];
               if (metal_f32_binops) b = ensure_f32(ctx, b);
+            if (cuda_bf16_cast && b->type == GGML_TYPE_BF16) b = ggml_cast(ctx, b, GGML_TYPE_F32);
               gt = ggml_add(ctx, gt, b);
             }
           }
@@ -3751,6 +3785,7 @@ static Error build_graph(
           if (has_weight && srcs.size() > 1) {
             struct ggml_tensor* w = srcs[1];
             if (metal_f32_binops) w = ensure_f32(ctx, w);
+            if (cuda_bf16_cast && w->type == GGML_TYPE_BF16) w = ggml_cast(ctx, w, GGML_TYPE_F32);
             gt = ggml_mul(ctx, gt, w);
           }
           break;
