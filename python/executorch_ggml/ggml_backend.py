@@ -581,7 +581,7 @@ class GgmlBackend(BackendDetails):
                             quantize_tensor,
                             GgmlQuantType,
                         )
-                        if should_quantize(
+                        if not is_mutable and should_quantize(
                             fqn, tuple(t_cpu.shape), t_cpu.dtype,
                             t_cpu.numel(), quant_config,
                         ):

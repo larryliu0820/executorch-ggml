@@ -2902,12 +2902,11 @@ static Error build_graph(
 
           if (is_mutable_dst) {
             // Use native ggml_set_rows for KV cache updates — runs on GPU
-            // without graph splits.  Requires F32 value and I32/I64 indices.
+            // without graph splits.  Requires F32 value; dst (cache) must
+            // NOT be cast (set_rows returns a new tensor, cast would break
+            // the link to the mutable buffer).
             if (val->type != GGML_TYPE_F32) {
               val = safe_ggml_cast(ctx, val, GGML_TYPE_F32, &host_acc);
-            }
-            if (dst->type != GGML_TYPE_F32) {
-              dst = safe_ggml_cast(ctx, dst, GGML_TYPE_F32, &host_acc);
             }
             gt = ggml_set_rows(ctx, dst, val, idx);
             ggml_set_output(gt);
@@ -3727,9 +3726,8 @@ static Error build_graph(
           if (value->type != GGML_TYPE_F32) {
             value = safe_ggml_cast(ctx, value, GGML_TYPE_F32, &host_acc);
           }
-          if (cache->type != GGML_TYPE_F32) {
-            cache = safe_ggml_cast(ctx, cache, GGML_TYPE_F32, &host_acc);
-          }
+          // Don't cast cache — set_rows returns a new tensor and casting
+          // would break the link to the mutable buffer.
 
           gt = ggml_set_rows(ctx, cache, value, indices);
           break;
