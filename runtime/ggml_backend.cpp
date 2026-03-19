@@ -3714,17 +3714,14 @@ static Error build_graph(
           // For contiguous update, we can create a view and copy
           // cache[:, start_pos:start_pos+seq_len, :, :] = value
 
-          // Create indices tensor for ggml_set_rows
+          // Generate indices as a graph op via ggml_arange so they live on the
+          // compute backend (GPU).  Eagerly-allocated host-memory indices cause
+          // the scheduler to run set_rows on CPU, adding sync barriers.
           int64_t seq_len_new = value->ne[ggml_axis];
-          ggml_set_no_alloc(ctx, false);
-          struct ggml_tensor* indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, seq_len_new);
-          ggml_set_no_alloc(ctx, true);
-          int64_t* idx_data = static_cast<int64_t*>(indices->data);
-          for (int64_t i = 0; i < seq_len_new; ++i) {
-            idx_data[i] = start_pos + i;
-          }
+          struct ggml_tensor* indices = ggml_arange(ctx,
+              (float)start_pos, (float)(start_pos + seq_len_new), 1.0f);
+          indices = safe_ggml_cast(ctx, indices, GGML_TYPE_I32, &host_acc);
 
-          // ggml_set_rows requires value (b) and cache (a) to be F32.
           if (value->type != GGML_TYPE_F32) {
             value = safe_ggml_cast(ctx, value, GGML_TYPE_F32, &host_acc);
           }
@@ -3732,7 +3729,6 @@ static Error build_graph(
             cache = safe_ggml_cast(ctx, cache, GGML_TYPE_F32, &host_acc);
           }
 
-          // Use ggml_set_rows to scatter values into cache
           gt = ggml_set_rows(ctx, cache, value, indices);
           break;
         }
@@ -4617,9 +4613,7 @@ Error GgmlBackendInterface::execute(
   }
 
   // --- Rebuild graph every call ---
-  // Like llama.cpp: rebuild ctx+graph from IR each invocation. The scheduler
-  // is preserved across calls for gallocr buffer reuse. Graph building is
-  // cheap (bump-pointer alloc + O(n_tensors) ggml API calls).
+  auto t_start = std::chrono::high_resolution_clock::now();
   {
     const int64_t* ne_ptr = handle->has_dynamic ? current_ne.data() : nullptr;
     size_t ne_count = handle->has_dynamic ? current_ne.size() : 0;
@@ -4627,6 +4621,7 @@ Error GgmlBackendInterface::execute(
                             /*verbose=*/false);
     if (err != Error::Ok) return err;
   }
+  auto t_build = std::chrono::high_resolution_clock::now();
   // Update counts after rebuild.
   n_inputs = active->inputs.size();
   n_outputs = active->outputs.size();
@@ -4681,10 +4676,12 @@ Error GgmlBackendInterface::execute(
     }
   }
 
+  auto t_pre_alloc = std::chrono::high_resolution_clock::now();
   if (!ggml_backend_sched_alloc_graph(active->sched, active->graph)) {
     fprintf(stderr, "[ggml_backend] ERROR: scheduler alloc failed\n");
     return Error::MemoryAllocationFailed;
   }
+  auto t_alloc = std::chrono::high_resolution_clock::now();
 
   // Copy eager constant data after sched_alloc (buffer is already assigned).
   for (auto& ec : active->eager_constants) {
@@ -4780,7 +4777,22 @@ Error GgmlBackendInterface::execute(
     }
   }
 
+  auto t_pre_compute = std::chrono::high_resolution_clock::now();
   enum ggml_status status = ggml_backend_sched_graph_compute(active->sched, active->graph);
+  auto t_compute = std::chrono::high_resolution_clock::now();
+
+  {
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    static int call_count = 0;
+    if (call_count > 0 && call_count <= 3) {
+      int n_splits = ggml_backend_sched_get_n_splits(active->sched);
+      fprintf(stderr, "[timing] build=%.1fms alloc=%.1fms compute=%.1fms total=%.1fms splits=%d nodes=%d\n",
+              ms(t_start, t_build), ms(t_pre_alloc, t_alloc),
+              ms(t_pre_compute, t_compute), ms(t_start, t_compute),
+              n_splits, ggml_graph_n_nodes(active->graph));
+    }
+    call_count++;
+  }
 
   if (debug_ctx.fp) {
     fclose(debug_ctx.fp);
