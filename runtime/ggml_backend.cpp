@@ -2901,13 +2901,15 @@ static Error build_graph(
           }
 
           if (is_mutable_dst) {
-            struct ggml_tensor* extra_args[2] = {idx, val};
-            gt = ggml_custom_inplace(
-                ctx, dst, extra_args, 2,
-                ggml_custom_index_put_inplace,
-                GGML_N_TASKS_MAX,
-                nullptr);
-            pin_to_cpu(gt);
+            // Use native ggml_set_rows for KV cache updates — runs on GPU
+            // without graph splits.  Requires F32 value and I32/I64 indices.
+            if (val->type != GGML_TYPE_F32) {
+              val = safe_ggml_cast(ctx, val, GGML_TYPE_F32, &host_acc);
+            }
+            if (dst->type != GGML_TYPE_F32) {
+              dst = safe_ggml_cast(ctx, dst, GGML_TYPE_F32, &host_acc);
+            }
+            gt = ggml_set_rows(ctx, dst, val, idx);
             ggml_set_output(gt);
           } else {
             struct ggml_tensor* args[3] = {dst, idx, val};
@@ -4397,11 +4399,11 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       fprintf(stderr, "[ggml_backend] const_buf allocated: %zu MB\n", const_total / (1024*1024));
     }
     if (mutable_total > 0) {
-      // Allocate on CPU so custom inplace ops write directly into mutable_buf
-      // without scheduler copy-buffer aliasing (gallocr shares a single copy
-      // buffer between K/V cache leaves whose lifetimes don't overlap).
-      // On Apple Silicon, CPU malloc is unified memory anyway.
-      handle->mutable_buf = ggml_backend_alloc_buffer(handle->backend_cpu, mutable_total);
+      // Allocate KV cache on the primary backend (GPU) so ggml_set_rows
+      // updates run on-device without graph splits.
+      // On Metal/Apple Silicon the CPU buffer type IS the unified GPU
+      // buffer, so using the primary backend is correct everywhere.
+      handle->mutable_buf = ggml_backend_alloc_buffer(handle->backend, mutable_total);
       if (!handle->mutable_buf) {
         fprintf(stderr, "[ggml_backend] ERROR: failed to allocate mutable_buf (%zu bytes)\n", mutable_total);
         if (handle->const_buf) ggml_backend_buffer_free(handle->const_buf);
