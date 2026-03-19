@@ -245,12 +245,48 @@ def main():
             mel = proc_result[0]
             mel_len = proc_result[1].item()
 
+            # --- Encoder comparison: eager vs GGML ---
+            print("\n--- Encoder output comparison ---")
+            encoder_with_proj = EncoderWithProjection(model.encoder, model.joint)
+            encoder_with_proj.eval()
+            eager_enc = encoder_with_proj(
+                audio_signal=mel, length=torch.tensor([mel_len], dtype=torch.int64)
+            )
+            eager_f_proj = eager_enc[0]
+            eager_enc_len = eager_enc[1].item()
+            print(f"  Eager  enc_len: {eager_enc_len}")
+            print(
+                f"  Eager  f_proj: shape={list(eager_f_proj.shape)}, "
+                f"min={eager_f_proj.min().item():.6f}, max={eager_f_proj.max().item():.6f}, "
+                f"mean={eager_f_proj.mean().item():.6f}, std={eager_f_proj.std().item():.6f}"
+            )
+
             encoder_method = program.load_method("encoder")
             mel_len_tensor = torch.tensor([mel_len], dtype=torch.int64)
             enc_result = encoder_method.execute([mel, mel_len_tensor])
             f_proj = enc_result[0]
             encoded_len = enc_result[1].item()
+            print(f"  GGML   enc_len: {encoded_len}  (dtype={enc_result[1].dtype})")
+            print(
+                f"  GGML   f_proj: shape={list(f_proj.shape)}, "
+                f"min={f_proj.min().item():.6f}, max={f_proj.max().item():.6f}, "
+                f"mean={f_proj.mean().item():.6f}, std={f_proj.std().item():.6f}"
+            )
 
+            if eager_f_proj.shape == f_proj.shape:
+                diff = (eager_f_proj - f_proj).abs()
+                cos = torch.nn.functional.cosine_similarity(
+                    eager_f_proj.flatten().unsqueeze(0),
+                    f_proj.flatten().unsqueeze(0),
+                ).item()
+                print(
+                    f"  Diff   max_abs={diff.max().item():.6f}, "
+                    f"mean_abs={diff.mean().item():.6f}, cosine_sim={cos:.6f}"
+                )
+            else:
+                print(f"  WARNING: shape mismatch!")
+
+            # --- Decode ---
             tokens = greedy_decode_executorch(
                 f_proj,
                 encoded_len,
@@ -261,7 +297,7 @@ def main():
             )
 
             et_text = model.tokenizer.ids_to_text(tokens)
-            print(f"  Result: {et_text}")
+            print(f"\n  GGML transcription: {et_text}")
 
             if eager_text == et_text:
                 print("\nTranscriptions match!")
@@ -269,6 +305,11 @@ def main():
                 print("\nTranscriptions differ!")
                 print(f"  Eager: {eager_text}")
                 print(f"  GGML:  {et_text}")
+                if not et_text:
+                    print("\n  HINT: Empty transcription. Check enc_len above.")
+                    print("  If enc_len is wrong, the output type conversion may be broken.")
+                    print("  If f_proj stats are very different, the encoder graph has issues.")
+                    print("  Try GGML_BACKEND_DEVICE=cpu to test CPU-only mode.")
 
     print("\nDone!")
 

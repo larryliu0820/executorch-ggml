@@ -629,10 +629,12 @@ class GgmlBackend(BackendDetails):
                     fake_val = node.meta.get("val")
 
                     # Skip non-tensor placeholders (e.g. SymInt from
-                    # dynamic shapes).  These are passed by ExecuTorch
-                    # for output-shape bookkeeping but are not real
-                    # tensor inputs to the ggml graph.
+                    # dynamic shapes).  Tuple placeholders come from
+                    # auto_functionalized_v2 wrapping mutating ops — store
+                    # a list so getitem can index into them.
                     if fake_val is None or not hasattr(fake_val, "shape"):
+                        if isinstance(fake_val, (tuple, list)):
+                            node_to_id[node] = [None] * len(fake_val)
                         continue
 
                     shape = _resolve_shape(fake_val)
@@ -2093,6 +2095,8 @@ class GgmlBackend(BackendDetails):
                 elif "aten._to_copy.default" in target_str:
                     # _to_copy(x, dtype=...) - dtype conversion with copy
                     src_node = node.args[0]
+                    if src_node not in node_to_id:
+                        continue  # source from auto_functionalized handled externally
                     src_id = node_to_id[src_node]
 
                     src_val = src_node.meta.get("val") if hasattr(src_node, "meta") else None
@@ -3054,6 +3058,59 @@ class GgmlBackend(BackendDetails):
                     )
                     node_to_id[node] = tid
 
+                elif "slice_scatter" in target_str:
+                    # aten.slice_scatter(self, src, dim, start, end) -> Tensor
+                    # Used for KV cache updates: cache = slice_scatter(cache, kv, seq_dim, start, end)
+                    cache_node = node.args[0]
+                    value_node = node.args[1]
+                    seq_dim = int(node.args[2]) if len(node.args) > 2 else 1
+                    # start is an int or node — we need the cache_position tensor
+                    # which is the start arg traced to its source tensor
+                    start_node = node.args[3] if len(node.args) > 3 else None
+
+                    cache_id = node_to_id[cache_node]
+                    value_id = node_to_id[value_node]
+
+                    # Trace start to a tensor for the position index
+                    def _trace_slice_scatter(n):
+                        if n is None:
+                            return None
+                        if n in node_to_id:
+                            return node_to_id[n]
+                        if hasattr(n, "target"):
+                            tname = str(n.target)
+                            if "item" in tname or "select" in tname:
+                                if n.args:
+                                    return _trace_slice_scatter(n.args[0])
+                        return None
+
+                    start_pos_id = _trace_slice_scatter(start_node)
+                    if start_pos_id is None:
+                        raise RuntimeError(
+                            f"Could not find tensor for slice_scatter start: {start_node}"
+                        )
+
+                    fake_val = node.meta.get("val")
+                    shape = _resolve_shape(fake_val)
+                    out_dtype = (
+                        getattr(fake_val, "dtype", torch.float32)
+                        if fake_val is not None
+                        else torch.float32
+                    )
+
+                    tid = alloc_id()
+                    ir_tensors.append(
+                        IrTensor(
+                            tensor_id=tid,
+                            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+                            ne=_pytorch_shape_to_ggml_ne(shape),
+                            op=OP_UPDATE_CACHE,
+                            src_ids=[cache_id, value_id, start_pos_id],
+                            op_params=pack_update_cache_params(seq_dim),
+                        )
+                    )
+                    node_to_id[node] = tid
+
                 elif "llama.update_cache.default" in target_str:
                     # llama.update_cache(value, cache, start_pos) -> cache
                     # Updates cache at start_pos with new values.
@@ -3395,8 +3452,11 @@ class GgmlBackend(BackendDetails):
                     src_val = node_to_id.get(src_node)
 
                     if isinstance(src_val, list):
-                        # split_with_sizes_copy: list of tensor IDs
-                        node_to_id[node] = src_val[idx]
+                        # split_with_sizes_copy / auto_functionalized: list of tensor IDs
+                        val = src_val[idx] if idx < len(src_val) else None
+                        if val is not None:
+                            node_to_id[node] = val
+                        # else: None means this element is not a tensor we track
                     elif isinstance(src_val, int):
                         # layer_norm / batch_norm: single tensor ID (only index 0 is the output)
                         if idx == 0:
@@ -3404,6 +3464,8 @@ class GgmlBackend(BackendDetails):
                         else:
                             # mean/rstd outputs — not used in inference, skip
                             pass
+                    elif src_val is None:
+                        pass  # source not tracked (auto_functionalized placeholder)
                     else:
                         raise RuntimeError(
                             f"getitem: unexpected source type {type(src_val)} for {src_node}"
@@ -3411,7 +3473,8 @@ class GgmlBackend(BackendDetails):
 
                 else:
                     raise RuntimeError(
-                        f"GgmlBackend.preprocess: unsupported op {target}"
+                        f"GgmlBackend.preprocess: unsupported op {target} "
+                        f"(node={node.name}, op={node.op})"
                     )
 
             elif node.op == "output":

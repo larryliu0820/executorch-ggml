@@ -233,6 +233,19 @@ def lower_to_ggml(programs, metadata=None, quant_config=None):
         for key, value in metadata.items():
             constant_methods[key] = value
 
+    # Remove auto_functionalized_v2 from exported programs.
+    # Newer PyTorch wraps mutating custom ops (llama.update_cache) in
+    # auto_functionalized_v2 during export.  We remove it so the edge
+    # transform and partitioner see the raw update_cache ops.
+    try:
+        from torch.export._remove_auto_functionalized_pass import (
+            unsafe_remove_auto_functionalized_pass,
+        )
+        for key in programs:
+            programs[key] = unsafe_remove_auto_functionalized_pass(programs[key])
+    except (ImportError, Exception):
+        pass
+
     et_prog = to_edge_transform_and_lower(
         programs,
         transform_passes=[BF16UnsafeOpsCastPass(), ReplaceCopyOpsPass(), RemoveGraphAssertsPass()],
@@ -243,6 +256,18 @@ def lower_to_ggml(programs, metadata=None, quant_config=None):
         ),
         constant_methods=constant_methods if constant_methods else None,
     )
+
+    # Disable to_executorch()'s internal auto_functionalized removal pass.
+    # The edge transform may re-wrap update_cache in auto_functionalized,
+    # and the removal pass crashes on delegate boundaries.  Since the
+    # update_cache ops are inside the GGML delegate, the HOP wrapper is
+    # harmless and can stay.
+    try:
+        import executorch.exir.program._program as _prog_mod
+        _prog_mod.unsafe_remove_auto_functionalized_pass = lambda ep: ep
+    except (ImportError, AttributeError):
+        pass
+
     return et_prog.to_executorch(
         config=ExecutorchBackendConfig(
             extract_delegate_segments=True,

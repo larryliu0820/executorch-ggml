@@ -86,14 +86,11 @@ def main():
         model_dtype = torch.bfloat16
 
     print(f"Loading model from {args.model_path}...")
-    # backend="cuda" gives F.scaled_dot_product_attention + StaticKVCache
-    # (index_copy_) which the GGML partitioner can recognize and lower.
     model = load_model(
         args.model_path,
         max_seq_len=args.max_seq_len,
         n_delay_tokens=args.delay_tokens,
         dtype=model_dtype,
-        backend="cuda",
     )
 
     # Fuse encoder RoPE into ggml_rope_ext

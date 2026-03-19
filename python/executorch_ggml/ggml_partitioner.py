@@ -134,7 +134,7 @@ _SUPPORTED_OP_NAMES = {
 }
 
 
-def _is_supported_target(target) -> bool:
+def _is_supported_target(target, node=None) -> bool:
     s = str(target)
     if "<built-in function getitem>" in s:
         return True
@@ -143,7 +143,7 @@ def _is_supported_target(target) -> bool:
 
 def _is_supported_node(node) -> bool:
     """Additional per-node checks beyond op name matching."""
-    if not _is_supported_target(node.target):
+    if not _is_supported_target(node.target, node):
         return False
     target_str = str(node.target)
 

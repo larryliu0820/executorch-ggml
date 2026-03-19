@@ -1863,13 +1863,29 @@ static Error build_graph(
       } else if (auto * bs = try_slice_to_match(b, a)) {
         b = bs;
       } else {
-        fprintf(stderr,
-                "[executorch-ggml] %s shape mismatch not broadcastable: "
-                "a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
-                op_name,
-                (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
-                (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
-        return false;
+        // Mutual broadcast: both tensors need expanding in different dims.
+        // e.g. a=(128,1) b=(1,127) → target=(128,127)
+        int64_t tgt[4];
+        bool can_broadcast = true;
+        for (int d = 0; d < 4; d++) {
+          if (a->ne[d] == b->ne[d]) { tgt[d] = a->ne[d]; }
+          else if (a->ne[d] == 1)   { tgt[d] = b->ne[d]; }
+          else if (b->ne[d] == 1)   { tgt[d] = a->ne[d]; }
+          else { can_broadcast = false; break; }
+        }
+        if (can_broadcast) {
+          struct ggml_tensor* target = ggml_new_tensor_4d(ctx, a->type, tgt[0], tgt[1], tgt[2], tgt[3]);
+          if (!ggml_are_same_shape(a, target)) a = ggml_repeat(ctx, a, target);
+          if (!ggml_are_same_shape(b, target)) b = ggml_repeat(ctx, b, target);
+        } else {
+          fprintf(stderr,
+                  "[executorch-ggml] %s shape mismatch not broadcastable: "
+                  "a=(%lld,%lld,%lld,%lld) b=(%lld,%lld,%lld,%lld)\n",
+                  op_name,
+                  (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
+                  (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
+          return false;
+        }
       }
       return true;
     };
