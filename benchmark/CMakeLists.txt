@@ -17,8 +17,8 @@ target_include_directories(benchmark_llm PRIVATE
 
 target_link_libraries(benchmark_llm PRIVATE
   -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
-  ggml ggml-base ggml-cpu
   executorch
+  ggml ggml-base ggml-cpu
   extension_module_static
   extension_tensor
 )
