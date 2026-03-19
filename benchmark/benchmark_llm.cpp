@@ -1,0 +1,149 @@
+/**
+ * benchmark_llm.cpp — Minimal LLM decode benchmark for executorch-ggml.
+ *
+ * Loads a .pte file, runs prefill + N decode steps, and reports tok/s.
+ * No tokenizer needed — uses raw token IDs.
+ *
+ * Usage:
+ *   ./benchmark_llm <model.pte> [--n-decode 32] [--prompt-len 5]
+ */
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include <executorch/extension/module/module.h>
+#include <executorch/extension/tensor/tensor.h>
+#include <executorch/runtime/core/result.h>
+
+using executorch::extension::Module;
+using executorch::extension::TensorPtr;
+using executorch::extension::from_blob;
+using executorch::runtime::Error;
+
+static double now_ms() {
+  auto t = std::chrono::high_resolution_clock::now();
+  return std::chrono::duration<double, std::milli>(t.time_since_epoch()).count();
+}
+
+int main(int argc, char** argv) {
+  if (argc < 2) {
+    fprintf(stderr, "Usage: %s <model.pte> [--n-decode N] [--prompt-len N]\n", argv[0]);
+    return 1;
+  }
+  const char* model_path = argv[1];
+  int n_decode = 32;
+  int prompt_len = 5;
+
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--n-decode") == 0 && i + 1 < argc) {
+      n_decode = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--prompt-len") == 0 && i + 1 < argc) {
+      prompt_len = atoi(argv[++i]);
+    }
+  }
+
+  fprintf(stderr, "Loading %s ...\n", model_path);
+  Module model(model_path);
+
+  // Build prompt token IDs [1, 2, 3, ..., prompt_len]
+  std::vector<int64_t> prompt_ids(prompt_len);
+  for (int i = 0; i < prompt_len; i++) prompt_ids[i] = i + 1;
+
+  // Cache positions [0, 1, ..., prompt_len-1]
+  std::vector<int64_t> cache_pos(prompt_len);
+  for (int i = 0; i < prompt_len; i++) cache_pos[i] = i;
+
+  // --- Prefill ---
+  fprintf(stderr, "Prefill (%d tokens) ...\n", prompt_len);
+  auto input_ids = from_blob(
+      prompt_ids.data(), {1, prompt_len},
+      executorch::aten::ScalarType::Long);
+  auto pos_tensor = from_blob(
+      cache_pos.data(), {prompt_len},
+      executorch::aten::ScalarType::Long);
+
+  double t0 = now_ms();
+  auto prefill_result = model.forward({*input_ids, *pos_tensor});
+  double t_prefill = now_ms() - t0;
+
+  if (!prefill_result.ok()) {
+    fprintf(stderr, "Prefill failed: %d\n", (int)prefill_result.error());
+    return 1;
+  }
+
+  // Get logits and find argmax for last token
+  auto& logits = prefill_result->at(0).toTensor();
+  int64_t vocab_size = logits.size(2);
+  const float* logits_data = logits.const_data_ptr<float>();
+  int64_t offset = (prompt_len - 1) * vocab_size;
+  int64_t next_token = 0;
+  float max_val = logits_data[offset];
+  for (int64_t v = 1; v < vocab_size; v++) {
+    if (logits_data[offset + v] > max_val) {
+      max_val = logits_data[offset + v];
+      next_token = v;
+    }
+  }
+
+  fprintf(stderr, "Prefill: %.1f ms (%.1f tok/s), first token=%lld\n",
+          t_prefill, prompt_len / (t_prefill / 1000.0), (long long)next_token);
+
+  // --- Decode ---
+  fprintf(stderr, "Decode (%d tokens) ...\n", n_decode);
+  std::vector<int64_t> generated;
+  generated.push_back(next_token);
+
+  double t_decode_total = 0;
+  for (int step = 0; step < n_decode - 1; step++) {
+    int64_t pos = prompt_len + step;
+    auto tok = from_blob(&next_token, {1, 1}, executorch::aten::ScalarType::Long);
+    auto pos_t = from_blob(&pos, {1}, executorch::aten::ScalarType::Long);
+
+    double t_step = now_ms();
+    auto result = model.forward({*tok, *pos_t});
+    t_decode_total += now_ms() - t_step;
+
+    if (!result.ok()) {
+      fprintf(stderr, "Decode step %d failed: %d\n", step, (int)result.error());
+      return 1;
+    }
+
+    auto& step_logits = result->at(0).toTensor();
+    const float* ld = step_logits.const_data_ptr<float>();
+    next_token = 0;
+    max_val = ld[0];
+    for (int64_t v = 1; v < vocab_size; v++) {
+      if (ld[v] > max_val) {
+        max_val = ld[v];
+        next_token = v;
+      }
+    }
+    generated.push_back(next_token);
+
+    if (next_token == 2) break; // EOS
+  }
+
+  int actual_decode = (int)generated.size() - 1;
+  fprintf(stderr, "Decode: %.1f ms total, %.1f ms/tok (%.1f tok/s)\n",
+          t_decode_total,
+          actual_decode > 0 ? t_decode_total / actual_decode : 0,
+          actual_decode > 0 ? actual_decode / (t_decode_total / 1000.0) : 0);
+
+  // Print summary
+  printf("| model | prefill tok/s | decode tok/s | decode ms/tok |\n");
+  printf("| --- | --- | --- | --- |\n");
+  printf("| %s | %.1f | %.1f | %.1f |\n",
+         model_path,
+         prompt_len / (t_prefill / 1000.0),
+         actual_decode > 0 ? actual_decode / (t_decode_total / 1000.0) : 0,
+         actual_decode > 0 ? t_decode_total / actual_decode : 0);
+
+  fprintf(stderr, "Tokens: ");
+  for (auto t : generated) fprintf(stderr, "%lld ", (long long)t);
+  fprintf(stderr, "\n");
+
+  return 0;
+}

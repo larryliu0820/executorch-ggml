@@ -1,0 +1,53 @@
+# Benchmark executable for executorch-ggml LLM decode speed.
+# Requires ExecuTorch built from source (EXECUTORCH_GGML_BUILD_LLAMA_RUNNER=ON).
+
+if(EXECUTORCH_GGML_BUILD_LLAMA_RUNNER)
+
+add_executable(benchmark_llm benchmark_llm.cpp)
+
+target_include_directories(benchmark_llm PRIVATE
+  "${CMAKE_SOURCE_DIR}/runtime"
+  "${CMAKE_SOURCE_DIR}/schema"
+  "${LLAMA_CPP_DIR}/ggml/include"
+  "${EXECUTORCH_DIR}/.."
+  "${EXECUTORCH_DIR}"
+  "${EXECUTORCH_DIR}/include"
+  "${EXECUTORCH_DIR}/third-party/flatbuffers/include"
+)
+
+target_link_libraries(benchmark_llm PRIVATE
+  -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
+  ggml ggml-base ggml-cpu
+  executorch
+  extension_module_static
+  extension_tensor
+)
+
+if(TARGET ggml-blas)
+  target_link_libraries(benchmark_llm PRIVATE ggml-blas)
+endif()
+if(TARGET ggml-metal)
+  target_link_libraries(benchmark_llm PRIVATE ggml-metal)
+endif()
+if(TARGET ggml-cuda)
+  target_link_libraries(benchmark_llm PRIVATE ggml-cuda)
+endif()
+if(TARGET portable_ops_lib)
+  target_link_libraries(benchmark_llm PRIVATE -Wl,--no-as-needed portable_ops_lib portable_kernels -Wl,--as-needed)
+endif()
+
+if(APPLE)
+  set_target_properties(benchmark_llm PROPERTIES
+    BUILD_RPATH "${CMAKE_BINARY_DIR}/ggml/src"
+    INSTALL_RPATH "@executable_path"
+  )
+else()
+  set_target_properties(benchmark_llm PROPERTIES
+    BUILD_RPATH "${CMAKE_BINARY_DIR}/ggml/src"
+  )
+endif()
+
+message(STATUS "benchmark_llm target configured")
+else()
+  message(STATUS "Skipping benchmark_llm: requires EXECUTORCH_GGML_BUILD_LLAMA_RUNNER=ON")
+endif()

@@ -286,3 +286,4 @@ endif()
 # ---------------------------------------------------------------------------
 add_subdirectory(runner)
 add_subdirectory(runner/parakeet)
+add_subdirectory(benchmark)
