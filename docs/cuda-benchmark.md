@@ -2,11 +2,15 @@
 
 ## Quick Results (Qwen3-0.6B, A100)
 
-| Backend | Model Size | Decode tok/s | Compute ms/tok | Build ms/tok |
+| Backend | Model Size | Decode tok/s | Compute ms/tok | Overhead ms/tok |
 |---|---|---|---|---|
 | llama.cpp (Q8_0 GGUF) | 604 MB | 364 | ~2.7 | ~0 (reused) |
-| executorch-ggml (F32) | 2275 MB | 10.8 | 10.4 | 105 |
-| executorch-ggml (Q8_0) | 606 MB | 11.8 | 24.8 | 108 |
+| executorch-ggml (F32) | 2275 MB | **62** | 10.5 | **0** (graph cached) |
+| executorch-ggml (Q8_0) | 606 MB | ~40* | ~24.8 | **0** (graph cached) |
+
+*Q8_0 estimate with graph caching (compute still to be optimized).
+
+Previously (without graph caching): F32=10.8 tok/s, Q8_0=11.8 tok/s (105ms rebuild overhead per call).
 
 ## 1. Build llama.cpp Baseline
 
@@ -155,74 +159,97 @@ Writes per-node mean/std/min/max. Compare CPU vs CUDA dumps to find
 divergence.
 
 ### Built-in execute timing
-The C++ backend prints `[timing]` lines for the first few calls:
+The C++ backend prints `[timing]` lines for the first few decode calls:
 ```
-[timing] build=105ms alloc=1ms compute=10ms total=148ms splits=1 nodes=2837
+[timing] build=0.0ms alloc=0.0ms compute=10.5ms total=10.7ms splits=1 nodes=2837
 ```
-- **build**: IR parsing + ggml tensor/graph creation
-- **alloc**: Scheduler buffer allocation
+
+With `GGML_PERF_LOG=1`, detailed timing is printed for the first 5 calls
+and every 100th call (plus all cache misses):
+```
+[perf] execute #0: build=47.10ms alloc=2.06ms input=33.13ms compute=1547.17ms output=0.84ms total=1630.30ms | MISS(build+alloc) nodes=2904 splits=1
+[perf] execute #1: build=85.05ms alloc=1.89ms input=32.36ms compute=72.25ms output=0.20ms total=191.75ms | MISS(build+alloc) nodes=2837 splits=1
+[perf] execute #2: build=0.00ms alloc=0.00ms input=0.00ms compute=10.54ms output=0.16ms total=10.71ms | HIT nodes=2837 splits=1
+```
+
+Fields:
+- **build**: IR parsing + ggml tensor/graph creation (0 on cache HIT)
+- **alloc**: Scheduler buffer allocation (0 on cache HIT)
+- **input**: Input data copy to backend tensors
 - **compute**: Actual `ggml_backend_sched_graph_compute`
+- **output**: Output data copy from backend tensors
+- **HIT/MISS**: Graph cache hit (reuse) or miss (rebuild)
 - **splits**: Number of CPU↔GPU sync barriers (should be 1)
 - **nodes**: Graph size
 
+Init timing is also printed:
+```
+[perf] init: backends=2.3ms constants=1169.8ms buffers=685.1ms graph=47.4ms total=1904.6ms
+```
+
 ## 6. Performance Analysis
 
-### Current bottleneck breakdown (decode step, Qwen3-0.6B)
+### Current performance (with graph caching, decode step, Qwen3-0.6B)
 
 | Phase | Time | Notes |
 |---|---|---|
-| Graph rebuild | 105 ms | Re-parse IR, create ggml tensors |
-| Sched alloc | 1 ms | Trivial |
-| Compute | 10 ms | Actual GPU work |
-| **Total** | **~115 ms** | ~93% overhead |
+| Graph cache lookup | ~0 ms | Hash-based shape key lookup |
+| Input copy | ~0 ms | Single token, negligible |
+| Compute | 10.5 ms | Actual GPU work (bandwidth-limited) |
+| Output copy | 0.15 ms | Logits D→H transfer |
+| **Total** | **~10.7 ms** | **~62 tok/s** |
 
-The **graph rebuild** is 10x the actual compute. llama.cpp also rebuilds
-the graph every call, but their rebuild is ~0.1ms because they construct
-the graph directly via ggml API calls, not by parsing a serialized IR.
+Graph caching eliminates the 105ms rebuild overhead that dominated before.
+The remaining time is pure GPU compute, which is bandwidth-limited at
+~217 GB/s (A100 theoretical: ~2 TB/s). The F32 model's 2275 MB / 10.5ms
+matches llama.cpp's bandwidth utilization (604 MB / 2.7ms = ~224 GB/s).
 
-### Opportunities for improvement
+### Cache behavior
+- First call for each unique input shape: **MISS** — full `build_graph()`
+  (85ms for Qwen3 decode shape) + scheduler allocation
+- Subsequent calls with the same shape: **HIT** — zero overhead, direct compute
+- For LLMs: typically 2 shapes (prefill + decode), so after 2 misses,
+  all subsequent decode calls are cache hits
 
-#### High impact
-1. **Skip graph rebuild for same-shape calls** (~10x decode speedup).
-   Cache the ggml context + graph when input shapes haven't changed.
-   The graph cache infrastructure already exists (`graph_cache` keyed by
-   shape). Just skip `build_graph()` when `active->ctx` is valid.
-   Expected: 105ms → 0ms overhead → ~95 tok/s decode.
-
-2. **Graph caching with input patching**. Instead of rebuilding from IR,
-   reuse the existing graph and only update the input tensor data pointers.
-   This is how llama.cpp works — the graph structure is static, only
-   input buffers change between calls.
+### Remaining opportunities for improvement
 
 #### Medium impact
-3. **Q8_0 matmul kernels**. Currently Q8_0 weights are dequantized to F32
+1. **Q8_0 matmul kernels**. Currently Q8_0 weights are dequantized to F32
    during matmul. Using ggml's native Q8_0 dot product kernels would give
    ~4x bandwidth improvement. Need to verify the dequant+matmul path
    actually uses quantized kernels (check `ggml_mul_mat` with Q8_0 `a`).
 
-4. **Eliminate unnecessary CONT nodes**. 156 contiguity-enforcement copies
-   per decode step (793ms with profiling). Many are after reshape/permute
-   views that are already contiguous. Add `ggml_is_contiguous()` checks
-   before inserting `ensure_cont()`.
+2. **Reduce CONT nodes**. ~156 contiguity-enforcement copies per decode
+   step. The `ensure_cont()` helper already checks `ggml_is_contiguous()`,
+   so remaining CONTs are genuinely needed after permute/transpose. Could
+   be reduced by restructuring ops to avoid unnecessary transposes.
 
-5. **Reduce type conversion overhead**. F32↔F16 ping-pong in mixed-type
+3. **Reduce type conversion overhead**. F32↔F16 ping-pong in mixed-type
    models (FP16 weights + F32 activations). Each conversion adds a CPY
    node. Consider keeping all activations in F32 or all in F16.
 
 #### Lower impact
-6. **Batch graph compute**. Currently each ExecuTorch `execute()` call
-   rebuilds and computes one graph. Batching multiple decode steps into
-   a single graph compute would amortize the rebuild cost.
+4. **Pre-warm decode shape during init**. The first decode call triggers
+   a MISS (~85ms build + ~72ms CUDA kernel warmup). Could pre-build the
+   decode-shape graph during init to eliminate this one-time cost.
 
-7. **Persistent scheduler allocation**. The scheduler `reset + alloc`
-   cycle is cheap (1-3ms) but could be eliminated entirely by reusing
-   the buffer assignments across calls with the same graph shape.
+5. **Output copy optimization**. The 0.15ms logits D→H copy is small
+   but could be eliminated by doing argmax on GPU (requires framework changes).
+
+#### Completed
+- ~~Skip graph rebuild for same-shape calls~~ — **Done.** Graph + scheduler
+  + buffer assignments are fully reused across calls with the same shape.
+  105ms → 0ms overhead. 10.8 → 62 tok/s.
+- ~~Persistent scheduler allocation~~ — **Done.** Scheduler stays in
+  `is_alloc=true` state between cached calls, skipping reset+alloc entirely.
 
 ## 7. Environment Variables
 
 | Variable | Values | Description |
 |---|---|---|
 | `GGML_BACKEND_DEVICE` | `cpu`, `cuda`, `metal` | Force backend selection |
+| `GGML_PERF_LOG` | `1` | Detailed per-call timing breakdown |
+| `GGML_NO_GRAPH_CACHE` | `1` | Disable graph caching (for debugging) |
 | `GGML_PROFILE` | `1` | Per-op timing (adds sync overhead) |
 | `GGML_DEBUG_DUMP` | `<path>` | Per-node tensor stats to file |
 | `GGML_NATIVE_CMP_OPS` | `0`, `1` | Override comparison op mode |

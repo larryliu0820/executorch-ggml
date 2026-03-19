@@ -976,6 +976,7 @@ struct GraphInstance {
   std::vector<SharedLeaf> shared_leaves;  // leaf tensors in const_buf / mutable_buf
   std::vector<struct ggml_tensor*> cpu_pinned;  // tensors pinned to CPU backend
   ggml_backend_buffer_t eager_const_buf = nullptr;  // separate buffer for eager constants
+  bool is_allocated = false;  // true after first successful sched_alloc + compute
 };
 
 // ---------------------------------------------------------------------------
@@ -1031,6 +1032,28 @@ static void print_profile(const ProfileContext& ctx) {
             (double)p.total_us / p.count, pct);
   }
   fprintf(stderr, "\n");
+}
+
+// ---------------------------------------------------------------------------
+// Performance logging (enabled by GGML_PERF_LOG=1 environment variable)
+// ---------------------------------------------------------------------------
+static int perf_log_mode = -1;
+static bool should_perf_log() {
+  if (perf_log_mode < 0) {
+    const char* env = std::getenv("GGML_PERF_LOG");
+    perf_log_mode = (env && std::string(env) != "0") ? 1 : 0;
+  }
+  return perf_log_mode != 0;
+}
+
+// Graph cache can be disabled for debugging: GGML_NO_GRAPH_CACHE=1
+static int graph_cache_disabled = -1;
+static bool is_graph_cache_disabled() {
+  if (graph_cache_disabled < 0) {
+    const char* env = std::getenv("GGML_NO_GRAPH_CACHE");
+    graph_cache_disabled = (env && std::string(env) != "0") ? 1 : 0;
+  }
+  return graph_cache_disabled != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -4188,6 +4211,8 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     FreeableBuffer* processed,
     ArrayRef<CompileSpec> compile_specs) const {
 
+  auto t_init_start = std::chrono::high_resolution_clock::now();
+
   // --- 1. Copy IR buffer for later rebuilds ---
   auto* handle = new GgmlDelegateHandle();
   handle->ir_copy.assign(
@@ -4277,6 +4302,8 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     }
   };
 
+  auto t_backends_done = std::chrono::high_resolution_clock::now();
+
   // --- 4. Load ALL constants from NamedDataMap → handle->constant_data ---
   // This is the ONLY place NamedDataMap is touched.
   // After this, build_graph() reads from handle->constant_data.
@@ -4339,6 +4366,8 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     buf.Free();
     handle->constant_data.push_back(std::move(sc));
   }
+
+  auto t_constants_done = std::chrono::high_resolution_clock::now();
 
   // --- 5. Allocate shared const_buf and mutable_buf ---
   // Scan IR for leaf tensors with data_key. Compute total sizes,
@@ -4494,6 +4523,8 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
             handle->leaf_buf_map.size(), const_offset / (1024*1024), mutable_offset / (1024*1024));
   }
 
+  auto t_buffers_done = std::chrono::high_resolution_clock::now();
+
   // --- 6. Read sym_dim_ids from IR ---
   // Scan ALL tensors (not just inputs) for sym_dim_ids to detect dynamic models.
   int sym_tensor_count = 0;
@@ -4554,6 +4585,17 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     handle->graph_cache[key] = std::move(init_gi);
   }
 
+  {
+    auto t_init_end = std::chrono::high_resolution_clock::now();
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    fprintf(stderr, "[perf] init: backends=%.1fms constants=%.1fms buffers=%.1fms graph=%.1fms total=%.1fms\n",
+            ms(t_init_start, t_backends_done),
+            ms(t_backends_done, t_constants_done),
+            ms(t_constants_done, t_buffers_done),
+            ms(t_buffers_done, t_init_end),
+            ms(t_init_start, t_init_end));
+  }
+
   return handle;
 }
 
@@ -4612,9 +4654,14 @@ Error GgmlBackendInterface::execute(
     handle->active = active;
   }
 
-  // --- Rebuild graph every call ---
+  // --- Build or reuse graph ---
   auto t_start = std::chrono::high_resolution_clock::now();
-  {
+  bool no_cache = is_graph_cache_disabled();
+  bool need_build = (active->ctx == nullptr) || no_cache;
+  bool need_alloc = need_build || !active->is_allocated;
+
+  if (need_build) {
+    // First time for this shape: full IR parse + tensor creation.
     const int64_t* ne_ptr = handle->has_dynamic ? current_ne.data() : nullptr;
     size_t ne_count = handle->has_dynamic ? current_ne.size() : 0;
     Error err = build_graph(handle, active, ne_ptr, ne_count, &input_data_vec,
@@ -4622,74 +4669,74 @@ Error GgmlBackendInterface::execute(
     if (err != Error::Ok) return err;
   }
   auto t_build = std::chrono::high_resolution_clock::now();
-  // Update counts after rebuild.
+  // Update counts after build (or use existing from cache).
   n_inputs = active->inputs.size();
   n_outputs = active->outputs.size();
   n_non_output_args = args.size() >= n_outputs ? args.size() - n_outputs : 0;
 
-  // --- Scheduler reset + alloc ---
-  // build_graph() cleared all non-shared tensor data/buffer pointers, so
-  // the scheduler can safely allocate fresh backend buffers.
-  if (!active->sched) {
-    return Error::InvalidState;
-  }
-
-  ggml_backend_sched_reset(active->sched);
-
-  // Re-apply CPU pin assignments for custom ops (reset clears them).
-  for (auto* t : active->cpu_pinned) {
-    if (handle->backend_cpu && handle->backend_cpu != handle->backend) {
-      ggml_backend_sched_set_tensor_backend(active->sched, t, handle->backend_cpu);
+  // --- Scheduler setup (only on first alloc for this graph shape) ---
+  auto t_pre_alloc = t_build;
+  auto t_alloc = t_build;
+  if (need_alloc) {
+    if (!active->sched) {
+      return Error::InvalidState;
     }
-  }
 
-  // Restore shared-buffer leaf tensors (const_buf / mutable_buf) BEFORE
-  // sched_alloc so the scheduler sees them as pre-allocated and skips them.
-  for (auto& sl : active->shared_leaves) {
-    sl.tensor->data = static_cast<char*>(ggml_backend_buffer_get_base(sl.buf)) + sl.offset;
-    sl.tensor->buffer = sl.buf;
-  }
+    ggml_backend_sched_reset(active->sched);
 
-  // Restore eager constants into a dedicated buffer BEFORE sched_alloc.
-  // The scheduler's gallocr may alias eager constant memory with intermediate
-  // tensors if they're in the scheduler's pool. By assigning them to a
-  // separate buffer with data/buffer already set, the scheduler treats them
-  // like shared leaves and won't overlap them.
-  if (!active->eager_constants.empty()) {
-    const size_t alignment = 64;
-    size_t total = 0;
-    for (auto& ec : active->eager_constants) {
-      total += ((ec.data.size() + alignment - 1) / alignment) * alignment;
-    }
-    if (!active->eager_const_buf) {
-      active->eager_const_buf = ggml_backend_alloc_buffer(handle->backend, total);
-    }
-    if (active->eager_const_buf) {
-      char* base = static_cast<char*>(ggml_backend_buffer_get_base(active->eager_const_buf));
-      size_t offset = 0;
-      for (auto& ec : active->eager_constants) {
-        size_t nbytes = ec.data.size();
-        ec.tensor->data = base + offset;
-        ec.tensor->buffer = active->eager_const_buf;
-        offset += ((nbytes + alignment - 1) / alignment) * alignment;
+    // Re-apply CPU pin assignments for custom ops (reset clears them).
+    for (auto* t : active->cpu_pinned) {
+      if (handle->backend_cpu && handle->backend_cpu != handle->backend) {
+        ggml_backend_sched_set_tensor_backend(active->sched, t, handle->backend_cpu);
       }
     }
-  }
 
-  auto t_pre_alloc = std::chrono::high_resolution_clock::now();
-  if (!ggml_backend_sched_alloc_graph(active->sched, active->graph)) {
-    fprintf(stderr, "[ggml_backend] ERROR: scheduler alloc failed\n");
-    return Error::MemoryAllocationFailed;
-  }
-  auto t_alloc = std::chrono::high_resolution_clock::now();
-
-  // Copy eager constant data after sched_alloc (buffer is already assigned).
-  for (auto& ec : active->eager_constants) {
-    if (ec.tensor->buffer) {
-      ggml_backend_tensor_set(ec.tensor, ec.data.data(), 0, ec.data.size());
-    } else if (ec.tensor->data) {
-      memcpy(ec.tensor->data, ec.data.data(), ec.data.size());
+    // Restore shared-buffer leaf tensors (const_buf / mutable_buf) BEFORE
+    // sched_alloc so the scheduler sees them as pre-allocated and skips them.
+    for (auto& sl : active->shared_leaves) {
+      sl.tensor->data = static_cast<char*>(ggml_backend_buffer_get_base(sl.buf)) + sl.offset;
+      sl.tensor->buffer = sl.buf;
     }
+
+    // Restore eager constants into a dedicated buffer BEFORE sched_alloc.
+    if (!active->eager_constants.empty()) {
+      const size_t alignment = 64;
+      size_t total = 0;
+      for (auto& ec : active->eager_constants) {
+        total += ((ec.data.size() + alignment - 1) / alignment) * alignment;
+      }
+      if (!active->eager_const_buf) {
+        active->eager_const_buf = ggml_backend_alloc_buffer(handle->backend, total);
+      }
+      if (active->eager_const_buf) {
+        char* base = static_cast<char*>(ggml_backend_buffer_get_base(active->eager_const_buf));
+        size_t offset = 0;
+        for (auto& ec : active->eager_constants) {
+          size_t nbytes = ec.data.size();
+          ec.tensor->data = base + offset;
+          ec.tensor->buffer = active->eager_const_buf;
+          offset += ((nbytes + alignment - 1) / alignment) * alignment;
+        }
+      }
+    }
+
+    t_pre_alloc = std::chrono::high_resolution_clock::now();
+    if (!ggml_backend_sched_alloc_graph(active->sched, active->graph)) {
+      fprintf(stderr, "[ggml_backend] ERROR: scheduler alloc failed\n");
+      return Error::MemoryAllocationFailed;
+    }
+    t_alloc = std::chrono::high_resolution_clock::now();
+
+    // Copy eager constant data after sched_alloc (buffer is already assigned).
+    for (auto& ec : active->eager_constants) {
+      if (ec.tensor->buffer) {
+        ggml_backend_tensor_set(ec.tensor, ec.data.data(), 0, ec.data.size());
+      } else if (ec.tensor->data) {
+        memcpy(ec.tensor->data, ec.data.data(), ec.data.size());
+      }
+    }
+
+    active->is_allocated = true;
   }
 
   // --- Copy input data from ExecuTorch tensors → backend tensors ---
@@ -4739,6 +4786,7 @@ Error GgmlBackendInterface::execute(
       }
     }
   }
+  auto t_input_copy = std::chrono::high_resolution_clock::now();
 
   // --- Deferred I64→I32 casts ---
   for (const auto& [src_i64, dst_i32] : active->deferred_i64_to_i32) {
@@ -4780,19 +4828,6 @@ Error GgmlBackendInterface::execute(
   auto t_pre_compute = std::chrono::high_resolution_clock::now();
   enum ggml_status status = ggml_backend_sched_graph_compute(active->sched, active->graph);
   auto t_compute = std::chrono::high_resolution_clock::now();
-
-  {
-    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    static int call_count = 0;
-    if (call_count > 0 && call_count <= 3) {
-      int n_splits = ggml_backend_sched_get_n_splits(active->sched);
-      fprintf(stderr, "[timing] build=%.1fms alloc=%.1fms compute=%.1fms total=%.1fms splits=%d nodes=%d\n",
-              ms(t_start, t_build), ms(t_pre_alloc, t_alloc),
-              ms(t_pre_compute, t_compute), ms(t_start, t_compute),
-              n_splits, ggml_graph_n_nodes(active->graph));
-    }
-    call_count++;
-  }
 
   if (debug_ctx.fp) {
     fclose(debug_ctx.fp);
@@ -4866,8 +4901,6 @@ Error GgmlBackendInterface::execute(
     } else if (gt->type == GGML_TYPE_I64 && et_tensor.scalar_type() == executorch::aten::ScalarType::Long) {
       ggml_backend_tensor_get(gt, et_tensor.mutable_data_ptr(), 0, ggml_nbytes(gt));
     } else if (gt->type == GGML_TYPE_F32 && et_tensor.scalar_type() == executorch::aten::ScalarType::Long) {
-      // F32 graph output that ExecuTorch expects as Long (e.g. enc_len computed
-      // in F32 without a cast back to I64). Convert element-wise.
       std::vector<float> tmp(nelem);
       ggml_backend_tensor_get(gt, tmp.data(), 0, nelem * sizeof(float));
       int64_t* dst = static_cast<int64_t*>(et_tensor.mutable_data_ptr());
@@ -4878,6 +4911,39 @@ Error GgmlBackendInterface::execute(
       size_t copy_size = std::min(ggml_nbytes(gt), (size_t)et_tensor.nbytes());
       ggml_backend_tensor_get(gt, et_tensor.mutable_data_ptr(), 0, copy_size);
     }
+  }
+  auto t_output_copy = std::chrono::high_resolution_clock::now();
+
+  // --- Performance logging ---
+  {
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    static int call_count = 0;
+    bool perf = should_perf_log();
+    // GGML_PERF_LOG: first 5 calls + every 100th; legacy: calls 1-3
+    bool should_print = perf
+        ? (call_count < 5 || call_count % 100 == 0 || need_alloc)
+        : (call_count > 0 && call_count <= 3);
+    if (should_print) {
+      int n_splits = ggml_backend_sched_get_n_splits(active->sched);
+      if (perf) {
+        fprintf(stderr, "[perf] execute #%d: build=%.2fms alloc=%.2fms input=%.2fms compute=%.2fms output=%.2fms total=%.2fms | %s nodes=%d splits=%d\n",
+                call_count,
+                ms(t_start, t_build),
+                ms(t_pre_alloc, t_alloc),
+                ms(t_build, t_input_copy) - ms(t_pre_alloc, t_alloc),
+                ms(t_pre_compute, t_compute),
+                ms(t_compute, t_output_copy),
+                ms(t_start, t_output_copy),
+                need_alloc ? (need_build ? "MISS(build+alloc)" : "MISS(alloc)") : "HIT",
+                ggml_graph_n_nodes(active->graph), n_splits);
+      } else {
+        fprintf(stderr, "[timing] build=%.1fms alloc=%.1fms compute=%.1fms total=%.1fms splits=%d nodes=%d\n",
+                ms(t_start, t_build), ms(t_pre_alloc, t_alloc),
+                ms(t_pre_compute, t_compute), ms(t_start, t_compute),
+                n_splits, ggml_graph_n_nodes(active->graph));
+      }
+    }
+    call_count++;
   }
 
   return Error::Ok;
