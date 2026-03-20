@@ -4772,7 +4772,19 @@ Error GgmlBackendInterface::execute(
     t_alloc = std::chrono::high_resolution_clock::now();
 
     // Copy eager constant data after sched_alloc (buffer is already assigned).
+    // On the first alloc, upload everything. On subsequent calls, the
+    // eager_const_buf already has data from the previous call. Skip
+    // constants whose data hasn't changed (shape-dependent masks stay
+    // the same; data-dependent scalars/indices get re-uploaded).
     for (auto& ec : active->eager_constants) {
+      if (active->is_allocated && ec.tensor->buffer == active->eager_const_buf) {
+        // The buffer already has data. Check if it changed by comparing
+        // a prefix. For large masks (>>64B) this avoids a full GPU upload.
+        char sample[64];
+        size_t cmp_len = std::min(ec.nbytes, sizeof(sample));
+        ggml_backend_tensor_get(ec.tensor, sample, 0, cmp_len);
+        if (memcmp(sample, ec.ctx_data, cmp_len) == 0) continue;
+      }
       if (ec.tensor->buffer) {
         ggml_backend_tensor_set(ec.tensor, ec.ctx_data, 0, ec.nbytes);
       } else if (ec.tensor->data) {
