@@ -462,7 +462,7 @@ class TestRuntimeCorrectness:
         tests = [torch.randn(1, 64, l) for l in [64, 128, 256]]
         _export_load_and_run(model, trace, dyn, tests, atol=1e-2)
 
-    @pytest.mark.xfail(reason="LayerNorm with dynamic shapes has numerical drift on CUDA")
+    @pytest.mark.xfail(reason="LayerNorm with permute+dynamic shapes has large numerical drift on CUDA")
     def test_run_conformer_block_dynamic(self):
         """Mini conformer block: LayerNorm + Conv1d(stride=2) + SiLU."""
         class MiniConformer(nn.Module):

@@ -1045,14 +1045,16 @@ static bool should_perf_log() {
   return perf_log_mode != 0;
 }
 
-// Graph cache can be disabled for debugging: GGML_NO_GRAPH_CACHE=1
-static int graph_cache_disabled = -1;
+// Graph cache: skip build_graph for repeated shapes.
+// Enable with GGML_GRAPH_CACHE=1. Gives ~6x decode speedup but may cause
+// numerical drift on models with stateful operations (KV cache accumulation).
+static int graph_cache_enabled = -1;
 static bool is_graph_cache_disabled() {
-  if (graph_cache_disabled < 0) {
-    const char* env = std::getenv("GGML_NO_GRAPH_CACHE");
-    graph_cache_disabled = (env && std::string(env) != "0") ? 1 : 0;
+  if (graph_cache_enabled < 0) {
+    const char* env = std::getenv("GGML_GRAPH_CACHE");
+    graph_cache_enabled = (env && std::string(env) != "0") ? 1 : 0;
   }
-  return graph_cache_disabled != 0;
+  return graph_cache_enabled == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -4665,17 +4667,6 @@ Error GgmlBackendInterface::execute(
     Error err = build_graph(handle, active, ne_ptr, ne_count, &input_data_vec,
                             /*verbose=*/false);
     if (err != Error::Ok) return err;
-  } else {
-    // Graph cached: clear non-shared tensor data/buffer so the scheduler
-    // can re-allocate them fresh (same as build_graph Phase C step 2).
-    for (struct ggml_tensor* t = ggml_get_first_tensor(active->ctx);
-         t != nullptr;
-         t = ggml_get_next_tensor(active->ctx, t)) {
-      if (handle->const_buf && t->buffer == handle->const_buf) continue;
-      if (handle->mutable_buf && t->buffer == handle->mutable_buf) continue;
-      t->data   = nullptr;
-      t->buffer = nullptr;
-    }
   }
   auto t_build = std::chrono::high_resolution_clock::now();
   // Update counts after build (or use existing from cache).
@@ -4683,10 +4674,12 @@ Error GgmlBackendInterface::execute(
   n_outputs = active->outputs.size();
   n_non_output_args = args.size() >= n_outputs ? args.size() - n_outputs : 0;
 
-  // --- Scheduler reset + alloc (every call) ---
+  // --- Scheduler setup (only on MISS — first time for this shape) ---
+  // On HIT, the scheduler's is_alloc state persists from the previous call,
+  // so graph_compute goes straight to compute_splits with zero overhead.
   auto t_pre_alloc = t_build;
   auto t_alloc = t_build;
-  {
+  if (need_build) {
     if (!active->sched) {
       return Error::InvalidState;
     }
