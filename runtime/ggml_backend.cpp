@@ -1051,10 +1051,10 @@ static bool should_perf_log() {
 }
 
 // Graph cache: skip build_graph for repeated shapes.
-// Disabled by default — eager constants in build_graph depend on input
-// data (e.g. position-dependent I64 index computations for KV cache),
-// so reusing them produces wrong results. Enable with GGML_GRAPH_CACHE=1
-// only for models without data-dependent eager computations.
+// Disabled by default — build_graph computes 2 data-dependent F32 scalars
+// from input position that change each call. With zero-copy eager constants
+// and skip-unchanged uploads, build_graph is only ~2ms so the cache saves
+// little. Enable with GGML_GRAPH_CACHE=1 for stateless models.
 static int graph_cache_enabled = -1;
 static bool is_graph_cache_disabled() {
   if (graph_cache_enabled < 0) {
@@ -1238,7 +1238,10 @@ static struct ggml_tensor* try_eager_scalar_binop(
     struct ggml_context* ctx,
     struct ggml_tensor* a, struct ggml_tensor* b,
     char op_char, HostDataAccessor& acc) {
-  // Only for scalar f32 tensors where both have data available.
+  // Only for scalar f32 tensors where both have data available
+  // AND neither is marked as an input (input data is only valid at execute
+  // time, not at build time — eagerly computing from it would break graph
+  // reuse across calls with different input values).
   if (ggml_nelements(a) != 1 || ggml_nelements(b) != 1) return nullptr;
   if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) return nullptr;
   if (!a->data || !b->data) return nullptr;
@@ -4171,10 +4174,34 @@ static Error build_graph(
   auto t_bg_c2 = std::chrono::high_resolution_clock::now();
   {
     size_t ec_total_bytes = 0;
-    for (auto& ec : eager_constants) ec_total_bytes += ec.nbytes;
+    size_t ec_i64_count = 0, ec_i32_count = 0, ec_f16_count = 0, ec_f32_count = 0, ec_other = 0;
+    for (auto& ec : eager_constants) {
+      ec_total_bytes += ec.nbytes;
+      switch (ec.tensor->type) {
+        case GGML_TYPE_I64: ec_i64_count++; break;
+        case GGML_TYPE_I32: ec_i32_count++; break;
+        case GGML_TYPE_F16: ec_f16_count++; break;
+        case GGML_TYPE_F32: ec_f32_count++; break;
+        default: ec_other++; break;
+      }
+    }
     if (should_perf_log()) {
-      fprintf(stderr, "[perf] eager_constants: count=%zu total_bytes=%zu\n",
-              eager_constants.size(), ec_total_bytes);
+      size_t ec_large = 0, ec_large_bytes = 0;
+      for (auto& ec : eager_constants) {
+        if (ec.nbytes > 1024) {
+          ec_large++; ec_large_bytes += ec.nbytes;
+          if (ec_large <= 3) {
+            fprintf(stderr, "[perf]   large eager: ne=[%lld,%lld,%lld,%lld] type=%d bytes=%zu\n",
+                    (long long)ec.tensor->ne[0], (long long)ec.tensor->ne[1],
+                    (long long)ec.tensor->ne[2], (long long)ec.tensor->ne[3],
+                    (int)ec.tensor->type, ec.nbytes);
+          }
+        }
+      }
+      fprintf(stderr, "[perf] eager_constants: count=%zu bytes=%zu (I64=%zu I32=%zu F16=%zu F32=%zu) large(>1KB)=%zu large_bytes=%zu\n",
+              eager_constants.size(), ec_total_bytes,
+              ec_i64_count, ec_i32_count, ec_f16_count, ec_f32_count,
+              ec_large, ec_large_bytes);
     }
   }
   // 2. Clear data/buffer on non-shared tensors so scheduler can allocate them.
@@ -4776,19 +4803,30 @@ Error GgmlBackendInterface::execute(
     // eager_const_buf already has data from the previous call. Skip
     // constants whose data hasn't changed (shape-dependent masks stay
     // the same; data-dependent scalars/indices get re-uploaded).
-    for (auto& ec : active->eager_constants) {
-      if (active->is_allocated && ec.tensor->buffer == active->eager_const_buf) {
-        // The buffer already has data. Check if it changed by comparing
-        // a prefix. For large masks (>>64B) this avoids a full GPU upload.
-        char sample[64];
-        size_t cmp_len = std::min(ec.nbytes, sizeof(sample));
-        ggml_backend_tensor_get(ec.tensor, sample, 0, cmp_len);
-        if (memcmp(sample, ec.ctx_data, cmp_len) == 0) continue;
+    {
+      int ec_skipped = 0, ec_uploaded = 0;
+      size_t ec_uploaded_bytes = 0;
+      for (auto& ec : active->eager_constants) {
+        if (active->is_allocated && ec.tensor->buffer == active->eager_const_buf
+            && ec.nbytes > 64) {
+          // Large constant: check 64-byte prefix to skip if unchanged.
+          // Small constants (<= 64B) always re-uploaded — they may be
+          // input-derived and the upload cost is negligible.
+          char sample[64];
+          ggml_backend_tensor_get(ec.tensor, sample, 0, 64);
+          if (memcmp(sample, ec.ctx_data, 64) == 0) { ec_skipped++; continue; }
+        }
+        if (ec.tensor->buffer) {
+          ggml_backend_tensor_set(ec.tensor, ec.ctx_data, 0, ec.nbytes);
+        } else if (ec.tensor->data) {
+          memcpy(ec.tensor->data, ec.ctx_data, ec.nbytes);
+        }
+        ec_uploaded++;
+        ec_uploaded_bytes += ec.nbytes;
       }
-      if (ec.tensor->buffer) {
-        ggml_backend_tensor_set(ec.tensor, ec.ctx_data, 0, ec.nbytes);
-      } else if (ec.tensor->data) {
-        memcpy(ec.tensor->data, ec.ctx_data, ec.nbytes);
+      if (should_perf_log()) {
+        fprintf(stderr, "[perf] eager upload: skipped=%d uploaded=%d (%zu bytes)\n",
+                ec_skipped, ec_uploaded, ec_uploaded_bytes);
       }
     }
 
