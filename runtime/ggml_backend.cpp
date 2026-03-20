@@ -1047,14 +1047,17 @@ static bool should_perf_log() {
 }
 
 // Graph cache: skip build_graph for repeated shapes.
-// Disable with GGML_NO_GRAPH_CACHE=1 for debugging.
-static int graph_cache_disabled = -1;
+// Disabled by default — eager constants in build_graph depend on input
+// data (e.g. position-dependent I64 index computations for KV cache),
+// so reusing them produces wrong results. Enable with GGML_GRAPH_CACHE=1
+// only for models without data-dependent eager computations.
+static int graph_cache_enabled = -1;
 static bool is_graph_cache_disabled() {
-  if (graph_cache_disabled < 0) {
-    const char* env = std::getenv("GGML_NO_GRAPH_CACHE");
-    graph_cache_disabled = (env && std::string(env) != "0") ? 1 : 0;
+  if (graph_cache_enabled < 0) {
+    const char* env = std::getenv("GGML_GRAPH_CACHE");
+    graph_cache_enabled = (env && std::string(env) != "0") ? 1 : 0;
   }
-  return graph_cache_disabled != 0;
+  return graph_cache_enabled == 0;
 }
 
 // ---------------------------------------------------------------------------
