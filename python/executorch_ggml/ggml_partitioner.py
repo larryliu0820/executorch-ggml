@@ -330,7 +330,10 @@ class GgmlPartitioner(Partitioner):
         in to_edge_transform_and_lower (avoids the EDGE_DO_NOT_DECOMP path
         which re-decomposes SDPA in a second pass).
         """
-        ops = [torch.ops.aten.scaled_dot_product_attention.default]
+        ops = [
+            torch.ops.aten.scaled_dot_product_attention.default,
+            torch.ops.aten.rms_norm.default,
+        ]
         try:
             ops.append(torch.ops.ggml.rope.default)
         except AttributeError:
