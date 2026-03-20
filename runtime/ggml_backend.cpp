@@ -1046,8 +1046,8 @@ static bool should_perf_log() {
 }
 
 // Graph cache: skip build_graph for repeated shapes.
-// Enable with GGML_GRAPH_CACHE=1. Gives ~6x decode speedup but may cause
-// numerical drift on models with stateful operations (KV cache accumulation).
+// Currently disabled by default on CUDA due to gallocr re-allocation issues.
+// Enable with GGML_GRAPH_CACHE=1 (works on CPU, experimental on CUDA).
 static int graph_cache_enabled = -1;
 static bool is_graph_cache_disabled() {
   if (graph_cache_enabled < 0) {
@@ -4674,11 +4674,16 @@ Error GgmlBackendInterface::execute(
   n_outputs = active->outputs.size();
   n_non_output_args = args.size() >= n_outputs ? args.size() - n_outputs : 0;
 
-  // --- Scheduler setup (only on MISS — first time for this shape) ---
-  // On HIT, the scheduler's is_alloc state persists from the previous call,
-  // so graph_compute goes straight to compute_splits with zero overhead.
+  // --- Scheduler setup ---
+  // On MISS: full build_graph already cleared tensor data, so we do
+  // reset + restore + alloc as before.
+  // On HIT: just reset the scheduler so graph_compute will auto-alloc.
+  // The scheduler's split_graph + gallocr handles pre-allocated tensors
+  // (shared leaves, eager constants keep their buffer assignments).
   auto t_pre_alloc = t_build;
   auto t_alloc = t_build;
+  // (Graph cache HIT path is a no-op here — build_graph was skipped,
+  // so the alloc block below handles the full reset+alloc cycle.)
   if (need_build) {
     if (!active->sched) {
       return Error::InvalidState;
