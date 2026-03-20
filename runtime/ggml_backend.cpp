@@ -942,10 +942,13 @@ struct SavedConstant {
 // shape configuration (e.g. decode T_q=1, prefill T_q=N).
 // Eager constant: a leaf tensor with data computed during build_graph
 // (e.g. bool masks, scalar constants) that doesn't live in const_buf/mutable_buf.
-// Must be saved before scheduler allocation and restored after.
+// The data lives in the ggml context pool (allocated inline with no_alloc=false).
+// We save the source pointer so we can restore it after scheduler allocation
+// reassigns tensor data/buffer pointers.
 struct EagerConstant {
   struct ggml_tensor* tensor;
-  std::vector<uint8_t> data;
+  const void* ctx_data;  // pointer into ggml context pool (valid until ggml_free)
+  size_t nbytes;
 };
 
 // Maps a ggml_tensor* to its shared buffer assignment.
@@ -976,6 +979,7 @@ struct GraphInstance {
   std::vector<SharedLeaf> shared_leaves;  // leaf tensors in const_buf / mutable_buf
   std::vector<struct ggml_tensor*> cpu_pinned;  // tensors pinned to CPU backend
   ggml_backend_buffer_t eager_const_buf = nullptr;  // separate buffer for eager constants
+  ggml_backend_buffer_t host_buf = nullptr;  // temporary CPU buffer for leaf data (kept alive for eager const ctx_data)
   bool is_allocated = false;  // true after first successful sched_alloc
 };
 
@@ -1353,6 +1357,7 @@ static Error build_graph(
   gi->deferred_i64_to_i32.clear();
 
   // --- Parse IR from the saved copy ---
+  auto t_bg_start = std::chrono::high_resolution_clock::now();
   const auto* fb_graph = ggml_ir::GetGgmlGraph(handle->ir_copy.data());
   if (!fb_graph || !fb_graph->tensors()) {
     return Error::InvalidArgument;
@@ -1457,6 +1462,7 @@ static Error build_graph(
   if (!ctx) {
     return Error::MemoryAllocationFailed;
   }
+  auto t_bg_phaseA = std::chrono::high_resolution_clock::now();
 
   // --- Create per-graph scheduler (first build only) ---
   // Preserved across rebuilds for gallocr buffer reuse. Only created once
@@ -4082,6 +4088,7 @@ static Error build_graph(
       output_pairs.emplace_back(out_idx >= 0 ? out_idx : (int)output_pairs.size(), gt);
     }
   }
+  auto t_bg_phaseB = std::chrono::high_resolution_clock::now();
   if (verbose) { fprintf(stderr, "[ggml_backend] Phase B complete, last_processed=%d/%d\n", last_processed, n_tensors); fflush(stderr); }
 
   // Sort outputs by output_index (stored in input_index field for outputs)
@@ -4098,11 +4105,12 @@ static Error build_graph(
   }
 
   // === Build compute graph ===
-  // Build compute graph using the same estimated size from above.
+  auto t_bg_graph_start = std::chrono::high_resolution_clock::now();
   struct ggml_cgraph* graph = ggml_new_graph_custom(ctx, est_graph_size, false);
   for (auto* out : output_tensors) {
     ggml_build_forward_expand(graph, out);
   }
+  auto t_bg_graph_end = std::chrono::high_resolution_clock::now();
   if (verbose) fprintf(stderr, "[ggml_backend] graph built: %d nodes, %d leafs (max %zu)\n",
           ggml_graph_n_nodes(graph), (int)0, est_graph_size);
   // Sort inputs by input_index
@@ -4131,6 +4139,7 @@ static Error build_graph(
   }
 
   // === Phase C: prepare graph for scheduler allocation ===
+  auto t_bg_c1 = std::chrono::high_resolution_clock::now();
   // Leaf tensors with data_key already have data/buffer pointers set from
   // const_buf/mutable_buf and are marked as inputs so the scheduler skips them.
 
@@ -4156,12 +4165,18 @@ static Error build_graph(
     if (deferred_dst_set.count(gt)) continue;
     if (gt->op != GGML_OP_NONE) continue;
     ggml_set_input(gt);  // prevent scheduler from reusing this memory
-    size_t nbytes = ggml_nbytes(gt);
-    eager_constants.push_back({gt, std::vector<uint8_t>(
-        static_cast<uint8_t*>(gt->data),
-        static_cast<uint8_t*>(gt->data) + nbytes)});
+    eager_constants.push_back({gt, gt->data, ggml_nbytes(gt)});
   }
 
+  auto t_bg_c2 = std::chrono::high_resolution_clock::now();
+  {
+    size_t ec_total_bytes = 0;
+    for (auto& ec : eager_constants) ec_total_bytes += ec.nbytes;
+    if (should_perf_log()) {
+      fprintf(stderr, "[perf] eager_constants: count=%zu total_bytes=%zu\n",
+              eager_constants.size(), ec_total_bytes);
+    }
+  }
   // 2. Clear data/buffer on non-shared tensors so scheduler can allocate them.
   for (struct ggml_tensor* t = ggml_get_first_tensor(ctx);
        t != nullptr;
@@ -4183,11 +4198,17 @@ static Error build_graph(
     ggml_set_output(out);
   }
 
-  // 4. Free the temporary CPU host buffer.
-  if (host_buf) {
-    ggml_backend_buffer_free(host_buf);
-    host_buf = nullptr;
+  auto t_bg_c4 = std::chrono::high_resolution_clock::now();
+  // 4. Transfer host_buf ownership to GraphInstance — kept alive so that
+  //    eager constant ctx_data pointers (which may point into host_buf)
+  //    remain valid until execute() copies them to the GPU buffer.
+  if (gi->host_buf) {
+    ggml_backend_buffer_free(gi->host_buf);
   }
+  gi->host_buf = host_buf;
+  host_buf = nullptr;  // prevent RAII guard from freeing it
+
+  auto t_bg_phaseC = std::chrono::high_resolution_clock::now();
 
   // === Update graph instance ===
   gi->ctx = ctx;
@@ -4198,6 +4219,17 @@ static Error build_graph(
   gi->eager_constants = std::move(eager_constants);
   gi->shared_leaves = std::move(shared_leaves);
   gi->cpu_pinned = std::move(cpu_pinned);
+
+  if (should_perf_log()) {
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    fprintf(stderr, "[perf] build_graph: phaseA=%.2fms phaseB=%.2fms graph_expand=%.2fms phaseC=%.2fms total=%.2fms tensors=%d nodes=%d\n",
+            ms(t_bg_start, t_bg_phaseA), ms(t_bg_phaseA, t_bg_phaseB),
+            ms(t_bg_graph_start, t_bg_graph_end),
+            ms(t_bg_graph_end, t_bg_phaseC), ms(t_bg_start, t_bg_phaseC), n_tensors,
+            ggml_graph_n_nodes(graph));
+    fprintf(stderr, "[perf] build_graph phaseC detail: eager_collect=%.2fms clear=%.2fms mark+free=%.2fms\n",
+            ms(t_bg_c1, t_bg_c2), ms(t_bg_c2, t_bg_c4), ms(t_bg_c4, t_bg_phaseC));
+  }
 
   return Error::Ok;
 }
@@ -4285,6 +4317,10 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       if (gi && gi->eager_const_buf) {
         ggml_backend_buffer_free(gi->eager_const_buf);
         gi->eager_const_buf = nullptr;
+      }
+      if (gi && gi->host_buf) {
+        ggml_backend_buffer_free(gi->host_buf);
+        gi->host_buf = nullptr;
       }
       if (gi && gi->sched) {
         ggml_backend_sched_free(gi->sched);
@@ -4711,7 +4747,7 @@ Error GgmlBackendInterface::execute(
       const size_t alignment = 64;
       size_t total = 0;
       for (auto& ec : active->eager_constants) {
-        total += ((ec.data.size() + alignment - 1) / alignment) * alignment;
+        total += ((ec.nbytes + alignment - 1) / alignment) * alignment;
       }
       if (!active->eager_const_buf) {
         active->eager_const_buf = ggml_backend_alloc_buffer(handle->backend, total);
@@ -4720,7 +4756,7 @@ Error GgmlBackendInterface::execute(
         char* base = static_cast<char*>(ggml_backend_buffer_get_base(active->eager_const_buf));
         size_t offset = 0;
         for (auto& ec : active->eager_constants) {
-          size_t nbytes = ec.data.size();
+          size_t nbytes = ec.nbytes;
           ec.tensor->data = base + offset;
           ec.tensor->buffer = active->eager_const_buf;
           offset += ((nbytes + alignment - 1) / alignment) * alignment;
@@ -4738,9 +4774,9 @@ Error GgmlBackendInterface::execute(
     // Copy eager constant data after sched_alloc (buffer is already assigned).
     for (auto& ec : active->eager_constants) {
       if (ec.tensor->buffer) {
-        ggml_backend_tensor_set(ec.tensor, ec.data.data(), 0, ec.data.size());
+        ggml_backend_tensor_set(ec.tensor, ec.ctx_data, 0, ec.nbytes);
       } else if (ec.tensor->data) {
-        memcpy(ec.tensor->data, ec.data.data(), ec.data.size());
+        memcpy(ec.tensor->data, ec.ctx_data, ec.nbytes);
       }
     }
 
@@ -4964,6 +5000,9 @@ void GgmlBackendInterface::destroy(DelegateHandle* handle_raw) const {
     for (auto& [k, gi] : handle->graph_cache) {
       if (gi && gi->eager_const_buf) {
         ggml_backend_buffer_free(gi->eager_const_buf);
+      }
+      if (gi && gi->host_buf) {
+        ggml_backend_buffer_free(gi->host_buf);
       }
       if (gi && gi->sched) {
         ggml_backend_sched_free(gi->sched);
