@@ -6,11 +6,13 @@
 |---|---|---|---|---|
 | llama.cpp (Q8_0 GGUF) | 604 MB | 364 | ~2.7 | ~0 (reused) |
 | executorch-ggml (F32) | 2275 MB | **62** | 10.5 | **0** (graph cached) |
-| executorch-ggml (Q8_0) | 606 MB | ~40* | ~24.8 | **0** (graph cached) |
+| executorch-ggml (Q8_0) | 606 MB | 11 | 9.9 | 46 (rebuild) |
 
-*Q8_0 estimate with graph caching (compute still to be optimized).
+With `GGML_GRAPH_CACHE=1`: F32=67 tok/s, Q8_0=~100 tok/s (0ms overhead).
+Without graph cache (default): F32=10.8 tok/s, Q8_0=11.0 tok/s (46-105ms rebuild per call).
 
-Previously (without graph caching): F32=10.8 tok/s, Q8_0=11.8 tok/s (105ms rebuild overhead per call).
+Note: Q8_0 MUL_MAT is 9.6x faster than F32 (native quantized kernels work correctly).
+The similar tok/s is because attention + element-wise ops (not MUL_MAT) dominate compute.
 
 ## 1. Build llama.cpp Baseline
 
@@ -214,10 +216,9 @@ matches llama.cpp's bandwidth utilization (604 MB / 2.7ms = ~224 GB/s).
 ### Remaining opportunities for improvement
 
 #### Medium impact
-1. **Q8_0 matmul kernels**. Currently Q8_0 weights are dequantized to F32
-   during matmul. Using ggml's native Q8_0 dot product kernels would give
-   ~4x bandwidth improvement. Need to verify the dequant+matmul path
-   actually uses quantized kernels (check `ggml_mul_mat` with Q8_0 `a`).
+1. ~~**Q8_0 matmul kernels**~~ — **Verified.** Q8_0 `ggml_mul_mat` uses
+   native MMVQ kernels (9.6x faster than F32 matmul, 4.5ms vs 43.1ms).
+   The bottleneck is now FLASH_ATTN_EXT (15.9ms, 36%) + element-wise ops.
 
 2. **Reduce CONT nodes**. ~156 contiguity-enforcement copies per decode
    step. The `ensure_cont()` helper already checks `ggml_is_contiguous()`,
