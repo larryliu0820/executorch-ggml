@@ -976,6 +976,7 @@ struct GraphInstance {
   std::vector<SharedLeaf> shared_leaves;  // leaf tensors in const_buf / mutable_buf
   std::vector<struct ggml_tensor*> cpu_pinned;  // tensors pinned to CPU backend
   ggml_backend_buffer_t eager_const_buf = nullptr;  // separate buffer for eager constants
+  bool is_allocated = false;  // true after first successful sched_alloc
 };
 
 // ---------------------------------------------------------------------------
@@ -1046,15 +1047,14 @@ static bool should_perf_log() {
 }
 
 // Graph cache: skip build_graph for repeated shapes.
-// Currently disabled by default on CUDA due to gallocr re-allocation issues.
-// Enable with GGML_GRAPH_CACHE=1 (works on CPU, experimental on CUDA).
-static int graph_cache_enabled = -1;
+// Disable with GGML_NO_GRAPH_CACHE=1 for debugging.
+static int graph_cache_disabled = -1;
 static bool is_graph_cache_disabled() {
-  if (graph_cache_enabled < 0) {
-    const char* env = std::getenv("GGML_GRAPH_CACHE");
-    graph_cache_enabled = (env && std::string(env) != "0") ? 1 : 0;
+  if (graph_cache_disabled < 0) {
+    const char* env = std::getenv("GGML_NO_GRAPH_CACHE");
+    graph_cache_disabled = (env && std::string(env) != "0") ? 1 : 0;
   }
-  return graph_cache_enabled == 0;
+  return graph_cache_disabled != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -4675,16 +4675,14 @@ Error GgmlBackendInterface::execute(
   n_non_output_args = args.size() >= n_outputs ? args.size() - n_outputs : 0;
 
   // --- Scheduler setup ---
-  // On MISS: full build_graph already cleared tensor data, so we do
-  // reset + restore + alloc as before.
-  // On HIT: just reset the scheduler so graph_compute will auto-alloc.
-  // The scheduler's split_graph + gallocr handles pre-allocated tensors
-  // (shared leaves, eager constants keep their buffer assignments).
+  // MISS path: build_graph cleared tensor data → full reset + restore + alloc.
+  // HIT (first time): scheduler not yet allocated → same full cycle.
+  // HIT (subsequent): scheduler already allocated, tensor buffers valid from
+  //   previous alloc → skip everything (like llama.cpp's graph reuse path).
   auto t_pre_alloc = t_build;
   auto t_alloc = t_build;
-  // (Graph cache HIT path is a no-op here — build_graph was skipped,
-  // so the alloc block below handles the full reset+alloc cycle.)
-  if (need_build) {
+  bool need_alloc = need_build || !active->is_allocated;
+  if (need_alloc) {
     if (!active->sched) {
       return Error::InvalidState;
     }
@@ -4742,6 +4740,8 @@ Error GgmlBackendInterface::execute(
         memcpy(ec.tensor->data, ec.data.data(), ec.data.size());
       }
     }
+
+    active->is_allocated = true;
   }
 
   // --- Copy input data from ExecuTorch tensors → backend tensors ---
@@ -4926,7 +4926,7 @@ Error GgmlBackendInterface::execute(
     bool perf = should_perf_log();
     // GGML_PERF_LOG: first 5 calls + every 100th; legacy: calls 1-3
     bool should_print = perf
-        ? (call_count < 5 || call_count % 100 == 0 || need_build)
+        ? (call_count < 5 || call_count % 100 == 0 || need_alloc)
         : (call_count > 0 && call_count <= 3);
     if (should_print) {
       int n_splits = ggml_backend_sched_get_n_splits(active->sched);
@@ -4939,7 +4939,7 @@ Error GgmlBackendInterface::execute(
                 ms(t_pre_compute, t_compute),
                 ms(t_compute, t_output_copy),
                 ms(t_start, t_output_copy),
-                need_build ? "MISS(build)" : "HIT",
+                need_alloc ? (need_build ? "MISS(build+alloc)" : "MISS(alloc)") : "HIT",
                 ggml_graph_n_nodes(active->graph), n_splits);
       } else {
         fprintf(stderr, "[timing] build=%.1fms alloc=%.1fms compute=%.1fms total=%.1fms splits=%d nodes=%d\n",
