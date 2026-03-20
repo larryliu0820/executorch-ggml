@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
-"""Test: GGML encoder + eager decoder."""
+"""Test: GGML encoder + eager decoder.
+
+Requires NeMo model weights and parakeet_ggml/model.pte.
+Run directly: python tests/test_eager_decoder.py
+"""
 import os, sys
+import pytest
 import torch
 import numpy as np
 
 _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_model_path = os.path.join(_repo_root, "parakeet_ggml", "model.pte")
+
+if not os.path.exists(_model_path):
+    pytest.skip(f"Model not found: {_model_path}", allow_module_level=True)
+
 sys.path.insert(0, _repo_root)
 _parakeet_pkg = "executorch.examples.models.parakeet.quantize"
 if _parakeet_pkg not in sys.modules:

@@ -976,7 +976,6 @@ struct GraphInstance {
   std::vector<SharedLeaf> shared_leaves;  // leaf tensors in const_buf / mutable_buf
   std::vector<struct ggml_tensor*> cpu_pinned;  // tensors pinned to CPU backend
   ggml_backend_buffer_t eager_const_buf = nullptr;  // separate buffer for eager constants
-  bool is_allocated = false;  // true after first successful sched_alloc + compute
 };
 
 // ---------------------------------------------------------------------------
@@ -4658,7 +4657,6 @@ Error GgmlBackendInterface::execute(
   auto t_start = std::chrono::high_resolution_clock::now();
   bool no_cache = is_graph_cache_disabled();
   bool need_build = (active->ctx == nullptr) || no_cache;
-  bool need_alloc = need_build || !active->is_allocated;
 
   if (need_build) {
     // First time for this shape: full IR parse + tensor creation.
@@ -4667,6 +4665,17 @@ Error GgmlBackendInterface::execute(
     Error err = build_graph(handle, active, ne_ptr, ne_count, &input_data_vec,
                             /*verbose=*/false);
     if (err != Error::Ok) return err;
+  } else {
+    // Graph cached: clear non-shared tensor data/buffer so the scheduler
+    // can re-allocate them fresh (same as build_graph Phase C step 2).
+    for (struct ggml_tensor* t = ggml_get_first_tensor(active->ctx);
+         t != nullptr;
+         t = ggml_get_next_tensor(active->ctx, t)) {
+      if (handle->const_buf && t->buffer == handle->const_buf) continue;
+      if (handle->mutable_buf && t->buffer == handle->mutable_buf) continue;
+      t->data   = nullptr;
+      t->buffer = nullptr;
+    }
   }
   auto t_build = std::chrono::high_resolution_clock::now();
   // Update counts after build (or use existing from cache).
@@ -4674,10 +4683,10 @@ Error GgmlBackendInterface::execute(
   n_outputs = active->outputs.size();
   n_non_output_args = args.size() >= n_outputs ? args.size() - n_outputs : 0;
 
-  // --- Scheduler setup (only on first alloc for this graph shape) ---
+  // --- Scheduler reset + alloc (every call) ---
   auto t_pre_alloc = t_build;
   auto t_alloc = t_build;
-  if (need_alloc) {
+  {
     if (!active->sched) {
       return Error::InvalidState;
     }
@@ -4735,8 +4744,6 @@ Error GgmlBackendInterface::execute(
         memcpy(ec.tensor->data, ec.data.data(), ec.data.size());
       }
     }
-
-    active->is_allocated = true;
   }
 
   // --- Copy input data from ExecuTorch tensors → backend tensors ---
@@ -4921,7 +4928,7 @@ Error GgmlBackendInterface::execute(
     bool perf = should_perf_log();
     // GGML_PERF_LOG: first 5 calls + every 100th; legacy: calls 1-3
     bool should_print = perf
-        ? (call_count < 5 || call_count % 100 == 0 || need_alloc)
+        ? (call_count < 5 || call_count % 100 == 0 || need_build)
         : (call_count > 0 && call_count <= 3);
     if (should_print) {
       int n_splits = ggml_backend_sched_get_n_splits(active->sched);
@@ -4934,7 +4941,7 @@ Error GgmlBackendInterface::execute(
                 ms(t_pre_compute, t_compute),
                 ms(t_compute, t_output_copy),
                 ms(t_start, t_output_copy),
-                need_alloc ? (need_build ? "MISS(build+alloc)" : "MISS(alloc)") : "HIT",
+                need_build ? "MISS(build)" : "HIT",
                 ggml_graph_n_nodes(active->graph), n_splits);
       } else {
         fprintf(stderr, "[timing] build=%.1fms alloc=%.1fms compute=%.1fms total=%.1fms splits=%d nodes=%d\n",

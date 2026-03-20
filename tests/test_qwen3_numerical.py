@@ -128,7 +128,12 @@ class TestQwen3WithSDPAPreservation:
         )
         print(f"Delegated calls: {delegate_count}")
 
-        et_module = edge_mgr.to_executorch()
+        from executorch.exir import ExecutorchBackendConfig
+        from executorch.exir.passes import MemoryPlanningPass
+        et_module = edge_mgr.to_executorch(config=ExecutorchBackendConfig(
+            extract_delegate_segments=True,
+            memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False),
+        ))
         print(f"Serialized .pte size: {len(et_module.buffer)} bytes")
 
         pte_model = _load_for_executorch_from_buffer(et_module.buffer)
