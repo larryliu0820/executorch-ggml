@@ -851,6 +851,7 @@ struct ggml_tensor* eager_cast_i64_to_i32(
   struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_I32, GGML_MAX_DIMS, src->ne);
   ggml_set_no_alloc(ctx, true);
   dst->op = GGML_OP_NONE;
+  dst->flags = src->flags;  // propagate INPUT flag
   if (src->data && dst->data) {
     const size_t n = ggml_nelements(src);
     const int64_t* s = acc ? static_cast<const int64_t*>(acc->get(src))
@@ -869,6 +870,7 @@ struct ggml_tensor* eager_cast_i32_to_i64(
   struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_I64, GGML_MAX_DIMS, src->ne);
   ggml_set_no_alloc(ctx, true);
   dst->op = GGML_OP_NONE;
+  dst->flags = src->flags;  // propagate INPUT flag
   if (src->data && dst->data) {
     const size_t n = ggml_nelements(src);
     const int32_t* s = acc ? static_cast<const int32_t*>(acc->get(src))
@@ -912,8 +914,10 @@ struct ggml_tensor* safe_ggml_cast(
     return i32;
   }
   // Eager scalar cast for I32→F32 (enc_len computation chains).
+  // Skip if the source is input-derived — must stay as a graph op for reuse.
   if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_F32 &&
-      ggml_nelements(src) == 1 && src->data) {
+      ggml_nelements(src) == 1 && src->data &&
+      !(src->flags & GGML_TENSOR_FLAG_INPUT)) {
     int32_t ival = acc ? acc->read_i32(src) : *(const int32_t*)src->data;
     ggml_set_no_alloc(ctx, false);
     struct ggml_tensor* dst = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1);
@@ -1051,10 +1055,10 @@ static bool should_perf_log() {
 }
 
 // Graph cache: skip build_graph for repeated shapes.
-// Disabled by default — build_graph computes 2 data-dependent F32 scalars
-// from input position that change each call. With zero-copy eager constants
-// and skip-unchanged uploads, build_graph is only ~2ms so the cache saves
-// little. Enable with GGML_GRAPH_CACHE=1 for stateless models.
+// Disabled by default — build_graph has data-dependent eager constants
+// that must be recomputed each call. With zero-copy eager constants,
+// build_graph is ~2ms which is acceptable overhead.
+// Enable with GGML_GRAPH_CACHE=1 for stateless models only.
 static int graph_cache_enabled = -1;
 static bool is_graph_cache_disabled() {
   if (graph_cache_enabled < 0) {
@@ -1245,6 +1249,10 @@ static struct ggml_tensor* try_eager_scalar_binop(
   if (ggml_nelements(a) != 1 || ggml_nelements(b) != 1) return nullptr;
   if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) return nullptr;
   if (!a->data || !b->data) return nullptr;
+  // Don't eagerly compute if either operand derives from runtime input data.
+  // Input tensors are marked with GGML_TENSOR_FLAG_INPUT during pre-population.
+  // Scalars derived from inputs (via cast chains) inherit the flag.
+  if ((a->flags & GGML_TENSOR_FLAG_INPUT) || (b->flags & GGML_TENSOR_FLAG_INPUT)) return nullptr;
   float va = acc.read_f32(a);
   float vb = acc.read_f32(b);
   float result;
@@ -1651,6 +1659,7 @@ static Error build_graph(
       }
 
       if (t->is_input()) {
+        ggml_set_input(gt);  // Mark as input early so try_eager_scalar_binop skips it
         input_pairs.emplace_back(t->input_index(), gt);
       }
       if (t->is_output()) {
@@ -1978,6 +1987,7 @@ static Error build_graph(
                 }
               }
             }
+            gt->flags = a->flags | b->flags;  // propagate INPUT flag
             break;
           }
           // Non-constant I64: cast to F32 and use ggml_add.
@@ -3176,6 +3186,7 @@ static Error build_graph(
                 }
               }
             }
+            gt->flags = a->flags | b->flags;  // propagate INPUT flag
           } else {
             // Non-constant I64: cast to F32 and use ggml_sub.
             if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
