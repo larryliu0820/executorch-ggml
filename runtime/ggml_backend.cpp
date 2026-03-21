@@ -891,9 +891,12 @@ struct ggml_tensor* safe_ggml_cast(
     HostDataAccessor* acc = nullptr) {
   if (src->type == target) return src;
   // I64 source: eager CPU conversion
-  if (src->type == GGML_TYPE_I64 && target == GGML_TYPE_I32) return eager_cast_i64_to_i32(ctx, src, acc);
+  if (src->type == GGML_TYPE_I64 && target == GGML_TYPE_I32) {
+    auto* r = eager_cast_i64_to_i32(ctx, src, acc);
+    return r;
+  }
   if (src->type == GGML_TYPE_I64) {
-    // I64 → F32 eager, then F32 → target via ggml_cast
+    // I64 → I32 eager, then I32 → target via native ggml_cast
     auto* i32 = eager_cast_i64_to_i32(ctx, src, acc);
     return (target == GGML_TYPE_F32) ? safe_ggml_cast(ctx, i32, GGML_TYPE_F32, acc)
                                      : safe_ggml_cast(ctx, safe_ggml_cast(ctx, i32, GGML_TYPE_F32, acc), target, acc);
@@ -1249,10 +1252,6 @@ static struct ggml_tensor* try_eager_scalar_binop(
   if (ggml_nelements(a) != 1 || ggml_nelements(b) != 1) return nullptr;
   if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) return nullptr;
   if (!a->data || !b->data) return nullptr;
-  // Don't eagerly compute if either operand derives from runtime input data.
-  // Input tensors are marked with GGML_TENSOR_FLAG_INPUT during pre-population.
-  // Scalars derived from inputs (via cast chains) inherit the flag.
-  if ((a->flags & GGML_TENSOR_FLAG_INPUT) || (b->flags & GGML_TENSOR_FLAG_INPUT)) return nullptr;
   float va = acc.read_f32(a);
   float vb = acc.read_f32(b);
   float result;
@@ -2032,12 +2031,15 @@ static Error build_graph(
             break;
           }
           // ggml_scale is a single op for scalar * tensor (avoids REPEAT).
-          // ggml_scale requires padded input — ggml_cont ensures this.
-          if (ggml_nelements(b) == 1 && b->data && b->type == GGML_TYPE_F32) {
+          // Skip for input-derived scalars — ggml_scale bakes the value into
+          // op_params which blocks graph reuse. Use ggml_mul instead.
+          if (ggml_nelements(b) == 1 && b->data && b->type == GGML_TYPE_F32
+              && !(b->flags & GGML_TENSOR_FLAG_INPUT)) {
             gt = ggml_scale(ctx, ggml_cont(ctx, a), host_acc.read_f32(b));
             break;
           }
-          if (ggml_nelements(a) == 1 && a->data && a->type == GGML_TYPE_F32) {
+          if (ggml_nelements(a) == 1 && a->data && a->type == GGML_TYPE_F32
+              && !(a->flags & GGML_TENSOR_FLAG_INPUT)) {
             gt = ggml_scale(ctx, ggml_cont(ctx, b), host_acc.read_f32(a));
             break;
           }
@@ -2996,9 +2998,9 @@ static Error build_graph(
           }
 
           // Eager scalar cast: compute immediately when source has data.
-          // This is needed for enc_len computation chains where F32→I64
-          // casts produce the final output scalar.
-          if (ggml_nelements(src) == 1 && src->data) {
+          // Skip for input-derived scalars — must stay as graph op for reuse.
+          if (ggml_nelements(src) == 1 && src->data
+              && !(src->flags & GGML_TENSOR_FLAG_INPUT)) {
             const void* src_host = host_acc.get(src);
             ggml_set_no_alloc(ctx, false);
             gt = ggml_new_tensor_4d(ctx, target_type, 1, 1, 1, 1);
@@ -3012,6 +3014,16 @@ static Error build_graph(
           // ggml CPU doesn't support GGML_OP_CPY from I64 to any other type,
           // so I64-source casts must be done eagerly on the CPU.
           if (src->type == GGML_TYPE_I64) {
+            // For I64 scalars targeting F32, always use the graph op path
+            // via safe_ggml_cast (I64→I32 eager + I32→F32 graph op).
+            // This ensures the F32 value is computed at runtime from the I32
+            // data, enabling graph reuse + CUDA graphs. Without this, the
+            // F32 value gets baked in as an eager constant that blocks reuse.
+            if (target_type == GGML_TYPE_F32 && ggml_nelements(src) == 1) {
+              gt = safe_ggml_cast(ctx, src, GGML_TYPE_F32, &host_acc);
+              break;
+            }
+
             // Create output tensor for eager conversion.
             ggml_set_no_alloc(ctx, false);
             gt = ggml_new_tensor(ctx, target_type, GGML_MAX_DIMS, src->ne);
@@ -3040,6 +3052,7 @@ static Error build_graph(
                 float* dst_data = static_cast<float*>(gt->data);
                 for (size_t i = 0; i < nelem; ++i) dst_data[i] = static_cast<float>(src_data[i]);
               }
+              gt->flags = src->flags;  // propagate INPUT flag
             }
             gt->op = GGML_OP_NONE;  // Treated as constant in compute graph.
           } else {
@@ -4821,11 +4834,14 @@ Error GgmlBackendInterface::execute(
         if (active->is_allocated && ec.tensor->buffer == active->eager_const_buf
             && ec.nbytes > 64) {
           // Large constant: check 64-byte prefix to skip if unchanged.
-          // Small constants (<= 64B) always re-uploaded — they may be
-          // input-derived and the upload cost is negligible.
           char sample[64];
           ggml_backend_tensor_get(ec.tensor, sample, 0, 64);
           if (memcmp(sample, ec.ctx_data, 64) == 0) { ec_skipped++; continue; }
+        } else if (active->is_allocated && ec.nbytes <= 4) {
+          // Small constant: check exact match to skip if unchanged
+          char old_val[4] = {0};
+          ggml_backend_tensor_get(ec.tensor, old_val, 0, ec.nbytes);
+          if (memcmp(old_val, ec.ctx_data, ec.nbytes) == 0) { ec_skipped++; continue; }
         }
         if (ec.tensor->buffer) {
           ggml_backend_tensor_set(ec.tensor, ec.ctx_data, 0, ec.nbytes);
