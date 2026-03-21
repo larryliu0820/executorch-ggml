@@ -28,6 +28,7 @@ def _export_qwen3(max_seq_len: int = 128):
     from executorch_ggml.passes import RemoveGraphAssertsPass
     from executorch_ggml.passes.fold_rms_norm_weights import fold_rms_norm_weights
     from executorch_ggml.passes.fuse_rope_pass import fuse_rope_in_graph
+    from executorch_ggml.passes.strip_gqa_expand_pass import strip_gqa_expand
     from executorch_ggml.passes.replace_copy_ops_pass import ReplaceCopyOpsPass
     from optimum.exporters.executorch.integrations import CausalLMExportableModule
     from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
@@ -69,6 +70,8 @@ def _export_qwen3(max_seq_len: int = 128):
     rope_theta = float((config.rope_scaling or {}).get("rope_theta", 10000.0))
     n_rope = fuse_rope_in_graph(ep.graph_module, config.head_dim, rope_theta)
     print(f"Fused {n_rope} RoPE instances via AOT pass")
+    n_gqa = strip_gqa_expand(ep.graph_module)
+    print(f"Stripped {n_gqa} GQA expand ops via AOT pass")
 
     edge_mgr = to_edge_transform_and_lower(
         ep,

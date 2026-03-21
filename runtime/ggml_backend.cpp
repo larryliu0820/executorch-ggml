@@ -2768,7 +2768,13 @@ static Error build_graph(
             }
           }
 
-          gt = ggml_reshape_4d(ctx, ensure_cont(ctx, srcs[0]),
+          // Collapse consecutive RESHAPEs: skip intermediate RESHAPE sources
+          // to avoid RESHAPE(RESHAPE(RESHAPE(...))) chains in the ggml graph.
+          struct ggml_tensor* view_src = srcs[0];
+          while (view_src->op == GGML_OP_RESHAPE && view_src->src[0]) {
+            view_src = view_src->src[0];
+          }
+          gt = ggml_reshape_4d(ctx, ensure_cont(ctx, view_src),
                               new_ne[0], new_ne[1], new_ne[2], new_ne[3]);
           break;
         }
@@ -3468,23 +3474,6 @@ static Error build_graph(
               mask = causal;
             }
           }
-
-          // Strip GQA REPEAT from K/V — ggml_flash_attn_ext handles
-          // head broadcast natively (gqa_ratio = Q.ne[2] / K.ne[2]).
-          auto strip_gqa_repeat = [](struct ggml_tensor* t) -> struct ggml_tensor* {
-            // Pattern: RESHAPE(REPEAT(RESHAPE(original_kv)))
-            auto* r = t;
-            // Skip outer RESHAPEs
-            while (r && r->op == GGML_OP_RESHAPE) r = r->src[0];
-            if (!r || r->op != GGML_OP_REPEAT) return t;  // no REPEAT found
-            // Found REPEAT — return its source (the un-expanded KV)
-            auto* pre = r->src[0];
-            // Skip inner RESHAPEs back to the original tensor
-            while (pre && pre->op == GGML_OP_RESHAPE) pre = pre->src[0];
-            return pre ? pre : t;
-          };
-          k = strip_gqa_repeat(k);
-          v = strip_gqa_repeat(v);
 
           // scale = 1/sqrt(head_dim). head_dim is ne0 in ggml layout when tensors are [D, T_q, H, B]
           float scale = 1.0f;
