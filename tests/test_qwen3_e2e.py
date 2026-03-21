@@ -24,7 +24,10 @@ def _export_qwen3(max_seq_len: int = 128):
     """Export Qwen3-0.6B to .pte with ggml backend delegation."""
     from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
     from executorch_ggml import GgmlPartitioner
+    from executorch_ggml.modules.rms_norm import swap_rms_norm
     from executorch_ggml.passes import RemoveGraphAssertsPass
+    from executorch_ggml.passes.fold_rms_norm_weights import fold_rms_norm_weights
+    from executorch_ggml.passes.fuse_rope_pass import fuse_rope_in_graph
     from executorch_ggml.passes.replace_copy_ops_pass import ReplaceCopyOpsPass
     from optimum.exporters.executorch.integrations import CausalLMExportableModule
     from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
@@ -48,6 +51,11 @@ def _export_qwen3(max_seq_len: int = 128):
         ),
     )
 
+    n_swapped = swap_rms_norm(eager_model)
+    print(f"Swapped {n_swapped} RMSNorm modules to fused aten.rms_norm")
+    n_folded = fold_rms_norm_weights(eager_model)
+    print(f"Folded {n_folded} RMSNorm weights into linear projections")
+
     exportable = CausalLMExportableModule(
         eager_model,
         max_seq_len=max_seq_len,
@@ -56,6 +64,11 @@ def _export_qwen3(max_seq_len: int = 128):
         disable_dynamic_shapes=False,
     )
     ep = exportable.export()["model"]
+
+    # Fuse decomposed RoPE into ggml.rope before edge lowering
+    rope_theta = float((config.rope_scaling or {}).get("rope_theta", 10000.0))
+    n_rope = fuse_rope_in_graph(ep.graph_module, config.head_dim, rope_theta)
+    print(f"Fused {n_rope} RoPE instances via AOT pass")
 
     edge_mgr = to_edge_transform_and_lower(
         ep,

@@ -835,6 +835,17 @@ public:
     return p ? *static_cast<const int64_t*>(p) : 0;
   }
 
+  // Track tensors derived from graph inputs (set during build_graph).
+  // Used to avoid baking in input-dependent values as eager constants.
+  std::unordered_set<struct ggml_tensor*>* input_derived = nullptr;
+
+  bool is_input_derived(const struct ggml_tensor* t) const {
+    return input_derived && input_derived->count(const_cast<struct ggml_tensor*>(t));
+  }
+  void propagate_derived(struct ggml_tensor* dst, const struct ggml_tensor* src) {
+    if (is_input_derived(src) && input_derived) input_derived->insert(dst);
+  }
+
 private:
   std::deque<std::vector<uint8_t>> staging_;
 };
@@ -851,7 +862,7 @@ struct ggml_tensor* eager_cast_i64_to_i32(
   struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_I32, GGML_MAX_DIMS, src->ne);
   ggml_set_no_alloc(ctx, true);
   dst->op = GGML_OP_NONE;
-  dst->flags = src->flags;  // propagate INPUT flag
+  if (acc) acc->propagate_derived(dst, src);
   if (src->data && dst->data) {
     const size_t n = ggml_nelements(src);
     const int64_t* s = acc ? static_cast<const int64_t*>(acc->get(src))
@@ -870,7 +881,7 @@ struct ggml_tensor* eager_cast_i32_to_i64(
   struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_I64, GGML_MAX_DIMS, src->ne);
   ggml_set_no_alloc(ctx, true);
   dst->op = GGML_OP_NONE;
-  dst->flags = src->flags;  // propagate INPUT flag
+  if (acc) acc->propagate_derived(dst, src);
   if (src->data && dst->data) {
     const size_t n = ggml_nelements(src);
     const int32_t* s = acc ? static_cast<const int32_t*>(acc->get(src))
@@ -920,7 +931,7 @@ struct ggml_tensor* safe_ggml_cast(
   // Skip if the source is input-derived — must stay as a graph op for reuse.
   if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_F32 &&
       ggml_nelements(src) == 1 && src->data &&
-      !(src->flags & GGML_TENSOR_FLAG_INPUT)) {
+      !(acc && acc->is_input_derived(src))) {
     int32_t ival = acc ? acc->read_i32(src) : *(const int32_t*)src->data;
     ggml_set_no_alloc(ctx, false);
     struct ggml_tensor* dst = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1);
@@ -988,6 +999,7 @@ struct GraphInstance {
   ggml_backend_buffer_t eager_const_buf = nullptr;  // separate buffer for eager constants
   ggml_backend_buffer_t host_buf = nullptr;  // temporary CPU buffer for leaf data (kept alive for eager const ctx_data)
   bool is_allocated = false;  // true after first successful sched_alloc
+  bool has_input_derived_eager = false;  // true if any eager constant depends on input data
 };
 
 // ---------------------------------------------------------------------------
@@ -1147,6 +1159,300 @@ static bool debug_dump_eval_callback(struct ggml_tensor* t, bool ask, void* user
 // Ensure tensor is contiguous. No-op if already contiguous.
 static inline struct ggml_tensor* ensure_cont(struct ggml_context* ctx, struct ggml_tensor* t) {
   return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
+}
+
+// Skip RESHAPE/VIEW/CONT/PERMUTE wrappers to find the "real" op underneath.
+static struct ggml_tensor* unwrap_views(struct ggml_tensor* t) {
+  while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW
+               || t->op == GGML_OP_CONT || t->op == GGML_OP_TRANSPOSE
+               || t->op == GGML_OP_PERMUTE)) {
+    t = t->src[0];
+  }
+  return t;
+}
+
+// Check if tensor t is rotate_half(x): CONCAT(NEG(x_first_half), x_second_half)
+// Returns the original x (before the views), or nullptr if pattern doesn't match.
+static struct ggml_tensor* match_rotate_half(struct ggml_tensor* t) {
+  auto* core = unwrap_views(t);
+  if (!core || core->op != GGML_OP_CONCAT) return nullptr;
+
+  // CONCAT has two branches. One should contain UNARY(NEG), the other should not.
+  auto* branch0 = unwrap_views(core->src[0]);
+  auto* branch1 = unwrap_views(core->src[1]);
+  if (!branch0 || !branch1) return nullptr;
+
+  static int rope_debug = -1;
+  if (rope_debug < 0) { const char* e = std::getenv("GGML_ROPE_DEBUG"); rope_debug = (e && *e != '0') ? 1 : 0; }
+  if (rope_debug) {
+    fprintf(stderr, "[rope_fuse]   CONCAT branch0=%d branch1=%d\n", branch0->op, branch1->op);
+  }
+
+  // Find which branch has the NEG (UNARY op)
+  struct ggml_tensor* neg_branch = nullptr;
+  struct ggml_tensor* pos_branch = nullptr;
+  if (branch0->op == GGML_OP_UNARY) {
+    neg_branch = branch0; pos_branch = branch1;
+  } else if (branch1->op == GGML_OP_UNARY) {
+    neg_branch = branch1; pos_branch = branch0;
+  } else {
+    return nullptr;
+  }
+
+  // NEG branch: UNARY(NEG) → its src[0] traces back to a VIEW of x
+  auto* neg_src = neg_branch->src[0];
+  auto* neg_inner = unwrap_views(neg_src);
+
+  // POS branch: traces back to a VIEW of the same x
+  auto* pos_inner = pos_branch;
+  if (pos_inner->op != GGML_OP_VIEW)
+    pos_inner = unwrap_views(pos_inner);
+
+  if (rope_debug) {
+    fprintf(stderr, "[rope_fuse]   neg_inner=%d pos_inner=%d\n",
+            neg_inner ? neg_inner->op : -1, pos_inner ? pos_inner->op : -1);
+  }
+
+  // Both should be VIEWs of the same tensor. But they might be VIEWs or
+  // the original tensor itself (if no VIEW was needed).
+  // Trace both back to the root non-view tensor.
+  auto* x_from_neg = neg_inner;
+  while (x_from_neg && (x_from_neg->op == GGML_OP_VIEW || x_from_neg->op == GGML_OP_RESHAPE
+         || x_from_neg->op == GGML_OP_CONT || x_from_neg->op == GGML_OP_TRANSPOSE
+         || x_from_neg->op == GGML_OP_PERMUTE))
+    x_from_neg = x_from_neg->src[0];
+  auto* x_from_pos = pos_inner;
+  while (x_from_pos && (x_from_pos->op == GGML_OP_VIEW || x_from_pos->op == GGML_OP_RESHAPE
+         || x_from_pos->op == GGML_OP_CONT || x_from_pos->op == GGML_OP_TRANSPOSE
+         || x_from_pos->op == GGML_OP_PERMUTE))
+    x_from_pos = x_from_pos->src[0];
+
+  if (rope_debug) {
+    fprintf(stderr, "[rope_fuse]   x_from_neg=%p (op=%d) x_from_pos=%p (op=%d)\n",
+            (void*)x_from_neg, x_from_neg ? x_from_neg->op : -1,
+            (void*)x_from_pos, x_from_pos ? x_from_pos->op : -1);
+  }
+  if (!x_from_neg || x_from_neg != x_from_pos) return nullptr;
+
+  return x_from_neg;
+}
+
+// Trace back from a COS/SIN tensor to find the position tensor and inv_freq,
+// then recover freq_base. Returns true on success.
+// Pattern: COS/SIN ← (CONT ← SCALE ←)? CONCAT ← PERMUTE ← MUL_MAT(pos_scalar, inv_freq)
+static bool extract_rope_params(
+    struct ggml_tensor* cos_or_sin,
+    struct ggml_tensor** out_pos,
+    float* out_freq_base,
+    int* out_n_dims,
+    HostDataAccessor& acc) {
+  // Skip through SCALE/CONT/RESHAPE wrappers after COS/SIN
+  auto* t = cos_or_sin;
+  if (!t) return false;
+
+  // t should be COS or SIN — its src[0] is the angle tensor
+  if (t->op != GGML_OP_COS && t->op != GGML_OP_SIN) {
+    t = unwrap_views(t);
+    if (!t || (t->op != GGML_OP_COS && t->op != GGML_OP_SIN)) return false;
+  }
+
+  // angle tensor: CONCAT of two halves, or direct from MUL_MAT
+  auto* angles = unwrap_views(t->src[0]);
+  if (!angles) return false;
+
+  static int rope_debug = -1;
+  if (rope_debug < 0) { const char* e = std::getenv("GGML_ROPE_DEBUG"); rope_debug = (e && *e != '0') ? 1 : 0; }
+  if (rope_debug) fprintf(stderr, "[rope_params] angles op=%d\n", angles->op);
+
+  // May be CONCAT (doubling for NeoX style) — unwrap to find MUL_MAT
+  if (angles->op == GGML_OP_CONCAT) {
+    angles = unwrap_views(angles->src[0]);  // first half
+    if (!angles) return false;
+    if (rope_debug) fprintf(stderr, "[rope_params] after CONCAT unwrap: op=%d\n", angles->op);
+  }
+
+  // Trace through remaining ops to find MUL_MAT
+  auto* mul_mat = angles;
+  int depth = 0;
+  while (mul_mat && mul_mat->op != GGML_OP_MUL_MAT && depth < 20) {
+    if (rope_debug) fprintf(stderr, "[rope_params]   trace[%d] op=%d\n", depth, mul_mat->op);
+    mul_mat = mul_mat->src[0];
+    depth++;
+  }
+  if (!mul_mat || mul_mat->op != GGML_OP_MUL_MAT) {
+    if (rope_debug) fprintf(stderr, "[rope_params] FAIL: MUL_MAT not found after %d hops\n", depth);
+    return false;
+  }
+  if (rope_debug) fprintf(stderr, "[rope_params] MUL_MAT found at depth %d\n", depth);
+
+  // MUL_MAT: one src is inv_freq (constant with data), the other is position
+  struct ggml_tensor* inv_freq = mul_mat->src[1];
+  struct ggml_tensor* pos_tensor = mul_mat->src[0];
+  // Swap if needed: inv_freq is the one with data (constant leaf)
+  if ((!inv_freq || !unwrap_views(inv_freq) || !unwrap_views(inv_freq)->data)
+      && unwrap_views(pos_tensor) && unwrap_views(pos_tensor)->data) {
+    std::swap(inv_freq, pos_tensor);
+  }
+
+  if (rope_debug) {
+    fprintf(stderr, "[rope_params] MUL_MAT src0 op=%d data=%p ne=[%lld,%lld] src1 op=%d data=%p ne=[%lld,%lld]\n",
+            inv_freq?inv_freq->op:-1, inv_freq?inv_freq->data:nullptr,
+            inv_freq?(long long)inv_freq->ne[0]:0, inv_freq?(long long)inv_freq->ne[1]:0,
+            pos_tensor?pos_tensor->op:-1, pos_tensor?pos_tensor->data:nullptr,
+            pos_tensor?(long long)pos_tensor->ne[0]:0, pos_tensor?(long long)pos_tensor->ne[1]:0);
+  }
+
+  // inv_freq should be a constant leaf with data
+  auto* inv_core = unwrap_views(inv_freq);
+  if (!inv_core || !inv_core->data) {
+    if (rope_debug) fprintf(stderr, "[rope_params] FAIL: inv_freq has no data (inv_core=%p op=%d)\n",
+        (void*)inv_core, inv_core?inv_core->op:-1);
+    return false;
+  }
+
+  // Read inv_freq values to extract freq_base
+  int64_t n_freq = ggml_nelements(inv_core);
+  if (n_freq < 2) return false;
+
+  const float* freq_data = static_cast<const float*>(acc.get(inv_core));
+  if (!freq_data) return false;
+
+  // inv_freq[i] = 1 / (freq_base ^ (2i / n_dims))
+  // inv_freq[0] = 1.0 (always), inv_freq[1] = 1/freq_base^(2/n_dims)
+  // freq_base = (1/inv_freq[1]) ^ (n_dims/2)
+  int n_dims = (int)(n_freq * 2);  // n_freq = n_dims/2
+  if (freq_data[1] > 0.0f && freq_data[1] < 1.0f) {
+    double ratio = 1.0 / (double)freq_data[1];
+    *out_freq_base = (float)std::pow(ratio, (double)n_dims / 2.0);
+  } else {
+    *out_freq_base = 10000.0f;  // fallback
+  }
+  *out_n_dims = n_dims;
+
+  // Trace pos_tensor back to the original position input
+  // It may be wrapped in CONT/TRANSPOSE/RESHAPE/CPY
+  auto* pos = pos_tensor;
+  while (pos && pos->op != GGML_OP_NONE) {
+    if (pos->op == GGML_OP_CPY) {
+      pos = pos->src[1];  // CPY copies src[0] into src[1]'s shape
+    } else {
+      pos = pos->src[0];
+    }
+  }
+  if (!pos) return false;
+  *out_pos = pos;
+  return true;
+}
+
+// Try to fuse ADD(MUL(x, cos), MUL(rotate_half(x), sin)) into ggml_rope_ext.
+// Called from the ADD handler in Phase B. Returns fused tensor or nullptr.
+static struct ggml_tensor* try_fuse_rope(
+    struct ggml_context* ctx,
+    struct ggml_tensor* a,
+    struct ggml_tensor* b,
+    HostDataAccessor& acc) {
+  // Both sides should be MUL
+  auto* a_core = unwrap_views(a);
+  auto* b_core = unwrap_views(b);
+  if (!a_core || !b_core) return nullptr;
+  if (a_core->op != GGML_OP_MUL || b_core->op != GGML_OP_MUL) return nullptr;
+  static int rope_debug = -1;
+  if (rope_debug < 0) { const char* e = std::getenv("GGML_ROPE_DEBUG"); rope_debug = (e && *e != '0') ? 1 : 0; }
+  if (rope_debug) fprintf(stderr, "[rope_fuse] ADD(MUL, MUL) candidate found\n");
+
+  // One MUL is x*cos, the other is rotate_half(x)*sin.
+  // Identify which is which by checking for rotate_half pattern.
+  struct ggml_tensor* x_cos_mul = a_core;
+  struct ggml_tensor* rot_sin_mul = b_core;
+
+  // Check if rot_sin_mul's src has rotate_half
+  struct ggml_tensor* x_from_rot = nullptr;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    // Try src[0] and src[1] of rot_sin_mul for rotate_half
+    for (int si = 0; si < 2; ++si) {
+      x_from_rot = match_rotate_half(rot_sin_mul->src[si]);
+      if (x_from_rot) break;
+    }
+    if (x_from_rot) break;
+    // Swap and retry
+    std::swap(x_cos_mul, rot_sin_mul);
+  }
+  if (!x_from_rot) {
+    if (rope_debug) {
+      fprintf(stderr, "[rope_fuse]   rotate_half not found. MUL_a src0=%d src1=%d, MUL_b src0=%d src1=%d\n",
+              a_core->src[0] ? a_core->src[0]->op : -1, a_core->src[1] ? a_core->src[1]->op : -1,
+              b_core->src[0] ? b_core->src[0]->op : -1, b_core->src[1] ? b_core->src[1]->op : -1);
+    }
+    return nullptr;
+  }
+  if (rope_debug) fprintf(stderr, "[rope_fuse]   rotate_half matched, x=%p\n", (void*)x_from_rot);
+
+  // x_cos_mul = MUL(x, cos) — verify x matches x_from_rot
+  struct ggml_tensor* x_direct = nullptr;
+  struct ggml_tensor* cos_tensor = nullptr;
+  for (int si = 0; si < 2; ++si) {
+    auto* candidate = unwrap_views(x_cos_mul->src[si]);
+    if (candidate == x_from_rot) {
+      x_direct = x_cos_mul->src[si];
+      cos_tensor = x_cos_mul->src[1 - si];
+      break;
+    }
+  }
+  if (!x_direct) {
+    auto* s0 = unwrap_views(x_cos_mul->src[0]);
+    auto* s1 = unwrap_views(x_cos_mul->src[1]);
+    // Also try deep unwrap (through PERMUTE etc.)
+    auto* s0d = s0; while (s0d && s0d->op != GGML_OP_NONE && s0d->op != GGML_OP_MUL_MAT && s0d->op != GGML_OP_MUL) s0d = s0d->src[0];
+    auto* s1d = s1; while (s1d && s1d->op != GGML_OP_NONE && s1d->op != GGML_OP_MUL_MAT && s1d->op != GGML_OP_MUL) s1d = s1d->src[0];
+    if (rope_debug) fprintf(stderr, "[rope_fuse]   FAIL: x not found. cos_mul s0=%p(op=%d) s1=%p(op=%d) s0d=%p(op=%d) s1d=%p(op=%d) x_from_rot=%p(op=%d)\n",
+        (void*)s0, s0?s0->op:-1, (void*)s1, s1?s1->op:-1,
+        (void*)s0d, s0d?s0d->op:-1, (void*)s1d, s1d?s1d->op:-1,
+        (void*)x_from_rot, x_from_rot?x_from_rot->op:-1);
+    return nullptr;
+  }
+  if (rope_debug) fprintf(stderr, "[rope_fuse]   cos_tensor found (op=%d)\n", cos_tensor ? cos_tensor->op : -1);
+
+  // Find sin tensor from rot_sin_mul
+  struct ggml_tensor* sin_tensor = nullptr;
+  for (int si = 0; si < 2; ++si) {
+    if (!match_rotate_half(rot_sin_mul->src[si])) {
+      sin_tensor = rot_sin_mul->src[si];
+      break;
+    }
+  }
+  if (!sin_tensor) {
+    if (rope_debug) fprintf(stderr, "[rope_fuse]   FAIL: sin not found\n");
+    return nullptr;
+  }
+
+  // Trace back from cos to find position tensor and freq_base
+  auto* cos_core = unwrap_views(cos_tensor);
+  auto* t = cos_core;
+  while (t && t->op != GGML_OP_COS) {
+    t = t->src[0];
+  }
+  if (!t) {
+    if (rope_debug) fprintf(stderr, "[rope_fuse]   FAIL: COS op not found tracing from cos_tensor (op=%d)\n",
+        cos_core ? cos_core->op : -1);
+    return nullptr;
+  }
+
+  struct ggml_tensor* pos = nullptr;
+  float freq_base = 10000.0f;
+  int n_dims = 0;
+  if (!extract_rope_params(t, &pos, &freq_base, &n_dims, acc)) {
+    if (rope_debug) fprintf(stderr, "[rope_fuse]   FAIL: extract_rope_params failed\n");
+    return nullptr;
+  }
+  if (rope_debug) fprintf(stderr, "[rope_fuse]   SUCCESS: freq_base=%.0f n_dims=%d\n", freq_base, n_dims);
+
+  // Build ggml_rope_ext: mode=2 (NeoX half-rotation for HF models)
+  auto* x_cont = ensure_cont(ctx, x_direct);
+  auto* pos_i32 = (pos->type == GGML_TYPE_I32) ? pos : safe_ggml_cast(ctx, pos, GGML_TYPE_I32);
+
+  auto* result = ggml_rope_ext(ctx, x_cont, pos_i32, NULL,
+      n_dims, /*mode=*/2, 0, freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+  return result;
 }
 
 // Cast BF16/F16 to F32 for Metal compatibility. No-op if already F32 or integer.
@@ -1521,6 +1827,8 @@ static Error build_graph(
   std::vector<SharedLeaf> shared_leaves;
   // Tensors pinned to CPU (for custom ops on GPU backends).
   std::vector<struct ggml_tensor*> cpu_pinned;
+  // Track tensors derived from graph inputs (transitive closure).
+  std::unordered_set<struct ggml_tensor*> input_derived;
   // sym_dim_values already built above (Phase A, before ggml_init).
 
   // --- Shape resolution helper (shared by leaf and op passes) ---
@@ -1587,6 +1895,7 @@ static Error build_graph(
   if (cmp_env) use_native_cmp_ops = (std::string(cmp_env) != "0");
   // Host-side accessor for reading tensor data that may live on a device buffer.
   HostDataAccessor host_acc;
+  host_acc.input_derived = &input_derived;
   // Cache causal attention masks so identical (T_kv, T_q) shapes reuse one allocation.
   std::unordered_map<uint64_t, struct ggml_tensor*> causal_mask_cache;
   int last_processed = -1;
@@ -1660,6 +1969,7 @@ static Error build_graph(
       if (t->is_input()) {
         ggml_set_input(gt);  // Mark as input early so try_eager_scalar_binop skips it
         input_pairs.emplace_back(t->input_index(), gt);
+        input_derived.insert(gt);
       }
       if (t->is_output()) {
         int out_idx = t->input_index();
@@ -1948,6 +2258,14 @@ static Error build_graph(
           struct ggml_tensor* a = srcs[0];
           struct ggml_tensor* b = srcs[1];
 
+          // TODO: Fuse decomposed RoPE: ADD(MUL(x,cos), MUL(rotate_half(x),sin))
+          // Pattern matching works (56 instances detected) but ggml_rope_ext
+          // shape/position requirements need more work. Disabled for now.
+          // if (auto* fused = try_fuse_rope(ctx, a, b, host_acc)) {
+          //   gt = fused;
+          //   break;
+          // }
+
           // Eager scalar path for enc_len-style computations.
           if (auto* eager = try_eager_scalar_binop(ctx, a, b, '+', host_acc)) {
             gt = eager;
@@ -1986,7 +2304,7 @@ static Error build_graph(
                 }
               }
             }
-            gt->flags = a->flags | b->flags;  // propagate INPUT flag
+            // input_derived propagation handled generically after switch
             break;
           }
           // Non-constant I64: cast to F32 and use ggml_add.
@@ -2034,12 +2352,12 @@ static Error build_graph(
           // Skip for input-derived scalars — ggml_scale bakes the value into
           // op_params which blocks graph reuse. Use ggml_mul instead.
           if (ggml_nelements(b) == 1 && b->data && b->type == GGML_TYPE_F32
-              && !(b->flags & GGML_TENSOR_FLAG_INPUT)) {
+              && !input_derived.count(b)) {
             gt = ggml_scale(ctx, ggml_cont(ctx, a), host_acc.read_f32(b));
             break;
           }
           if (ggml_nelements(a) == 1 && a->data && a->type == GGML_TYPE_F32
-              && !(a->flags & GGML_TENSOR_FLAG_INPUT)) {
+              && !input_derived.count(a)) {
             gt = ggml_scale(ctx, ggml_cont(ctx, b), host_acc.read_f32(a));
             break;
           }
@@ -3000,7 +3318,7 @@ static Error build_graph(
           // Eager scalar cast: compute immediately when source has data.
           // Skip for input-derived scalars — must stay as graph op for reuse.
           if (ggml_nelements(src) == 1 && src->data
-              && !(src->flags & GGML_TENSOR_FLAG_INPUT)) {
+              && !input_derived.count(src)) {
             const void* src_host = host_acc.get(src);
             ggml_set_no_alloc(ctx, false);
             gt = ggml_new_tensor_4d(ctx, target_type, 1, 1, 1, 1);
@@ -3052,7 +3370,7 @@ static Error build_graph(
                 float* dst_data = static_cast<float*>(gt->data);
                 for (size_t i = 0; i < nelem; ++i) dst_data[i] = static_cast<float>(src_data[i]);
               }
-              gt->flags = src->flags;  // propagate INPUT flag
+              // input_derived propagation handled generically after switch
             }
             gt->op = GGML_OP_NONE;  // Treated as constant in compute graph.
           } else {
@@ -3096,23 +3414,31 @@ static Error build_graph(
           struct ggml_tensor* mask = nullptr;
           if (srcs.size() > 3 && srcs[3] != nullptr) {
             mask = srcs[3];
-            // Convert boolean mask {0=don't attend, 1=attend} to F16 additive
-            // mask {-65504=don't attend, 0=attend} using graph ops that run on
-            // Metal. Avoids CPU custom ops which cause cross-backend NaN.
-            if (mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64) {
-              mask = safe_ggml_cast(ctx, mask, GGML_TYPE_F32, &host_acc);
-            }
-            if (mask->type == GGML_TYPE_F32) {
-              // mask * 65504 - 65504: {0,1} → {0-65504, 65504-65504} = {-65504, 0}
-              struct ggml_tensor* scaled = ggml_scale(ctx, ggml_cont(ctx, mask), 65504.0f);
-              mask = safe_ggml_cast(ctx,
-                  ggml_add(ctx, scaled, make_f32_scalar(ctx, -65504.0f)),
-                  GGML_TYPE_F16, &host_acc);
-            } else if (mask->type != GGML_TYPE_F16) {
-              mask = safe_ggml_cast(ctx, mask, GGML_TYPE_F16, &host_acc);
-            }
-            if (!ggml_is_contiguous(mask)) {
-              mask = ggml_cont(ctx, mask);
+            // Cache: if the same source mask appears in multiple SDPA calls
+            // (shared across layers), reuse the converted F16 result.
+            auto cm_src = causal_mask_cache.find(reinterpret_cast<uint64_t>(mask));
+            if (cm_src != causal_mask_cache.end()) {
+              mask = cm_src->second;
+            } else {
+              struct ggml_tensor* orig_mask = mask;
+              // Convert boolean mask {0=don't attend, 1=attend} to F16 additive
+              // mask {-65504=don't attend, 0=attend} using graph ops that run on
+              // Metal. Avoids CPU custom ops which cause cross-backend NaN.
+              if (mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64) {
+                mask = safe_ggml_cast(ctx, mask, GGML_TYPE_F32, &host_acc);
+              }
+              if (mask->type == GGML_TYPE_F32) {
+                struct ggml_tensor* scaled = ggml_scale(ctx, ggml_cont(ctx, mask), 65504.0f);
+                mask = safe_ggml_cast(ctx,
+                    ggml_add(ctx, scaled, make_f32_scalar(ctx, -65504.0f)),
+                    GGML_TYPE_F16, &host_acc);
+              } else if (mask->type != GGML_TYPE_F16) {
+                mask = safe_ggml_cast(ctx, mask, GGML_TYPE_F16, &host_acc);
+              }
+              if (!ggml_is_contiguous(mask)) {
+                mask = ggml_cont(ctx, mask);
+              }
+              causal_mask_cache[reinterpret_cast<uint64_t>(orig_mask)] = mask;
             }
           }
           // Build causal mask at runtime when is_causal=true and no explicit mask.
@@ -3142,6 +3468,23 @@ static Error build_graph(
               mask = causal;
             }
           }
+
+          // Strip GQA REPEAT from K/V — ggml_flash_attn_ext handles
+          // head broadcast natively (gqa_ratio = Q.ne[2] / K.ne[2]).
+          auto strip_gqa_repeat = [](struct ggml_tensor* t) -> struct ggml_tensor* {
+            // Pattern: RESHAPE(REPEAT(RESHAPE(original_kv)))
+            auto* r = t;
+            // Skip outer RESHAPEs
+            while (r && r->op == GGML_OP_RESHAPE) r = r->src[0];
+            if (!r || r->op != GGML_OP_REPEAT) return t;  // no REPEAT found
+            // Found REPEAT — return its source (the un-expanded KV)
+            auto* pre = r->src[0];
+            // Skip inner RESHAPEs back to the original tensor
+            while (pre && pre->op == GGML_OP_RESHAPE) pre = pre->src[0];
+            return pre ? pre : t;
+          };
+          k = strip_gqa_repeat(k);
+          v = strip_gqa_repeat(v);
 
           // scale = 1/sqrt(head_dim). head_dim is ne0 in ggml layout when tensors are [D, T_q, H, B]
           float scale = 1.0f;
@@ -3199,7 +3542,7 @@ static Error build_graph(
                 }
               }
             }
-            gt->flags = a->flags | b->flags;  // propagate INPUT flag
+            // input_derived propagation handled generically after switch
           } else {
             // Non-constant I64: cast to F32 and use ggml_sub.
             if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(ctx, a, GGML_TYPE_F32, &host_acc);
@@ -4108,6 +4451,17 @@ static Error build_graph(
           return Error::InvalidArgument;
       }
 
+    // Propagate input-derived tracking: if any source is input-derived,
+    // the result is too.
+    if (gt) {
+      for (auto* s : srcs) {
+        if (input_derived.count(s)) {
+          input_derived.insert(gt);
+          break;
+        }
+      }
+    }
+
     id_to_tensor[tid] = gt;
     last_processed = i;
     if (t->is_output()) {
@@ -4180,6 +4534,7 @@ static Error build_graph(
     deferred_dst_set.insert(dst);
   }
   std::vector<EagerConstant> eager_constants;
+  bool has_input_derived_eager = false;
   for (struct ggml_tensor* gt = ggml_get_first_tensor(ctx);
        gt != nullptr;
        gt = ggml_get_next_tensor(ctx, gt)) {
@@ -4193,6 +4548,7 @@ static Error build_graph(
     if (gt->op != GGML_OP_NONE) continue;
     ggml_set_input(gt);  // prevent scheduler from reusing this memory
     eager_constants.push_back({gt, gt->data, ggml_nbytes(gt)});
+    if (input_derived.count(gt)) has_input_derived_eager = true;
   }
 
   auto t_bg_c2 = std::chrono::high_resolution_clock::now();
@@ -4222,10 +4578,11 @@ static Error build_graph(
           }
         }
       }
-      fprintf(stderr, "[perf] eager_constants: count=%zu bytes=%zu (I64=%zu I32=%zu F16=%zu F32=%zu) large(>1KB)=%zu large_bytes=%zu\n",
+      fprintf(stderr, "[perf] eager_constants: count=%zu bytes=%zu (I64=%zu I32=%zu F16=%zu F32=%zu) large(>1KB)=%zu large_bytes=%zu input_derived=%s\n",
               eager_constants.size(), ec_total_bytes,
               ec_i64_count, ec_i32_count, ec_f16_count, ec_f32_count,
-              ec_large, ec_large_bytes);
+              ec_large, ec_large_bytes,
+              has_input_derived_eager ? "yes" : "no");
     }
   }
   // 2. Clear data/buffer on non-shared tensors so scheduler can allocate them.
@@ -4268,6 +4625,7 @@ static Error build_graph(
   gi->outputs = std::move(output_tensors);
   gi->deferred_i64_to_i32 = std::move(deferred_i64_to_i32);
   gi->eager_constants = std::move(eager_constants);
+  gi->has_input_derived_eager = has_input_derived_eager;
   gi->shared_leaves = std::move(shared_leaves);
   gi->cpu_pinned = std::move(cpu_pinned);
 
@@ -4748,7 +5106,10 @@ Error GgmlBackendInterface::execute(
   // --- Build or reuse graph ---
   auto t_start = std::chrono::high_resolution_clock::now();
   bool no_cache = is_graph_cache_disabled();
-  bool need_build = (active->ctx == nullptr) || no_cache;
+  // Force rebuild if this graph has input-derived eager constants (their
+  // values change per call and can't be refreshed without rebuilding).
+  bool need_build = (active->ctx == nullptr) || no_cache
+                    || active->has_input_derived_eager;
 
   if (need_build) {
     // First time for this shape: full IR parse + tensor creation.

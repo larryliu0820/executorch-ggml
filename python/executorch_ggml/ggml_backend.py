@@ -3168,11 +3168,12 @@ class GgmlBackend(BackendDetails):
                     node_to_id[node] = tid
 
                 elif "ggml.rope.default" in target_str:
-                    # ggml.rope(x, positions, n_dims, freq_base) -> Tensor
+                    # ggml.rope(x, positions, n_dims, freq_base, mode=0) -> Tensor
                     x_node = node.args[0]
                     pos_node = node.args[1]
                     n_dims = int(node.args[2])
                     freq_base = float(node.args[3])
+                    rope_mode = int(node.args[4]) if len(node.args) > 4 else 0
 
                     x_id = node_to_id[x_node]
                     pos_id = node_to_id[pos_node]
@@ -3190,7 +3191,7 @@ class GgmlBackend(BackendDetails):
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_ROPE,
                             src_ids=[x_id, pos_id],
-                            op_params=pack_rope_params(n_dims, 0, freq_base),
+                            op_params=pack_rope_params(n_dims, rope_mode, freq_base),
                             sym_dim_ids=_vsym,
                             sym_dim_exprs=_vexprs,
                         )
