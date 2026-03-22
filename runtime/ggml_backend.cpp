@@ -5428,7 +5428,10 @@ Error GgmlBackendInterface::execute(
   }
 
   auto t_pre_compute = std::chrono::high_resolution_clock::now();
-  enum ggml_status status = ggml_backend_sched_graph_compute(active->sched, active->graph);
+  // Use async compute + explicit sync. This avoids the double-sync that
+  // graph_compute does (sync inside compute + sync for output copy).
+  // The output copy (ggml_backend_tensor_get) will sync implicitly.
+  enum ggml_status status = ggml_backend_sched_graph_compute_async(active->sched, active->graph);
   auto t_compute = std::chrono::high_resolution_clock::now();
 
   if (debug_ctx.fp) {
@@ -5446,6 +5449,9 @@ Error GgmlBackendInterface::execute(
             ggml_status_to_string(status), (int)status);
     return Error::InvalidState;
   }
+
+  // Sync before output copy (async compute may not have finished).
+  ggml_backend_sched_synchronize(active->sched);
 
   // Copy output data from backend tensors → ExecuTorch output tensors.
   for (size_t i = 0; i < n_outputs; ++i) {
