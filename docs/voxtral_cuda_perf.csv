@@ -1,0 +1,7 @@
+configuration,component,nodes,splits,ms_per_unit,throughput,unit,notes
+Baseline (swap_encoder_rope only),encoder,817,2,80.0,12.5,audio_s/s,"1000 mel frames = 6.25s audio; p50"
++ swap_causal_conv1d,encoder,817,1,25.0,40.0,audio_s/s,"PAD elimination → splits 2→1; CUDA graphs active"
++ fold_encoder_rms_norm_weights,encoder,752,1,20.0,50.0,audio_s/s,"-65 MUL nodes from norm weight folding"
+Baseline (swap_voxtral_attention only),decoder,811,2,95.0,11,tok/s,"FP32 4B model; p50"
++ force-GPU input ops,decoder,811,1,25.0,40,tok/s,"splits 2→1; CUDA graphs active"
++ enable_gqa=True (no repeat_interleave),decoder,707,1,13.6,73,tok/s,"-104 REPEAT+CONT nodes; native GQA in flash_attn"

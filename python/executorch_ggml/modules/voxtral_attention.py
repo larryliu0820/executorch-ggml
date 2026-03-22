@@ -38,7 +38,8 @@ class StandardSDPA(nn.Module):
     """SDPA using F.scaled_dot_product_attention instead of llama.custom_sdpa.
 
     Expects KV cache in [B, S, H, D] layout; transposes to [B, H, S, D]
-    for the standard SDPA call.  GQA handled by repeat_interleave.
+    for the standard SDPA call.  GQA handled natively by enable_gqa=True
+    (ggml's flash_attn_ext supports GQA via gqa_ratio).
     """
 
     def __init__(self, n_heads: int, n_kv_heads: int, head_dim: int):
@@ -46,6 +47,7 @@ class StandardSDPA(nn.Module):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.dim = n_heads * head_dim
+        self.enable_gqa = n_kv_heads != n_heads
 
     def forward(
         self,
@@ -61,15 +63,12 @@ class StandardSDPA(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        if self.n_kv_heads != self.n_heads:
-            rep = self.n_heads // self.n_kv_heads
-            k = k.repeat_interleave(rep, dim=1)
-            v = v.repeat_interleave(rep, dim=1)
-
         if mask is None:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, enable_gqa=self.enable_gqa)
         else:
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, enable_gqa=self.enable_gqa)
 
         return y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 

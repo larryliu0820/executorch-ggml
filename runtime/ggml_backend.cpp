@@ -3386,7 +3386,37 @@ static Error build_graph(
             if (val->type != GGML_TYPE_F32) {
               val = safe_ggml_cast(ctx, val, GGML_TYPE_F32, &host_acc);
             }
-            gt = ggml_set_rows(ctx, dst, val, idx);
+
+            // ggml_set_rows scatters along ne[1]. Compute the actual ggml
+            // scatter axis from idx_pos (PyTorch dim).
+            int ndim = 4;
+            int ggml_scatter_axis = (ndim - 1) - idx_pos;
+            if (ggml_scatter_axis == 1) {
+              gt = ggml_set_rows(ctx, dst, val, idx);
+            } else {
+              // KV cache update: scatter along ne[2] (seq dim) with contiguous
+              // positions.  Use ggml_cpy into a view of the cache slice.
+              // Read start position from the first index element.
+              int64_t start_pos = host_acc.read_i32(idx);
+              int64_t seq_len_new = val->ne[ggml_scatter_axis];
+
+              // View into cache at [start_pos..start_pos+seq_len) along scatter axis.
+              size_t offset_bytes = start_pos * dst->nb[ggml_scatter_axis];
+              int64_t view_ne[4];
+              for (int d = 0; d < 4; d++) view_ne[d] = dst->ne[d];
+              view_ne[ggml_scatter_axis] = seq_len_new;
+
+              auto* cache_slice = ggml_view_4d(ctx, dst,
+                  view_ne[0], view_ne[1], view_ne[2], view_ne[3],
+                  dst->nb[1], dst->nb[2], dst->nb[3], offset_bytes);
+
+              auto* val_c = ensure_cont(ctx, val);
+              gt = ggml_cpy(ctx, val_c, cache_slice);
+              // ggml_cpy returns the destination (cache_slice).  To expose the
+              // full cache for downstream reads, create a view that depends on
+              // the cpy so the scheduler orders correctly.
+              gt = dst;  // downstream will see updated cache
+            }
             ggml_set_output(gt);
           } else {
             struct ggml_tensor* args[3] = {dst, idx, val};
@@ -4209,9 +4239,9 @@ static Error build_graph(
             start_pos = host_acc.read_i32(start_pos_tensor);
           }
 
-          // Use ggml_set_rows if we have indices, otherwise use a simple copy
-          // For contiguous update, we can create a view and copy
-          // cache[:, start_pos:start_pos+seq_len, :, :] = value
+          // ggml_set_rows scatters along ne[1]. When the scatter axis differs
+          // (e.g. ne[2] for KV cache seq dim), reshape to merge inner dims
+          // so the scatter axis becomes ne[1], then reshape back.
 
           // Generate indices as a graph op via ggml_arange so they live on the
           // compute backend (GPU).  Eagerly-allocated host-memory indices cause
@@ -4227,7 +4257,24 @@ static Error build_graph(
           // Don't cast cache — set_rows returns a new tensor and casting
           // would break the link to the mutable buffer.
 
-          gt = ggml_set_rows(ctx, cache, value, indices);
+          if (ggml_axis == 1) {
+            gt = ggml_set_rows(ctx, cache, value, indices);
+          } else {
+            // KV cache update: scatter along ne[ggml_axis] with contiguous
+            // positions.  Use ggml_cpy into a view of the cache slice.
+            size_t offset_bytes = start_pos * cache->nb[ggml_axis];
+            int64_t view_ne[4];
+            for (int d = 0; d < 4; d++) view_ne[d] = cache->ne[d];
+            view_ne[ggml_axis] = seq_len_new;
+
+            auto* cache_slice = ggml_view_4d(ctx, cache,
+                view_ne[0], view_ne[1], view_ne[2], view_ne[3],
+                cache->nb[1], cache->nb[2], cache->nb[3], offset_bytes);
+
+            auto* val_c = ensure_cont(ctx, value);
+            gt = ggml_cpy(ctx, val_c, cache_slice);
+            gt = cache;  // return full cache for downstream reads
+          }
           break;
         }
 
@@ -5289,6 +5336,28 @@ Error GgmlBackendInterface::execute(
           ec.tensor->data = base + offset;
           ec.tensor->buffer = active->eager_const_buf;
           offset += ((nbytes + alignment - 1) / alignment) * alignment;
+        }
+      }
+    }
+
+    // Force GPU backend for the first few ops that touch graph inputs.
+    // Without this, the scheduler places them on CPU (since inputs start on
+    // CPU host memory), creating a graph split that prevents CUDA graphs.
+    if (handle->backend && handle->backend != handle->backend_cpu) {
+      for (int i = 0; i < ggml_graph_n_nodes(active->graph); i++) {
+        struct ggml_tensor* node = active->graph->nodes[i];
+        // Only force the first non-view, non-pinned node per input.
+        // Check if any source is an input leaf (on CPU / no buffer).
+        bool has_input_leaf = false;
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+          auto* s = node->src[j];
+          if (s && (s->flags & GGML_TENSOR_FLAG_INPUT) && !ggml_is_view(node)) {
+            has_input_leaf = true;
+            break;
+          }
+        }
+        if (has_input_leaf) {
+          ggml_backend_sched_set_tensor_backend(active->sched, node, handle->backend);
         }
       }
     }
