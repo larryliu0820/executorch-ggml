@@ -3,10 +3,9 @@
 
 if(EXECUTORCH_GGML_BUILD_LLAMA_RUNNER)
 
+# Build as plain C++ executable. CUDA device symbols are resolved
+# through the fused_kernels static lib (linked via executorch_ggml_runtime).
 add_executable(benchmark_llm benchmark_llm.cpp)
-set_target_properties(benchmark_llm PROPERTIES
-  CUDA_RESOLVE_DEVICE_SYMBOLS OFF
-  CUDA_SEPARABLE_COMPILATION OFF)
 
 target_include_directories(benchmark_llm PRIVATE
   "${CMAKE_SOURCE_DIR}/runtime"
@@ -19,7 +18,7 @@ target_include_directories(benchmark_llm PRIVATE
 )
 
 target_link_libraries(benchmark_llm PRIVATE
-  executorch_ggml_runtime
+  -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
   -Wl,--no-as-needed executorch -Wl,--as-needed
   ggml ggml-base ggml-cpu
   extension_module_static
@@ -34,6 +33,10 @@ if(TARGET ggml-metal)
 endif()
 if(TARGET ggml-cuda)
   target_link_libraries(benchmark_llm PRIVATE ggml-cuda)
+  # CUDA runtime needed for fused kernels linked through executorch_ggml_runtime.
+  # Use -Wl,--no-as-needed to force cudart even though benchmark_llm itself
+  # doesn't directly reference CUDA symbols.
+  target_link_libraries(benchmark_llm PRIVATE -Wl,--no-as-needed -L/usr/local/cuda/lib64 -lcudart -Wl,--as-needed)
 endif()
 if(TARGET portable_ops_lib)
   target_link_libraries(benchmark_llm PRIVATE -Wl,--no-as-needed portable_ops_lib portable_kernels -Wl,--as-needed)

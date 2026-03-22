@@ -132,7 +132,7 @@ if(CMAKE_CUDA_COMPILER)
   add_library(executorch_ggml_fused_kernels STATIC runtime/fused_kernels.cu)
   target_include_directories(executorch_ggml_fused_kernels PRIVATE "${LLAMA_CPP_DIR}/ggml/include")
   set_target_properties(executorch_ggml_fused_kernels PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_SEPARABLE_COMPILATION OFF
     POSITION_INDEPENDENT_CODE ON)
 endif()
 

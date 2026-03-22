@@ -57,9 +57,11 @@ target_link_libraries(executorch_ggml_runtime PRIVATE
   ggml-cpu
 )
 
-# Link fused CUDA kernels
+# Link fused CUDA kernels (PRIVATE to avoid propagating CUDA device link to consumers)
 if(TARGET executorch_ggml_fused_kernels)
-  target_link_libraries(executorch_ggml_runtime PRIVATE executorch_ggml_fused_kernels)
+  # Link the .a directly without cmake CUDA device link propagation
+  target_link_libraries(executorch_ggml_runtime PRIVATE
+    $<TARGET_FILE:executorch_ggml_fused_kernels>)
   target_compile_definitions(executorch_ggml_runtime PRIVATE GGML_FUSED_KERNELS=1)
 endif()
 
