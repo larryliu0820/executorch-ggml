@@ -186,6 +186,14 @@ if(TARGET ggml-cuda)
   )
 endif()
 
+if(CMAKE_CUDA_COMPILER)
+  add_library(executorch_ggml_fused_kernels STATIC runtime/fused_kernels.cu)
+  target_include_directories(executorch_ggml_fused_kernels PRIVATE "${LLAMA_CPP_DIR}/ggml/include")
+  set_target_properties(executorch_ggml_fused_kernels PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON)
+endif()
+
 add_library(executorch_ggml_backend_py MODULE
   runtime/ggml_backend.cpp
   python/executorch_ggml/_ggml_backend_pybind.cpp
@@ -243,6 +251,10 @@ if(TARGET ggml-metal)
 endif()
 if(TARGET ggml-cuda)
   target_link_libraries(executorch_ggml_backend_py PRIVATE ggml-cuda)
+  if(TARGET executorch_ggml_fused_kernels)
+    target_link_libraries(executorch_ggml_backend_py PRIVATE executorch_ggml_fused_kernels)
+    target_compile_definitions(executorch_ggml_backend_py PRIVATE GGML_FUSED_KERNELS=1)
+  endif()
 endif()
 
 # ExecuTorch symbols are expected to resolve from the already-loaded

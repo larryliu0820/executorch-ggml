@@ -1037,6 +1037,66 @@ static bool profile_eval_callback(struct ggml_tensor* t, bool ask, void* user_da
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Fused kernel eval callback — replaces multi-node subgraphs with single
+// CUDA kernels for reduced node count and memory traffic.
+// ---------------------------------------------------------------------------
+#ifdef GGML_FUSED_KERNELS
+extern "C" void launch_fused_silu_gate(
+    const void* gate, const void* up, void* output,
+    int64_t n, void* stream);
+#endif
+
+struct FusedKernelContext {
+  // Tensors whose SiLU output should be skipped (fused into downstream MUL)
+  std::unordered_set<struct ggml_tensor*> skip_silu;
+};
+
+static bool fused_eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
+  if (!ask) return true;
+#ifdef GGML_FUSED_KERNELS
+  auto* ctx = static_cast<FusedKernelContext*>(user_data);
+
+  // Skip SiLU nodes that are fused into downstream MUL
+  if (t->op == GGML_OP_UNARY && ctx->skip_silu.count(t)) {
+    return false;  // skip — the fused MUL kernel will handle it
+  }
+
+  // SiLU-gate fusion: MUL(UNARY(SiLU, gate), up) → fused_silu_gate(gate, up)
+  if (t->op == GGML_OP_MUL && t->src[0] && t->src[1]) {
+    struct ggml_tensor* silu_src = nullptr;
+    struct ggml_tensor* up_src = nullptr;
+
+    // Check which src is the SiLU output
+    for (int i = 0; i < 2; i++) {
+      if (t->src[i]->op == GGML_OP_UNARY &&
+          ggml_get_unary_op(t->src[i]) == GGML_UNARY_OP_SILU &&
+          t->src[i]->type == GGML_TYPE_F32) {
+        silu_src = t->src[i];
+        up_src = t->src[1 - i];
+        break;
+      }
+    }
+
+    if (silu_src && up_src && silu_src->src[0]) {
+      // gate = silu_src->src[0] (input to SiLU)
+      const void* gate = silu_src->src[0]->data;
+      const void* up = up_src->data;
+      void* output = t->data;
+      int64_t n = ggml_nelements(t);
+
+      if (gate && up && output && n > 0) {
+        launch_fused_silu_gate(gate, up, output, n, nullptr);
+        return false;  // skip ggml's MUL
+      }
+    }
+  }
+#else
+  (void)user_data;
+#endif
+  return true;  // let ggml handle it
+}
+
 static void print_profile(const ProfileContext& ctx) {
   // Sort by total time descending
   std::vector<std::pair<int, OpProfile>> sorted(ctx.by_op.begin(), ctx.by_op.end());
@@ -5347,6 +5407,35 @@ Error GgmlBackendInterface::execute(
     ggml_backend_sched_set_eval_callback(active->sched, profile_eval_callback, &prof_ctx);
   }
 
+  // Fused kernels via eval callback — available but NOT enabled by default.
+  // The per-node callback overhead (~1μs × n_nodes) exceeds the fusion savings
+  // for small models. Enable with GGML_FUSED_KERNELS=1 for larger models.
+  FusedKernelContext fused_ctx;
+#ifdef GGML_FUSED_KERNELS
+  {
+    static int fused_mode = -1;
+    if (fused_mode < 0) {
+      const char* env = std::getenv("GGML_FUSED_KERNELS");
+      fused_mode = (env && std::string(env) != "0") ? 1 : 0;
+    }
+    if (fused_mode && !profile_mode) {
+      for (int i = 0; i < active->graph->n_nodes; i++) {
+        struct ggml_tensor* node = active->graph->nodes[i];
+        if (node->op != GGML_OP_MUL) continue;
+        for (int s = 0; s < 2; s++) {
+          if (node->src[s] && node->src[s]->op == GGML_OP_UNARY &&
+              ggml_get_unary_op(node->src[s]) == GGML_UNARY_OP_SILU) {
+            fused_ctx.skip_silu.insert(node->src[s]);
+          }
+        }
+      }
+      if (!fused_ctx.skip_silu.empty()) {
+        ggml_backend_sched_set_eval_callback(active->sched, fused_eval_callback, &fused_ctx);
+      }
+    }
+  }
+#endif
+
   // Debug tensor dump (GGML_DEBUG_DUMP=<path>)
   DebugDumpContext debug_ctx;
   {
@@ -5373,6 +5462,11 @@ Error GgmlBackendInterface::execute(
     ggml_backend_sched_set_eval_callback(active->sched, nullptr, nullptr);
     print_profile(prof_ctx);
   }
+#ifdef GGML_FUSED_KERNELS
+  if (!fused_ctx.skip_silu.empty()) {
+    ggml_backend_sched_set_eval_callback(active->sched, nullptr, nullptr);
+  }
+#endif
 
   if (status != GGML_STATUS_SUCCESS) {
     fprintf(stderr, "[ggml_backend] ERROR: scheduler graph compute failed: %s (%d)\n",
