@@ -5453,6 +5453,40 @@ Error GgmlBackendInterface::execute(
   // Sync before output copy (async compute may not have finished).
   ggml_backend_sched_synchronize(active->sched);
 
+  // GGML_SKIP_OUTPUT_COPY: skip GPU→CPU copy for output tensors.
+  // Instead, point the ET tensor's data pointer directly at the GPU buffer.
+  // The caller must handle GPU data (e.g., use a CUDA argmax sampler).
+  // This saves ~0.15ms/tok for the logits copy (608KB for Qwen3 vocab).
+  static int skip_output_copy = -1;
+  if (skip_output_copy < 0) {
+    const char* env = std::getenv("GGML_SKIP_OUTPUT_COPY");
+    skip_output_copy = (env && std::string(env) != "0") ? 1 : 0;
+  }
+
+  if (skip_output_copy) {
+    for (size_t i = 0; i < n_outputs; ++i) {
+      size_t out_idx = args.size() - n_outputs + i;
+      if (out_idx >= (size_t)args.size() || !args[out_idx]->isTensor()) continue;
+      auto& et_tensor = args[out_idx]->toTensor();
+      struct ggml_tensor* gt = active->outputs[i];
+      // Resize ET tensor to match ggml shape
+      int et_ndim = et_tensor.dim();
+      std::vector<executorch::aten::SizesType> new_sizes(et_ndim);
+      for (int d = 0; d < et_ndim; ++d) {
+        new_sizes[d] = static_cast<executorch::aten::SizesType>(gt->ne[et_ndim - 1 - d]);
+      }
+      executorch::ET_RUNTIME_NAMESPACE::resize_tensor(
+          et_tensor, {new_sizes.data(), new_sizes.size()});
+      // Point ET tensor data directly at GPU buffer (zero-copy).
+      // WARNING: this data lives on GPU. The caller must not dereference
+      // it on CPU without copying first.
+      et_tensor.unsafeGetTensorImpl()->set_data(gt->data);
+    }
+    auto t_output_copy = std::chrono::high_resolution_clock::now();
+    // Skip to timing/return section
+    goto execute_done;
+  }
+
   // Copy output data from backend tensors → ExecuTorch output tensors.
   for (size_t i = 0; i < n_outputs; ++i) {
     size_t out_idx = args.size() - n_outputs + i;
@@ -5520,8 +5554,8 @@ Error GgmlBackendInterface::execute(
       ggml_backend_tensor_get(gt, et_tensor.mutable_data_ptr(), 0, copy_size);
     }
   }
+execute_done:
   auto t_output_copy = std::chrono::high_resolution_clock::now();
-
   // --- Performance logging ---
   {
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };

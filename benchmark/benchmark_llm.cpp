@@ -23,6 +23,9 @@ using executorch::extension::TensorPtr;
 using executorch::extension::from_blob;
 using executorch::runtime::Error;
 
+// CUDA argmax for GPU-resident logits (when GGML_SKIP_OUTPUT_COPY=1)
+extern "C" int64_t cuda_argmax_f32(const void* gpu_data, int64_t n);
+
 static double now_ms() {
   auto t = std::chrono::high_resolution_clock::now();
   return std::chrono::duration<double, std::milli>(t.time_since_epoch()).count();
@@ -36,6 +39,8 @@ int main(int argc, char** argv) {
   const char* model_path = argv[1];
   int n_decode = 32;
   int prompt_len = 5;
+  bool skip_copy = (std::getenv("GGML_SKIP_OUTPUT_COPY") &&
+                    std::string(std::getenv("GGML_SKIP_OUTPUT_COPY")) != "0");
 
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "--n-decode") == 0 && i + 1 < argc) {
@@ -110,14 +115,21 @@ int main(int argc, char** argv) {
   // Get logits and find argmax for last token
   auto& logits = prefill_result->at(0).toTensor();
   int64_t vocab_size = logits.size(2);
-  const float* logits_data = logits.const_data_ptr<float>();
-  int64_t offset = (prompt_len - 1) * vocab_size;
   int64_t next_token = 0;
-  float max_val = logits_data[offset];
-  for (int64_t v = 1; v < vocab_size; v++) {
-    if (logits_data[offset + v] > max_val) {
-      max_val = logits_data[offset + v];
-      next_token = v;
+  if (skip_copy) {
+    // Logits data is on GPU — use CUDA argmax
+    const float* gpu_data = logits.const_data_ptr<float>();
+    int64_t offset = (prompt_len - 1) * vocab_size;
+    next_token = cuda_argmax_f32(gpu_data + offset, vocab_size);
+  } else {
+    const float* logits_data = logits.const_data_ptr<float>();
+    int64_t offset = (prompt_len - 1) * vocab_size;
+    float max_val = logits_data[offset];
+    for (int64_t v = 1; v < vocab_size; v++) {
+      if (logits_data[offset + v] > max_val) {
+        max_val = logits_data[offset + v];
+        next_token = v;
+      }
     }
   }
 
@@ -145,13 +157,17 @@ int main(int argc, char** argv) {
     }
 
     auto& step_logits = result->at(0).toTensor();
-    const float* ld = step_logits.const_data_ptr<float>();
-    next_token = 0;
-    max_val = ld[0];
-    for (int64_t v = 1; v < vocab_size; v++) {
-      if (ld[v] > max_val) {
-        max_val = ld[v];
-        next_token = v;
+    if (skip_copy) {
+      next_token = cuda_argmax_f32(step_logits.const_data_ptr<float>(), vocab_size);
+    } else {
+      const float* ld = step_logits.const_data_ptr<float>();
+      next_token = 0;
+      float max_val = ld[0];
+      for (int64_t v = 1; v < vocab_size; v++) {
+        if (ld[v] > max_val) {
+          max_val = ld[v];
+          next_token = v;
+        }
       }
     }
     generated.push_back(next_token);

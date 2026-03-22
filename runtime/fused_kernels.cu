@@ -51,6 +51,49 @@ extern "C" void ggml_fused_silu_gate(
 }
 
 // ---------------------------------------------------------------------------
+// GPU argmax: find the index of the max element in a float array on GPU.
+// Used by the benchmark when GGML_SKIP_OUTPUT_COPY=1 (logits stay on GPU).
+// ---------------------------------------------------------------------------
+__global__ void argmax_kernel(const float* __restrict__ data, int64_t n,
+                              int64_t* __restrict__ result) {
+  __shared__ float s_max[256];
+  __shared__ int64_t s_idx[256];
+
+  float local_max = -INFINITY;
+  int64_t local_idx = 0;
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+    float v = data[i];
+    if (v > local_max) { local_max = v; local_idx = i; }
+  }
+  s_max[threadIdx.x] = local_max;
+  s_idx[threadIdx.x] = local_idx;
+  __syncthreads();
+
+  // Reduce within block
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      if (s_max[threadIdx.x + stride] > s_max[threadIdx.x]) {
+        s_max[threadIdx.x] = s_max[threadIdx.x + stride];
+        s_idx[threadIdx.x] = s_idx[threadIdx.x + stride];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) *result = s_idx[0];
+}
+
+// Launch argmax on GPU, copy single int64 result back to CPU.
+extern "C" int64_t cuda_argmax_f32(const void* gpu_data, int64_t n) {
+  int64_t* d_result;
+  cudaMalloc(&d_result, sizeof(int64_t));
+  argmax_kernel<<<1, 256>>>(static_cast<const float*>(gpu_data), n, d_result);
+  int64_t h_result;
+  cudaMemcpy(&h_result, d_result, sizeof(int64_t), cudaMemcpyDeviceToHost);
+  cudaFree(d_result);
+  return h_result;
+}
+
+// ---------------------------------------------------------------------------
 // RMSNorm + weight fusion: rms_norm(x, eps) * weight
 // Replaces: RMS_NORM(x) → MUL(norm_out, weight)  (2 nodes → 1)
 // Saves: 1 global memory round-trip for the intermediate norm output
