@@ -4593,7 +4593,9 @@ static Error build_graph(
   }
   // Strip view-only nodes (RESHAPE, VIEW, PERMUTE, TRANSPOSE) from the graph.
   // These have no CUDA kernel — removing them reduces per-node iteration overhead
-  // in the scheduler and CUDA graph replay loop.
+  // in the scheduler and CUDA graph replay loop (338 vs 294 tok/s).
+  // Note: this prevents ggml's built-in CUDA fusions (RMS_NORM+MUL, etc.) from
+  // firing since they check consecutive nodes. But the node reduction wins.
   {
     int w = 0;
     for (int r = 0; r < graph->n_nodes; r++) {
