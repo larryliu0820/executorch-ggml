@@ -25,6 +25,9 @@
 #include <ggml.h>
 #include <ggml-backend.h>
 #include <ggml-alloc.h>
+// ggml_cgraph struct definition for graph compaction (stripping view nodes).
+// Only the struct layout is needed — no ggml-internal functions are called.
+#include "../third-party/llama.cpp/ggml/src/ggml-impl.h"
 #include <ggml-cpu.h>
 #include <ggml-backend.h>
 
@@ -1589,6 +1592,33 @@ static struct ggml_tensor* safe_ggml_permute(struct ggml_context* ctx, struct gg
   }
   // Identity permute → no-op
   if (axis0 == 0 && axis1 == 1 && axis2 == 2 && axis3 == 3) return a;
+  // Size-1 dim swap: when permuting dims where at least one has ne==1,
+  // the data layout is unchanged. Replace with RESHAPE (no CUDA kernel).
+  // This fires for decode (T=1) where H↔T swaps are data no-ops.
+  if (ggml_is_contiguous(a)) {
+    int64_t pne[4] = {a->ne[axis0], a->ne[axis1], a->ne[axis2], a->ne[axis3]};
+    bool is_size1_swap = (pne[0] != a->ne[0] || pne[1] != a->ne[1] ||
+                          pne[2] != a->ne[2] || pne[3] != a->ne[3]);
+    if (is_size1_swap) {
+      bool all_swaps_trivial = true;
+      for (int i = 0; i < 4; i++) {
+        if (pne[i] != a->ne[i] && pne[i] != 1 && a->ne[i] != 1) {
+          all_swaps_trivial = false;
+          break;
+        }
+      }
+      if (all_swaps_trivial) {
+        // Peel through source RESHAPEs to compose into one
+        struct ggml_tensor* base = a;
+        while (base->op == GGML_OP_RESHAPE && base->src[0]) base = base->src[0];
+        // Identity check after reshape composition
+        if (base->ne[0] == pne[0] && base->ne[1] == pne[1] &&
+            base->ne[2] == pne[2] && base->ne[3] == pne[3])
+          return base;
+        return ggml_reshape_4d(ctx, base, pne[0], pne[1], pne[2], pne[3]);
+      }
+    }
+  }
   // Compose consecutive permutes: PERMUTE(PERMUTE(x, p1), p2) = PERMUTE(x, p1∘p2)
   if (a->op == GGML_OP_PERMUTE) {
     int p1[4];
@@ -4498,6 +4528,21 @@ static Error build_graph(
   struct ggml_cgraph* graph = ggml_new_graph_custom(ctx, est_graph_size, false);
   for (auto* out : output_tensors) {
     ggml_build_forward_expand(graph, out);
+  }
+  // Strip view-only nodes (RESHAPE, VIEW, PERMUTE, TRANSPOSE) from the graph.
+  // These have no CUDA kernel — removing them reduces per-node iteration overhead
+  // in the scheduler and CUDA graph replay loop.
+  {
+    int w = 0;
+    for (int r = 0; r < graph->n_nodes; r++) {
+      ggml_op op = graph->nodes[r]->op;
+      if (op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+          op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE) {
+        continue;
+      }
+      graph->nodes[w++] = graph->nodes[r];
+    }
+    graph->n_nodes = w;
   }
   auto t_bg_graph_end = std::chrono::high_resolution_clock::now();
   if (verbose) fprintf(stderr, "[ggml_backend] graph built: %d nodes, %d leafs (max %zu)\n",
