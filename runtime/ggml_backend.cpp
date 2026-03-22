@@ -1041,61 +1041,12 @@ static bool profile_eval_callback(struct ggml_tensor* t, bool ask, void* user_da
 // Fused kernel eval callback — replaces multi-node subgraphs with single
 // CUDA kernels for reduced node count and memory traffic.
 // ---------------------------------------------------------------------------
+// Fused CUDA kernel declarations — called via ggml_map_custom2 on GPU.
 #ifdef GGML_FUSED_KERNELS
-extern "C" void launch_fused_silu_gate(
-    const void* gate, const void* up, void* output,
-    int64_t n, void* stream);
+extern "C" void ggml_fused_silu_gate(
+    struct ggml_tensor* dst, const struct ggml_tensor* a,
+    const struct ggml_tensor* b, int ith, int nth, void* userdata);
 #endif
-
-struct FusedKernelContext {
-  // Tensors whose SiLU output should be skipped (fused into downstream MUL)
-  std::unordered_set<struct ggml_tensor*> skip_silu;
-};
-
-static bool fused_eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
-  if (!ask) return true;
-#ifdef GGML_FUSED_KERNELS
-  auto* ctx = static_cast<FusedKernelContext*>(user_data);
-
-  // Skip SiLU nodes that are fused into downstream MUL
-  if (t->op == GGML_OP_UNARY && ctx->skip_silu.count(t)) {
-    return false;  // skip — the fused MUL kernel will handle it
-  }
-
-  // SiLU-gate fusion: MUL(UNARY(SiLU, gate), up) → fused_silu_gate(gate, up)
-  if (t->op == GGML_OP_MUL && t->src[0] && t->src[1]) {
-    struct ggml_tensor* silu_src = nullptr;
-    struct ggml_tensor* up_src = nullptr;
-
-    // Check which src is the SiLU output
-    for (int i = 0; i < 2; i++) {
-      if (t->src[i]->op == GGML_OP_UNARY &&
-          ggml_get_unary_op(t->src[i]) == GGML_UNARY_OP_SILU &&
-          t->src[i]->type == GGML_TYPE_F32) {
-        silu_src = t->src[i];
-        up_src = t->src[1 - i];
-        break;
-      }
-    }
-
-    if (silu_src && up_src && silu_src->src[0]) {
-      // gate = silu_src->src[0] (input to SiLU)
-      const void* gate = silu_src->src[0]->data;
-      const void* up = up_src->data;
-      void* output = t->data;
-      int64_t n = ggml_nelements(t);
-
-      if (gate && up && output && n > 0) {
-        launch_fused_silu_gate(gate, up, output, n, nullptr);
-        return false;  // skip ggml's MUL
-      }
-    }
-  }
-#else
-  (void)user_data;
-#endif
-  return true;  // let ggml handle it
-}
 
 static void print_profile(const ProfileContext& ctx) {
   // Sort by total time descending
@@ -2446,6 +2397,52 @@ static Error build_graph(
           // Swap if needed so the larger tensor is first.
           struct ggml_tensor* a = srcs[0];
           struct ggml_tensor* b = srcs[1];
+#if 0  // SiLU-gate fusion — DISABLED for debugging
+          // SiLU-gate AOT fusion: MUL(SILU(gate), up) → fused_silu_gate(gate, up)
+          // Detect: one src is UNARY(SiLU), use its input (gate) + other src (up)
+          {
+            struct ggml_tensor* gate = nullptr;
+            struct ggml_tensor* up = nullptr;
+            static int _silu_dbg = -1;
+            if (_silu_dbg < 0) { const char* e = std::getenv("GGML_SILU_DBG"); _silu_dbg = (e && *e != '0') ? 1 : 0; }
+            if (_silu_dbg) fprintf(stderr, "[silu_fuse] MUL: a->op=%d b->op=%d\n", a->op, b->op);
+            // Pattern: MUL(x, SIGMOID(x)) followed by MUL(silu_result, up)
+            // PyTorch decomposes silu(x) = x * sigmoid(x), so the IR has:
+            //   SIGMOID(gate) → MUL(gate, sigmoid_gate)  [= silu(gate)]
+            //   MUL(silu_gate, up)                        [= gate activation]
+            // We detect the OUTER MUL where one src is a MUL(x, SIGMOID(x)).
+            for (int si = 0; si < 2; si++) {
+              struct ggml_tensor* s = (si == 0) ? a : b;
+              // Check if s is MUL(x, SIGMOID(x)) — the decomposed silu
+              if (s->op == GGML_OP_MUL && s->src[0] && s->src[1]) {
+                struct ggml_tensor* sigmoid_t = nullptr;
+                struct ggml_tensor* x_t = nullptr;
+                for (int j = 0; j < 2; j++) {
+                  if (s->src[j]->op == GGML_OP_UNARY &&
+                      ggml_get_unary_op(s->src[j]) == GGML_UNARY_OP_SIGMOID) {
+                    sigmoid_t = s->src[j];
+                    x_t = s->src[1-j];
+                    break;
+                  }
+                }
+                // Verify sigmoid input matches x (silu(x) = x * sigmoid(x))
+                if (sigmoid_t && x_t && sigmoid_t->src[0] == x_t) {
+                  gate = x_t;            // gate_proj output
+                  up = (si == 0) ? b : a; // up_proj output
+                  break;
+                }
+              }
+            }
+            if (gate && up) {
+              if (verbose) fprintf(stderr, "[ggml_backend] SiLU-gate fusion: gate ne=[%lld,%lld] up ne=[%lld,%lld]\n",
+                  (long long)gate->ne[0], (long long)gate->ne[1],
+                  (long long)up->ne[0], (long long)up->ne[1]);
+              gt = ggml_map_custom2(ctx, gate, up,
+                  ggml_fused_silu_gate, 1, nullptr);
+              break;
+            }
+          }
+#endif
           if (auto* eager = try_eager_scalar_binop(ctx, a, b, '*', host_acc)) {
             gt = eager;
             break;
@@ -5407,34 +5404,8 @@ Error GgmlBackendInterface::execute(
     ggml_backend_sched_set_eval_callback(active->sched, profile_eval_callback, &prof_ctx);
   }
 
-  // Fused kernels via eval callback — available but NOT enabled by default.
-  // The per-node callback overhead (~1μs × n_nodes) exceeds the fusion savings
-  // for small models. Enable with GGML_FUSED_KERNELS=1 for larger models.
-  FusedKernelContext fused_ctx;
-#ifdef GGML_FUSED_KERNELS
-  {
-    static int fused_mode = -1;
-    if (fused_mode < 0) {
-      const char* env = std::getenv("GGML_FUSED_KERNELS");
-      fused_mode = (env && std::string(env) != "0") ? 1 : 0;
-    }
-    if (fused_mode && !profile_mode) {
-      for (int i = 0; i < active->graph->n_nodes; i++) {
-        struct ggml_tensor* node = active->graph->nodes[i];
-        if (node->op != GGML_OP_MUL) continue;
-        for (int s = 0; s < 2; s++) {
-          if (node->src[s] && node->src[s]->op == GGML_OP_UNARY &&
-              ggml_get_unary_op(node->src[s]) == GGML_UNARY_OP_SILU) {
-            fused_ctx.skip_silu.insert(node->src[s]);
-          }
-        }
-      }
-      if (!fused_ctx.skip_silu.empty()) {
-        ggml_backend_sched_set_eval_callback(active->sched, fused_eval_callback, &fused_ctx);
-      }
-    }
-  }
-#endif
+  // Note: SiLU-gate fusion is now done AOT in build_graph (Phase B MUL handler)
+  // via ggml_map_custom2, not via eval callback. No runtime setup needed.
 
   // Debug tensor dump (GGML_DEBUG_DUMP=<path>)
   DebugDumpContext debug_ctx;
@@ -5462,11 +5433,6 @@ Error GgmlBackendInterface::execute(
     ggml_backend_sched_set_eval_callback(active->sched, nullptr, nullptr);
     print_profile(prof_ctx);
   }
-#ifdef GGML_FUSED_KERNELS
-  if (!fused_ctx.skip_silu.empty()) {
-    ggml_backend_sched_set_eval_callback(active->sched, nullptr, nullptr);
-  }
-#endif
 
   if (status != GGML_STATUS_SUCCESS) {
     fprintf(stderr, "[ggml_backend] ERROR: scheduler graph compute failed: %s (%d)\n",
