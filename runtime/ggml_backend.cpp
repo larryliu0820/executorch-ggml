@@ -1585,8 +1585,20 @@ static struct ggml_tensor* safe_ggml_permute(struct ggml_context* ctx, struct gg
     fprintf(stderr, "[ggml_backend] %s: invalid permute axes [%d,%d,%d,%d], src ne=[%lld,%lld,%lld,%lld]\n",
             caller, axis0, axis1, axis2, axis3,
             (long long)a->ne[0], (long long)a->ne[1], (long long)a->ne[2], (long long)a->ne[3]);
-    // Clamp to identity permute to avoid crash
     return a;
+  }
+  // Identity permute → no-op
+  if (axis0 == 0 && axis1 == 1 && axis2 == 2 && axis3 == 3) return a;
+  // Compose consecutive permutes: PERMUTE(PERMUTE(x, p1), p2) = PERMUTE(x, p1∘p2)
+  if (a->op == GGML_OP_PERMUTE) {
+    int p1[4];
+    memcpy(p1, a->op_params, 4 * sizeof(int));
+    int p2[4] = {axis0, axis1, axis2, axis3};
+    int composed[4] = {p1[p2[0]], p1[p2[1]], p1[p2[2]], p1[p2[3]]};
+    // Check if composed is identity
+    if (composed[0] == 0 && composed[1] == 1 && composed[2] == 2 && composed[3] == 3)
+      return a->src[0];
+    return ggml_permute(ctx, a->src[0], composed[0], composed[1], composed[2], composed[3]);
   }
   return ggml_permute(ctx, a, axis0, axis1, axis2, axis3);
 }

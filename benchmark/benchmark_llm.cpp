@@ -74,6 +74,21 @@ int main(int argc, char** argv) {
   std::vector<int64_t> cache_pos(prompt_len);
   for (int i = 0; i < prompt_len; i++) cache_pos[i] = i;
 
+  // --- Warmup (triggers graph build + sched_alloc for both shapes) ---
+  {
+    fprintf(stderr, "Warmup ...\n");
+    auto w_ids = from_blob(prompt_ids.data(), {1, prompt_len},
+                           executorch::aten::ScalarType::Long);
+    auto w_pos = from_blob(cache_pos.data(), {prompt_len},
+                           executorch::aten::ScalarType::Long);
+    (void)model.forward({*w_ids, *w_pos});  // prefill shape
+    int64_t tok = 1, pos = prompt_len;
+    auto w_tok = from_blob(&tok, {1, 1}, executorch::aten::ScalarType::Long);
+    auto w_p = from_blob(&pos, {1}, executorch::aten::ScalarType::Long);
+    (void)model.forward({*w_tok, *w_p});     // decode shape
+    fprintf(stderr, "Warmup done.\n");
+  }
+
   // --- Prefill ---
   fprintf(stderr, "Prefill (%d tokens) ...\n", prompt_len);
   auto input_ids = from_blob(
