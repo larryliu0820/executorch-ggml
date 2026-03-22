@@ -12,7 +12,8 @@ Decode throughput progression for **Qwen3-0.6B Q8_0 on A100-SXM4-40GB**:
 | + GQA REPEAT elimination | 1475 | 4.9 | 203 | 0.61x |
 | + RMSNorm weight folding | 1418 | 4.8 | 209 | 0.62x |
 | + Mask conversion cache | 1310 | 4.3 | 231 | 0.69x |
-| **llama.cpp** (reference) | ~700 | ~3.0 | 335 | 1.0x |
+| + RESHAPE collapse + PERMUTE compose | 1142 | 3.6 | 280 | 0.74x |
+| **llama.cpp** (reference) | ~700 | ~2.6 | 380 | 1.0x |
 
 ## 1. Graph Cache (`GGML_GRAPH_CACHE=1`)
 
@@ -116,13 +117,13 @@ the original decomposed ops are kept (no correctness risk).
 REPEAT before passing to attention. For Qwen3 (8 KV heads, 16 Q heads), each layer has
 2 REPEATs + 4 RESHAPEs = 168 nodes total.
 
-**Solution**: The C++ SDPA handler strips the REPEAT by tracing back through
-RESHAPE → REPEAT → RESHAPE and passing the un-expanded K/V directly to
-`ggml_flash_attn_ext`, which handles GQA natively (`gqa_ratio = Q.ne[2] / K.ne[2]`).
+**Solution**: AOT FX pass `strip_gqa_expand` removes the `unsqueeze → expand → reshape`
+chain from SDPA's K/V args, sets `enable_gqa=True`. The ggml backend's `flash_attn_ext`
+handles GQA natively (`gqa_ratio = Q.ne[2] / K.ne[2]`).
 
 **Result**: 56 REPEAT + 112 RESHAPE eliminated. Nodes: 1643 -> 1475 (-10%).
 
-**Files**: `runtime/ggml_backend.cpp` (LLAMA_ATTENTION handler, `strip_gqa_repeat` lambda)
+**Files**: `python/executorch_ggml/passes/strip_gqa_expand_pass.py`
 
 ## 6. RMSNorm Weight Folding
 
@@ -165,17 +166,37 @@ Nodes: 1418 -> 1310 (-8%).
 
 **Files**: `runtime/ggml_backend.cpp` (LLAMA_ATTENTION handler, mask cache lookup)
 
+## 8. RESHAPE Collapse + PERMUTE Composition
+
+**Problem**: The C++ VIEW handler creates ggml RESHAPE nodes for each IR view/reshape.
+Consecutive RESHAPEs accumulate (e.g. `RESHAPE(RESHAPE(RESHAPE(x)))`) because each
+linear op reshapes its input/output. Similarly, the SDPA handler's output permute
+followed by a downstream transpose creates redundant PERMUTE(PERMUTE(x)) pairs.
+
+**Solution**:
+- **RESHAPE collapse**: The VIEW handler skips intermediate RESHAPE sources, connecting
+  directly to the first non-RESHAPE tensor. `RESHAPE(RESHAPE(RESHAPE(x))) → RESHAPE(x)`.
+- **PERMUTE composition**: `safe_ggml_permute` composes consecutive permutes
+  `PERMUTE(PERMUTE(x, p1), p2) → PERMUTE(x, p1∘p2)` and detects identity permutes.
+  The 28 double-permutes after SDPA compose to identity (eliminated entirely).
+
+**Result**: 117 RESHAPE chains collapsed + 56 PERMUTE ops eliminated.
+Nodes: 1310 -> 1142 (-13%).
+
+**Files**: `runtime/ggml_backend.cpp` (VIEW handler, `safe_ggml_permute`)
+
 ## Remaining gap to llama.cpp
 
-We have 1310 nodes vs llama.cpp's ~700. The remaining 610-node difference comes from:
+We have 1142 nodes vs llama.cpp's ~700. GPU compute time is identical (~1.7ms).
+The entire gap (~1.1ms) is CUDA graph replay overhead from extra nodes.
 
-- **View ops** (564 RESHAPE + 140 PERMUTE = 704): Zero-compute layout operations that
-  ExecuTorch's IR generates from PyTorch's decomposed attention reshaping. llama.cpp
-  builds Q/K/V views directly via the C API. These add CUDA graph overhead but no
-  GPU compute.
-- **56 q_norm/k_norm weight MULs**: Can't be folded (RoPE follows, not a linear).
-- **ExecuTorch Python overhead**: `method.execute()` goes through Python → pybind → C++
-  on each call (~0.3ms).
+The remaining ~440 extra nodes are **RESHAPE ops** from ggml's reversed dimension order.
+Each linear op requires `RESHAPE(flatten) → MUL_MAT → RESHAPE(unflatten) → RESHAPE(split_heads)`.
+llama.cpp avoids these by building tensors in the right layout via the C API.
+
+Closing this gap requires refactoring the C++ handlers (linear, attention, view) to
+minimize layout conversion nodes — essentially building the ggml graph more like
+llama.cpp does, while still consuming the ExecuTorch IR.
 
 ## Full export pipeline
 
@@ -183,6 +204,7 @@ We have 1310 nodes vs llama.cpp's ~700. The remaining 610-node difference comes 
 from executorch_ggml.modules.rms_norm import swap_rms_norm
 from executorch_ggml.passes.fold_rms_norm_weights import fold_rms_norm_weights
 from executorch_ggml.passes.fuse_rope_pass import fuse_rope_in_graph
+from executorch_ggml.passes.strip_gqa_expand_pass import strip_gqa_expand
 
 # 1. Module swaps (before export)
 swap_rms_norm(model)
@@ -193,7 +215,9 @@ ep = exportable.export()["model"]
 
 # 3. AOT graph passes (before edge lowering)
 fuse_rope_in_graph(ep.graph_module, head_dim, freq_base)
+strip_gqa_expand(ep.graph_module)
 
-# 4. Edge lowering (C++ handler applies GQA strip + mask cache automatically)
+# 4. Edge lowering (C++ handler applies RESHAPE collapse, PERMUTE compose,
+#    mask cache automatically)
 edge_mgr = to_edge_transform_and_lower(ep, ...)
 ```
