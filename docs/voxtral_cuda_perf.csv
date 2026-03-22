@@ -5,3 +5,6 @@ Baseline (swap_encoder_rope only),encoder,817,2,80.0,12.5,audio_s/s,"1000 mel fr
 Baseline (swap_voxtral_attention only),decoder,811,2,95.0,11,tok/s,"FP32 4B model; p50"
 + force-GPU input ops,decoder,811,1,25.0,40,tok/s,"splits 2→1; CUDA graphs active"
 + enable_gqa=True (no repeat_interleave),decoder,707,1,13.6,73,tok/s,"-104 REPEAT+CONT nodes; native GQA in flash_attn"
++ swap_decoder_rope (fused ggml.rope),decoder,497,1,13.2,76,tok/s,"-210 nodes from interleaved RoPE fusion (mode=0)"
++ fold_decoder_attention_norm,decoder,471,1,13.1,76,tok/s,"-26 MUL nodes from attention_norm weight folding"
++ skip_output_copy + CUDA argmax,decoder,471,1,0.2,~5000,tok/s,"output 13ms→0.01ms; ~0.1ms for argmax+D2H; compute-bound"

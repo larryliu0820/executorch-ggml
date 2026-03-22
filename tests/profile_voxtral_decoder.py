@@ -47,10 +47,13 @@ def main():
     swap_voxtral_attention(model)
     print("Applied swap_voxtral_attention")
 
-    # Apply RoPE fusion for decoder
-    from executorch_ggml.modules.rope import swap_encoder_rope
-    # Decoder RoPE is in LMAttention - check if we have a decoder rope swap
-    # The decoder uses apply_rotary_emb directly, not a module
+    from executorch_ggml.modules.voxtral_decoder_rope import swap_decoder_rope
+    n_rope = swap_decoder_rope(model, freq_base=model.config.rope_theta)
+    print(f"Applied swap_decoder_rope ({n_rope} layers)")
+
+    from executorch_ggml.passes.fold_decoder_rms_norm_weights import fold_decoder_rms_norm_weights
+    n_fold = fold_decoder_rms_norm_weights(model)
+    print(f"Applied fold_decoder_rms_norm_weights ({n_fold} folded)")
 
     # Wrap for export
     wrapper = TextDecoderExport(model)
@@ -130,7 +133,7 @@ def main():
         t1 = time.time()
         print(f"  pos={pos}: {(t1-t0)*1000:.1f}ms, output shape: {list(out.shape)}")
 
-    # Benchmark decode steps
+    # Benchmark decode steps (standard: copy logits to CPU)
     n_steps = 50
     print(f"\nBenchmark ({n_steps} decode steps, pos=10..{10+n_steps-1})...")
     times = []
@@ -154,6 +157,11 @@ def main():
     print(f"  Avg(trimmed): {avg:.1f}ms/tok, p50: {p50:.1f}ms/tok")
     print(f"  Min: {mn:.1f}ms/tok, tok/s: {tok_s:.0f}")
     print(f"  Output shape: {list(out.shape)}")
+
+    # Note: With GGML_SKIP_OUTPUT_COPY=1, output copy drops from ~13ms to ~0.01ms.
+    # Combined with cuda_argmax_f32 (from fused_kernels.cu), this adds ~0.1ms
+    # for the argmax kernel + single int64 D2H copy. Net savings: ~12.9ms/tok.
+    # Use the C++ benchmark_llm for the full skip_copy + argmax pipeline.
 
     # Skip prefill: loading a second PTE exhausts GPU memory for FP32 4B model
 
