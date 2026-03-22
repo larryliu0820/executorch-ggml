@@ -1046,6 +1046,9 @@ static bool profile_eval_callback(struct ggml_tensor* t, bool ask, void* user_da
 extern "C" void ggml_fused_silu_gate(
     struct ggml_tensor* dst, const struct ggml_tensor* a,
     const struct ggml_tensor* b, int ith, int nth, void* userdata);
+extern "C" void ggml_fused_rms_norm_weight(
+    struct ggml_tensor* dst, const struct ggml_tensor* a,
+    const struct ggml_tensor* b, int ith, int nth, void* userdata);
 #endif
 
 static void print_profile(const ProfileContext& ctx) {
@@ -4271,6 +4274,11 @@ static Error build_graph(
             memcpy(&has_weight, data + 4, sizeof(int32_t));
           }
 
+          // Note: RMSNorm+weight fusion via ggml_map_custom2 is available
+          // (ggml_fused_rms_norm_weight in fused_kernels.cu) but DISABLED:
+          // ggml's native RMS_NORM CUDA kernel is highly optimized and the
+          // fused kernel can't match it. 546 nodes but 287 tok/s vs 602
+          // nodes with 317 tok/s using separate ops. Needs a better kernel.
           gt = ggml_rms_norm(ctx, ensure_cont(ctx, srcs[0]), eps);
 
           if (has_weight && srcs.size() > 1) {
