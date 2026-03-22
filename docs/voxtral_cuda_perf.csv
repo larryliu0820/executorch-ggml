@@ -7,4 +7,5 @@ Baseline (swap_voxtral_attention only),decoder,811,2,95.0,11,tok/s,"FP32 4B mode
 + enable_gqa=True (no repeat_interleave),decoder,707,1,13.6,73,tok/s,"-104 REPEAT+CONT nodes; native GQA in flash_attn"
 + swap_decoder_rope (fused ggml.rope),decoder,497,1,13.2,76,tok/s,"-210 nodes from interleaved RoPE fusion (mode=0)"
 + fold_decoder_attention_norm,decoder,471,1,13.1,76,tok/s,"-26 MUL nodes from attention_norm weight folding"
-+ skip_output_copy + CUDA argmax,decoder,471,1,0.2,~5000,tok/s,"output 13ms→0.01ms; ~0.1ms for argmax+D2H; compute-bound"
++ skip_output_copy + CUDA argmax,decoder,471,1,12.70,78.8,tok/s,"C++ benchmark; skip 512KB logits D2H; -0.18ms/tok"
+C++ baseline (CPU argmax verified),decoder,471,1,12.88,77.7,tok/s,"C++ benchmark_voxtral; 100 decode steps; FP32 A100"
