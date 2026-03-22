@@ -42,21 +42,10 @@ extern "C" void ggml_fused_silu_gate(
   float* output     = static_cast<float*>(dst->data);
   int64_t n         = ggml_nelements(dst);
 
-  fprintf(stderr, "[fused_silu_gate] n=%lld gate=%p up=%p out=%p\n",
-          (long long)n, (void*)gate, (void*)up, (void*)output);
-
-  if (!gate || !up || !output || n <= 0) {
-    fprintf(stderr, "[fused_silu_gate] ERROR: null pointer or zero elements\n");
-    return;
-  }
+  // userdata contains the CUDA stream (passed by our forked ggml-cuda dispatch)
+  cudaStream_t stream = static_cast<cudaStream_t>(userdata);
 
   const int block = 256;
   const int grid  = (n + block - 1) / block;
-  fused_silu_gate_kernel<<<grid, block>>>(gate, up, output, n);
-
-  // Debug: sync and check for errors
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    fprintf(stderr, "[fused_silu_gate] CUDA error: %s\n", cudaGetErrorString(err));
-  }
+  fused_silu_gate_kernel<<<grid, block, 0, stream>>>(gate, up, output, n);
 }

@@ -2397,15 +2397,12 @@ static Error build_graph(
           // Swap if needed so the larger tensor is first.
           struct ggml_tensor* a = srcs[0];
           struct ggml_tensor* b = srcs[1];
-#if 0  // SiLU-gate fusion — DISABLED for debugging
+#if 1  // SiLU-gate fusion
           // SiLU-gate AOT fusion: MUL(SILU(gate), up) → fused_silu_gate(gate, up)
           // Detect: one src is UNARY(SiLU), use its input (gate) + other src (up)
           {
             struct ggml_tensor* gate = nullptr;
             struct ggml_tensor* up = nullptr;
-            static int _silu_dbg = -1;
-            if (_silu_dbg < 0) { const char* e = std::getenv("GGML_SILU_DBG"); _silu_dbg = (e && *e != '0') ? 1 : 0; }
-            if (_silu_dbg) fprintf(stderr, "[silu_fuse] MUL: a->op=%d b->op=%d\n", a->op, b->op);
             // Pattern: MUL(x, SIGMOID(x)) followed by MUL(silu_result, up)
             // PyTorch decomposes silu(x) = x * sigmoid(x), so the IR has:
             //   SIGMOID(gate) → MUL(gate, sigmoid_gate)  [= silu(gate)]
