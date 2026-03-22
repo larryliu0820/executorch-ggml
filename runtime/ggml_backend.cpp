@@ -5450,9 +5450,6 @@ Error GgmlBackendInterface::execute(
     return Error::InvalidState;
   }
 
-  // Sync before output copy (async compute may not have finished).
-  ggml_backend_sched_synchronize(active->sched);
-
   // GGML_SKIP_OUTPUT_COPY: skip GPU→CPU copy for output tensors.
   // Instead, point the ET tensor's data pointer directly at the GPU buffer.
   // The caller must handle GPU data (e.g., use a CUDA argmax sampler).
@@ -5461,6 +5458,13 @@ Error GgmlBackendInterface::execute(
   if (skip_output_copy < 0) {
     const char* env = std::getenv("GGML_SKIP_OUTPUT_COPY");
     skip_output_copy = (env && std::string(env) != "0") ? 1 : 0;
+  }
+
+  // Sync before output copy (async compute may not have finished).
+  // Skip sync when output stays on GPU — the caller's device operation
+  // (e.g., cuda_argmax_f32) will implicitly sync via cudaMemcpy.
+  if (!skip_output_copy) {
+    ggml_backend_sched_synchronize(active->sched);
   }
 
   if (skip_output_copy) {

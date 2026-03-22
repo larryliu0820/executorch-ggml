@@ -83,14 +83,17 @@ __global__ void argmax_kernel(const float* __restrict__ data, int64_t n,
 }
 
 // Launch argmax on GPU, copy single int64 result back to CPU.
+// Uses a persistent pinned buffer to avoid cudaMalloc/Free per call.
 extern "C" int64_t cuda_argmax_f32(const void* gpu_data, int64_t n) {
-  int64_t* d_result;
-  cudaMalloc(&d_result, sizeof(int64_t));
+  static int64_t* d_result = nullptr;
+  static int64_t* h_result = nullptr;  // pinned host memory
+  if (!d_result) {
+    cudaMalloc(&d_result, sizeof(int64_t));
+    cudaMallocHost(&h_result, sizeof(int64_t));
+  }
   argmax_kernel<<<1, 256>>>(static_cast<const float*>(gpu_data), n, d_result);
-  int64_t h_result;
-  cudaMemcpy(&h_result, d_result, sizeof(int64_t), cudaMemcpyDeviceToHost);
-  cudaFree(d_result);
-  return h_result;
+  cudaMemcpy(h_result, d_result, sizeof(int64_t), cudaMemcpyDeviceToHost);
+  return *h_result;
 }
 
 // ---------------------------------------------------------------------------
