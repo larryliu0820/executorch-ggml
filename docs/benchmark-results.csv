@@ -11,5 +11,5 @@ baseline (no optimizations),2844,,66,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
 + PERMUTE compose + view strip,658,973,307,c++,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
 + SiLU-gate AOT fusion,602,1012,317,c++,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
 + async compute,602,1012,325,c++,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
-+ skip output copy (GPU argmax),602,1012,345,c++ (GGML_SKIP_OUTPUT_COPY=1),Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ skip output copy + skip sync,602,1012,377,c++ (GGML_SKIP_OUTPUT_COPY=1),Qwen3-0.6B,A100-SXM4-40GB,Q8_0
 llama.cpp (reference),~700,1518,380,c++,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
