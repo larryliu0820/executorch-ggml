@@ -2786,6 +2786,13 @@ static Error build_graph(
           while (view_src->op == GGML_OP_RESHAPE && view_src->src[0]) {
             view_src = view_src->src[0];
           }
+          // Identity reshape (same shape) → no-op
+          if (view_src->ne[0] == new_ne[0] && view_src->ne[1] == new_ne[1] &&
+              view_src->ne[2] == new_ne[2] && view_src->ne[3] == new_ne[3] &&
+              ggml_is_contiguous(view_src)) {
+            gt = view_src;
+            break;
+          }
           gt = ggml_reshape_4d(ctx, ensure_cont(ctx, view_src),
                               new_ne[0], new_ne[1], new_ne[2], new_ne[3]);
           break;
