@@ -127,6 +127,15 @@ endif()
 
 add_subdirectory("${LLAMA_CPP_DIR}/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
 
+# Fused CUDA kernels (must be before runtime so it can link)
+if(CMAKE_CUDA_COMPILER)
+  add_library(executorch_ggml_fused_kernels STATIC runtime/fused_kernels.cu)
+  target_include_directories(executorch_ggml_fused_kernels PRIVATE "${LLAMA_CPP_DIR}/ggml/include")
+  set_target_properties(executorch_ggml_fused_kernels PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # ---------------------------------------------------------------------------
 # Runtime library
 # ---------------------------------------------------------------------------
@@ -184,14 +193,6 @@ if(TARGET ggml-cuda)
     LIBRARY_OUTPUT_DIRECTORY "${GGML_OUTPUT_DIR}"
     RUNTIME_OUTPUT_DIRECTORY "${GGML_OUTPUT_DIR}"
   )
-endif()
-
-if(CMAKE_CUDA_COMPILER)
-  add_library(executorch_ggml_fused_kernels STATIC runtime/fused_kernels.cu)
-  target_include_directories(executorch_ggml_fused_kernels PRIVATE "${LLAMA_CPP_DIR}/ggml/include")
-  set_target_properties(executorch_ggml_fused_kernels PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    POSITION_INDEPENDENT_CODE ON)
 endif()
 
 add_library(executorch_ggml_backend_py MODULE

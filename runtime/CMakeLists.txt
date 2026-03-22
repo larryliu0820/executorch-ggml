@@ -57,6 +57,12 @@ target_link_libraries(executorch_ggml_runtime PRIVATE
   ggml-cpu
 )
 
+# Link fused CUDA kernels
+if(TARGET executorch_ggml_fused_kernels)
+  target_link_libraries(executorch_ggml_runtime PRIVATE executorch_ggml_fused_kernels)
+  target_compile_definitions(executorch_ggml_runtime PRIVATE GGML_FUSED_KERNELS=1)
+endif()
+
 # Link Metal backend on macOS
 if(TARGET ggml-metal)
   target_link_libraries(executorch_ggml_runtime PRIVATE ggml-metal)

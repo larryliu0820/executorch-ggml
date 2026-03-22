@@ -4,6 +4,9 @@
 if(EXECUTORCH_GGML_BUILD_LLAMA_RUNNER)
 
 add_executable(benchmark_llm benchmark_llm.cpp)
+set_target_properties(benchmark_llm PROPERTIES
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+  CUDA_SEPARABLE_COMPILATION OFF)
 
 target_include_directories(benchmark_llm PRIVATE
   "${CMAKE_SOURCE_DIR}/runtime"
@@ -16,7 +19,7 @@ target_include_directories(benchmark_llm PRIVATE
 )
 
 target_link_libraries(benchmark_llm PRIVATE
-  -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
+  executorch_ggml_runtime
   -Wl,--no-as-needed executorch -Wl,--as-needed
   ggml ggml-base ggml-cpu
   extension_module_static
