@@ -1,0 +1,16 @@
+configuration,nodes,pp5_toks,pp32_toks,pp128_toks,tg100_toks,runtime,model,gpu,quant
+baseline (no optimizations),2844,,,,66,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ graph cache,2844,,,,98,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ CUDA graphs,2844,,,,151,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ fused RMSNorm,2166,,,,184,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ fused RoPE (AOT),1643,,,,170,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ GQA strip (AOT),1475,,,,203,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ RMSNorm weight fold,1418,,,,209,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ mask conversion cache,1310,,,,231,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ RESHAPE collapse,860,,,,288,c++,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ identity RESHAPE elim,860,,,,288,c++,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ PERMUTE compose,832,,,,288,c++,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ view node strip,658,,,,307,c++,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ SiLU-gate fusion (off),658,938,2377,,247,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ SiLU-gate fusion (on),602,938,2377,,250,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
+llama.cpp (reference),~700,1239,4057,9573,373,c++,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
