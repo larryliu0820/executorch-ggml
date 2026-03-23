@@ -1037,19 +1037,6 @@ static bool profile_eval_callback(struct ggml_tensor* t, bool ask, void* user_da
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Fused kernel eval callback — replaces multi-node subgraphs with single
-// CUDA kernels for reduced node count and memory traffic.
-// ---------------------------------------------------------------------------
-// Fused CUDA kernel declarations — called via ggml_map_custom2 on GPU.
-#ifdef GGML_FUSED_KERNELS
-extern "C" void ggml_fused_silu_gate(
-    struct ggml_tensor* dst, const struct ggml_tensor* a,
-    const struct ggml_tensor* b, int ith, int nth, void* userdata);
-extern "C" void ggml_fused_rms_norm_weight(
-    struct ggml_tensor* dst, const struct ggml_tensor* a,
-    const struct ggml_tensor* b, int ith, int nth, void* userdata);
-#endif
 
 static void print_profile(const ProfileContext& ctx) {
   // Sort by total time descending
@@ -2400,8 +2387,7 @@ static Error build_graph(
           // Swap if needed so the larger tensor is first.
           struct ggml_tensor* a = srcs[0];
           struct ggml_tensor* b = srcs[1];
-#if 1  // SiLU-gate fusion
-          // SiLU-gate AOT fusion: MUL(SILU(gate), up) → fused_silu_gate(gate, up)
+          // SiLU-gate AOT fusion: MUL(SILU(gate), up) → swiglu_split(gate, up)
           // Detect: one src is UNARY(SiLU), use its input (gate) + other src (up)
           {
             struct ggml_tensor* gate = nullptr;
@@ -2434,15 +2420,20 @@ static Error build_graph(
               }
             }
             if (gate && up) {
-              if (verbose) fprintf(stderr, "[ggml_backend] SiLU-gate fusion: gate ne=[%lld,%lld] up ne=[%lld,%lld]\n",
+              if (verbose) fprintf(stderr, "[ggml_backend] SiLU-gate fusion (swiglu_split): gate ne=[%lld,%lld] up ne=[%lld,%lld]\n",
                   (long long)gate->ne[0], (long long)gate->ne[1],
                   (long long)up->ne[0], (long long)up->ne[1]);
-              gt = ggml_map_custom2(ctx, gate, up,
-                  ggml_fused_silu_gate, 1, nullptr);
+              struct ggml_tensor* g = ensure_cont(ctx, gate);
+              struct ggml_tensor* u = ensure_cont(ctx, up);
+              if (metal_f32_binops) { g = ensure_f32(ctx, g); u = ensure_f32(ctx, u); }
+              if (cuda_bf16_cast) {
+                if (g->type == GGML_TYPE_BF16) g = ggml_cast(ctx, g, GGML_TYPE_F32);
+                if (u->type == GGML_TYPE_BF16) u = ggml_cast(ctx, u, GGML_TYPE_F32);
+              }
+              gt = ggml_swiglu_split(ctx, g, u);
               break;
             }
           }
-#endif
           if (auto* eager = try_eager_scalar_binop(ctx, a, b, '*', host_acc)) {
             gt = eager;
             break;
@@ -5460,12 +5451,16 @@ Error GgmlBackendInterface::execute(
     skip_output_copy = (env && std::string(env) != "0") ? 1 : 0;
   }
 
-  // Sync before output copy (async compute may not have finished).
-  // Skip sync when output stays on GPU — the caller's device operation
-  // (e.g., cuda_argmax_f32) will implicitly sync via cudaMemcpy.
+  // Sync before output access (async compute may not have finished).
+  // CUDA with skip_copy: skip sync — cuda_argmax_f32 syncs via cudaMemcpy.
+  // Metal/CPU: always sync — no implicit sync from unified memory reads.
+#ifdef GGML_FUSED_KERNELS
   if (!skip_output_copy) {
     ggml_backend_sched_synchronize(active->sched);
   }
+#else
+  ggml_backend_sched_synchronize(active->sched);
+#endif
 
   if (skip_output_copy) {
     for (size_t i = 0; i < n_outputs; ++i) {
