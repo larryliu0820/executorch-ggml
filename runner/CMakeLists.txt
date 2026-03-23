@@ -139,15 +139,22 @@ if(EXECUTORCH_GGML_BUILD_LLAMA_RUNNER)
     "${LLAMA_CPP_DIR}/ggml/include"
   )
 
-  target_link_libraries(llm_main PUBLIC
-    llama_runner
-    -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
-    ggml ggml-base ggml-cpu
-    # --no-as-needed ensures the ops shared libs stay linked even though
-    # llm_main has no direct symbol references (registration is via static
-    # constructors).
-    -Wl,--no-as-needed ${_link_libs} -Wl,--as-needed
-  )
+  if(APPLE)
+    target_link_libraries(llm_main PUBLIC
+      llama_runner
+      -Wl,-force_load,$<TARGET_FILE:executorch_ggml_runtime>
+      ggml ggml-base ggml-cpu
+      ${_link_libs})
+  else()
+    target_link_libraries(llm_main PUBLIC
+      llama_runner
+      -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
+      ggml ggml-base ggml-cpu
+      # --no-as-needed ensures the ops shared libs stay linked even though
+      # llm_main has no direct symbol references (registration is via static
+      # constructors).
+      -Wl,--no-as-needed ${_link_libs} -Wl,--as-needed)
+  endif()
   if(TARGET ggml-blas)
     target_link_libraries(llm_main PRIVATE ggml-blas)
   endif()

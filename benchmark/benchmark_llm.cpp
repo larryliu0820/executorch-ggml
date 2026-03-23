@@ -24,7 +24,16 @@ using executorch::extension::from_blob;
 using executorch::runtime::Error;
 
 // CUDA argmax for GPU-resident logits (when GGML_SKIP_OUTPUT_COPY=1)
+#ifdef GGML_FUSED_KERNELS
 extern "C" int64_t cuda_argmax_f32(const void* gpu_data, int64_t n);
+#endif
+
+// CPU argmax for Metal unified memory and CPU backends
+static int64_t cpu_argmax_f32(const float* data, int64_t n) {
+  int64_t idx = 0; float mx = data[0];
+  for (int64_t v = 1; v < n; v++) { if (data[v] > mx) { mx = data[v]; idx = v; } }
+  return idx;
+}
 
 static double now_ms() {
   auto t = std::chrono::high_resolution_clock::now();
@@ -117,10 +126,13 @@ int main(int argc, char** argv) {
   int64_t vocab_size = logits.size(2);
   int64_t next_token = 0;
   if (skip_copy) {
-    // Logits data is on GPU — use CUDA argmax
-    const float* gpu_data = logits.const_data_ptr<float>();
+    const float* data = logits.const_data_ptr<float>();
     int64_t offset = (prompt_len - 1) * vocab_size;
-    next_token = cuda_argmax_f32(gpu_data + offset, vocab_size);
+#ifdef GGML_FUSED_KERNELS
+    next_token = cuda_argmax_f32(data + offset, vocab_size);
+#else
+    next_token = cpu_argmax_f32(data + offset, vocab_size);
+#endif
   } else {
     const float* logits_data = logits.const_data_ptr<float>();
     int64_t offset = (prompt_len - 1) * vocab_size;
@@ -158,7 +170,11 @@ int main(int argc, char** argv) {
 
     auto& step_logits = result->at(0).toTensor();
     if (skip_copy) {
+#ifdef GGML_FUSED_KERNELS
       next_token = cuda_argmax_f32(step_logits.const_data_ptr<float>(), vocab_size);
+#else
+      next_token = cpu_argmax_f32(step_logits.const_data_ptr<float>(), vocab_size);
+#endif
     } else {
       const float* ld = step_logits.const_data_ptr<float>();
       next_token = 0;

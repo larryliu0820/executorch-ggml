@@ -17,13 +17,18 @@ target_include_directories(benchmark_llm PRIVATE
   "${EXECUTORCH_DIR}/third-party/flatbuffers/include"
 )
 
-target_link_libraries(benchmark_llm PRIVATE
-  -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
-  -Wl,--no-as-needed executorch -Wl,--as-needed
-  ggml ggml-base ggml-cpu
-  extension_module_static
-  extension_tensor
-)
+if(APPLE)
+  target_link_libraries(benchmark_llm PRIVATE
+    -Wl,-force_load,$<TARGET_FILE:executorch_ggml_runtime>
+    executorch ggml ggml-base ggml-cpu
+    extension_module_static extension_tensor)
+else()
+  target_link_libraries(benchmark_llm PRIVATE
+    -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
+    -Wl,--no-as-needed executorch -Wl,--as-needed
+    ggml ggml-base ggml-cpu
+    extension_module_static extension_tensor)
+endif()
 
 if(TARGET ggml-blas)
   target_link_libraries(benchmark_llm PRIVATE ggml-blas)
@@ -39,7 +44,13 @@ if(TARGET ggml-cuda)
   target_link_libraries(benchmark_llm PRIVATE -Wl,--no-as-needed -L/usr/local/cuda/lib64 -lcudart -Wl,--as-needed)
 endif()
 if(TARGET portable_ops_lib)
-  target_link_libraries(benchmark_llm PRIVATE -Wl,--no-as-needed portable_ops_lib portable_kernels -Wl,--as-needed)
+  if(APPLE)
+    target_link_libraries(benchmark_llm PRIVATE
+      -Wl,-force_load,$<TARGET_FILE:portable_ops_lib> portable_kernels)
+  else()
+    target_link_libraries(benchmark_llm PRIVATE
+      -Wl,--no-as-needed portable_ops_lib portable_kernels -Wl,--as-needed)
+  endif()
 endif()
 
 if(APPLE)
