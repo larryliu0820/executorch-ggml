@@ -68,7 +68,9 @@ def export_all_ggml(model, max_seq_len, dtype=torch.float32):
     swap_voxtral_attention(model)
 
     programs = {}
-    param_dtype = dtype
+    # Use target dtype for float tensors, but preserve integer dtypes for samples
+    float_dtype = dtype  # BF16 for float sample inputs
+    # Integer sample inputs should always use appropriate integer dtypes
 
     # Preprocessor (MelSpectrogram) is computed in Python at inference time
     # rather than exported into the PTE — torchaudio STFT ops don't have
@@ -80,7 +82,7 @@ def export_all_ggml(model, max_seq_len, dtype=torch.float32):
     audio_encoder.eval()
     max_t_mel = 24000  # 3000 * 8
     sample_mel = torch.randn(
-        1, model.config.num_mel_bins, max_t_mel, dtype=param_dtype
+        1, model.config.num_mel_bins, max_t_mel, dtype=float_dtype  # Use target float dtype
     )
     programs["audio_encoder"] = export(
         audio_encoder,
@@ -95,7 +97,7 @@ def export_all_ggml(model, max_seq_len, dtype=torch.float32):
     text_decoder = TextDecoderExport(model)
     text_decoder.eval()
     seq_dim = Dim("seq_len", min=1, max=max_seq_len)
-    sample_embeds = torch.randn(1, 4, model.config.dim, dtype=param_dtype)
+    sample_embeds = torch.randn(1, 4, model.config.dim, dtype=float_dtype)
     sample_pos = torch.arange(4, dtype=torch.long)
     programs["text_decoder"] = export(
         text_decoder,
@@ -140,16 +142,37 @@ def export_streaming_ggml(model, max_seq_len, max_enc_len=750, dtype=torch.float
     """Export streaming Voxtral components as ExportedPrograms."""
     programs = {}
     param_dtype = dtype
+    float_dtype = dtype  # Use target float dtype for sample inputs
 
     # Preprocessor (MelSpectrogram) computed in Python at inference time.
 
     # --- Streaming audio encoder ---
     print("\nExporting encode_audio_chunk...")
     streaming_enc = StreamingAudioEncoderExport(model, max_enc_len=max_enc_len)
-    streaming_enc.to(dtype=param_dtype)
+
+    # CRITICAL FIX: Only convert float parameters to BF16, preserve integer types
+    if param_dtype == torch.bfloat16:
+        print("  Converting only float parameters to BF16, preserving integer types...")
+        for name, param in streaming_enc.named_parameters():
+            if param.dtype.is_floating_point:
+                param.data = param.data.to(param_dtype)
+                print(f"    {name}: {param.dtype} -> converted to BF16")
+            else:
+                print(f"    {name}: {param.dtype} -> preserved (integer type)")
+
+        # Also handle buffers (position embeddings, etc.)
+        for name, buffer in streaming_enc.named_buffers():
+            if buffer.dtype.is_floating_point:
+                buffer.data = buffer.data.to(param_dtype)
+                print(f"    {name}: {buffer.dtype} -> converted to BF16")
+            else:
+                print(f"    {name}: {buffer.dtype} -> preserved (integer type)")
+    else:
+        streaming_enc.to(dtype=param_dtype)
+
     streaming_enc.eval()
     sample_mel_chunk = torch.randn(
-        1, model.config.num_mel_bins, 8, dtype=param_dtype
+        1, model.config.num_mel_bins, 8, dtype=float_dtype
     )
     sample_enc_pos = torch.arange(4, dtype=torch.long)
     programs["encode_audio_chunk"] = export(
@@ -165,7 +188,7 @@ def export_streaming_ggml(model, max_seq_len, max_enc_len=750, dtype=torch.float
     text_decoder = TextDecoderExport(model)
     text_decoder.eval()
     seq_dim = Dim("seq_len", min=1, max=max_seq_len)
-    sample_embeds = torch.randn(1, 4, model.config.dim, dtype=param_dtype)
+    sample_embeds = torch.randn(1, 4, model.config.dim, dtype=float_dtype)
     sample_pos = torch.arange(4, dtype=torch.long)
     programs["text_decoder"] = export(
         text_decoder,
@@ -228,7 +251,7 @@ def export_streaming_ggml(model, max_seq_len, max_enc_len=750, dtype=torch.float
     return programs, metadata
 
 
-def lower_to_ggml(programs, metadata=None, quant_config=None):
+def lower_to_ggml(programs, metadata=None, quant_config=None, target_dtype=None):
     """Lower exported programs to ExecuTorch with GGML backend."""
     print("\nLowering to ExecuTorch with GGML backend...")
 
@@ -239,9 +262,20 @@ def lower_to_ggml(programs, metadata=None, quant_config=None):
         for key, value in metadata.items():
             constant_methods[key] = value
 
+    # Build transform passes based on target dtype
+    transform_passes = [ReplaceCopyOpsPass(), RemoveGraphAssertsPass()]
+
+    # Precision-safe cast pass: protects integer index operations from BF16 corruption
+    if target_dtype == "BF16":
+        from executorch_ggml.passes.bf16_cast_pass import BF16UnsafeOpsCastPass
+        transform_passes.insert(0, BF16UnsafeOpsCastPass())
+        print("  Using BF16UnsafeOpsCastPass to protect index operations from corruption")
+    elif target_dtype == "FP16":
+        print("  FP16 cast pass not yet implemented, using F32")
+
     et_prog = to_edge_transform_and_lower(
         programs,
-        transform_passes=[BF16UnsafeOpsCastPass(), ReplaceCopyOpsPass(), RemoveGraphAssertsPass()],
+        transform_passes=transform_passes,
         partitioner=partitioner,
         compile_config=EdgeCompileConfig(
             _check_ir_validity=False,

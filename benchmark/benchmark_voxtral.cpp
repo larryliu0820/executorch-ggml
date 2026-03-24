@@ -68,17 +68,44 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Random embeddings for decode
+  // Detect model input dtype (BF16 vs F32) from method metadata
+  auto meta = model.method_meta("text_decoder");
+  bool is_bf16 = false;
+  if (meta.ok()) {
+    auto input_meta = meta->input_tensor_meta(0);
+    if (input_meta.ok()) {
+      is_bf16 = (input_meta->scalar_type() == executorch::aten::ScalarType::BFloat16);
+    }
+  }
+  auto embed_dtype = is_bf16 ? executorch::aten::ScalarType::BFloat16
+                             : executorch::aten::ScalarType::Float;
+  fprintf(stderr, "Model input dtype: %s\n", is_bf16 ? "BF16" : "F32");
+
+  // Random embeddings for decode (generate in F32, convert if needed)
   std::mt19937 rng(42);
   std::normal_distribution<float> dist(0.0f, 0.02f);
-  std::vector<float> embeds(dim);
-  for (auto& x : embeds) x = dist(rng);
+  std::vector<float> embeds_f32(dim);
+  for (auto& x : embeds_f32) x = dist(rng);
+
+  // BF16 storage (F32 bits >> 16, stored as uint16_t)
+  std::vector<uint16_t> embeds_bf16(dim);
+  if (is_bf16) {
+    for (int i = 0; i < dim; i++) {
+      uint32_t bits;
+      memcpy(&bits, &embeds_f32[i], sizeof(bits));
+      embeds_bf16[i] = static_cast<uint16_t>(bits >> 16);
+    }
+  }
 
   // Warmup (5 steps)
   fprintf(stderr, "Warmup ...\n");
   for (int pos = 0; pos < 5; pos++) {
-    auto emb = from_blob(embeds.data(), {1, 1, dim},
-                         executorch::aten::ScalarType::Float);
+    TensorPtr emb;
+    if (is_bf16) {
+      emb = from_blob(embeds_bf16.data(), {1, 1, dim}, embed_dtype);
+    } else {
+      emb = from_blob(embeds_f32.data(), {1, 1, dim}, embed_dtype);
+    }
     int64_t cache_pos = pos;
     auto pos_t = from_blob(&cache_pos, {1},
                            executorch::aten::ScalarType::Long);
@@ -100,8 +127,12 @@ int main(int argc, char** argv) {
 
   for (int step = 0; step < n_decode; step++) {
     int64_t pos = 10 + step;
-    auto emb = from_blob(embeds.data(), {1, 1, dim},
-                         executorch::aten::ScalarType::Float);
+    TensorPtr emb;
+    if (is_bf16) {
+      emb = from_blob(embeds_bf16.data(), {1, 1, dim}, embed_dtype);
+    } else {
+      emb = from_blob(embeds_f32.data(), {1, 1, dim}, embed_dtype);
+    }
     auto pos_t = from_blob(&pos, {1}, executorch::aten::ScalarType::Long);
 
     double t0 = now_ms();
@@ -117,6 +148,17 @@ int main(int argc, char** argv) {
     int64_t token;
     if (skip_copy) {
       token = cuda_argmax_f32(logits.const_data_ptr<float>(), vocab_size);
+    } else if (logits.scalar_type() == executorch::aten::ScalarType::BFloat16) {
+      // BF16 logits: convert to F32 for argmax
+      const uint16_t* ld = static_cast<const uint16_t*>(logits.const_data_ptr());
+      token = 0;
+      float max_val = -1e30f;
+      for (int64_t v = 0; v < vocab_size; v++) {
+        uint32_t bits = static_cast<uint32_t>(ld[v]) << 16;
+        float val;
+        memcpy(&val, &bits, sizeof(val));
+        if (val > max_val) { max_val = val; token = v; }
+      }
     } else {
       const float* ld = logits.const_data_ptr<float>();
       token = 0;

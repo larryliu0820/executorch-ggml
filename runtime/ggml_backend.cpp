@@ -1165,6 +1165,27 @@ static inline struct ggml_tensor* ensure_cont(struct ggml_context* ctx, struct g
   return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
 }
 
+// Fix BF16 tensor stride alignment issues. GGML expects nb values to be aligned to element size.
+static inline struct ggml_tensor* fix_bf16_strides(struct ggml_context* ctx, struct ggml_tensor* t) {
+  if (t->type != GGML_TYPE_BF16) return t;
+
+  const size_t elem_size = sizeof(ggml_bf16_t); // 2 bytes
+
+  // Check if any stride is misaligned
+  bool needs_fix = false;
+  for (int i = 0; i < GGML_MAX_DIMS; i++) {
+    if (t->nb[i] % elem_size != 0) {
+      needs_fix = true;
+      break;
+    }
+  }
+
+  if (!needs_fix) return t;
+
+  // Force contiguous layout to fix stride alignment
+  return ggml_cont(ctx, t);
+}
+
 // Skip RESHAPE/VIEW/CONT/PERMUTE wrappers to find the "real" op underneath.
 static struct ggml_tensor* unwrap_views(struct ggml_tensor* t) {
   while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW
@@ -1173,6 +1194,37 @@ static struct ggml_tensor* unwrap_views(struct ggml_tensor* t) {
     t = t->src[0];
   }
   return t;
+}
+
+// Safe wrapper for ggml_view_4d that adds bounds checking to prevent assertion failures.
+// Returns the view tensor on success, or nullptr if the view would exceed bounds.
+static struct ggml_tensor* safe_ggml_view_4d(
+    struct ggml_context* ctx,
+    struct ggml_tensor* src,
+    int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+    size_t nb1, size_t nb2, size_t nb3,
+    size_t offset) {
+
+  // Calculate the data size needed for this view
+  size_t data_size = ggml_row_size(src->type, ne0);
+  data_size *= ne1 * ne2 * ne3;
+
+  // Check bounds: data_size + offset <= total source tensor size
+  size_t src_total_bytes = ggml_nbytes(src);
+  if (offset > src_total_bytes || data_size > src_total_bytes - offset) {
+    fprintf(stderr, "[GGML_VIEW_4D_ERROR] View bounds check failed:\n");
+    fprintf(stderr, "  Source tensor: %ld bytes\n", src_total_bytes);
+    fprintf(stderr, "  View offset: %ld bytes\n", offset);
+    fprintf(stderr, "  View data size: %ld bytes\n", data_size);
+    fprintf(stderr, "  Required total: %ld bytes (exceeds source by %ld)\n",
+            offset + data_size, (offset + data_size) - src_total_bytes);
+    fprintf(stderr, "  View shape: [%ld, %ld, %ld, %ld]\n", ne0, ne1, ne2, ne3);
+    fprintf(stderr, "  Source shape: [%ld, %ld, %ld, %ld]\n",
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+    return nullptr;
+  }
+
+  return ggml_view_4d(ctx, src, ne0, ne1, ne2, ne3, nb1, nb2, nb3, offset);
 }
 
 // Check if tensor t is rotate_half(x): CONCAT(NEG(x_first_half), x_second_half)
@@ -1920,6 +1972,9 @@ static Error build_graph(
       ggml_free(ctx);
       return Error::MemoryAllocationFailed;
     }
+    // Zero-initialize host buffer so leaf tensors without explicit data
+    // (e.g. KV cache index tensors) start at 0 instead of uninitialized memory.
+    ggml_backend_buffer_clear(host_buf, 0);
   }
   struct ggml_tallocr tallocr = ggml_tallocr_new(host_buf);
 
@@ -2235,9 +2290,10 @@ static Error build_graph(
         if (big->ne[d] != small->ne[d]) any_diff = true;
       }
       if (!any_diff) return nullptr;
-      auto * v = ggml_view_4d(ctx, big,
+      auto * v = safe_ggml_view_4d(ctx, big,
           small->ne[0], small->ne[1], small->ne[2], small->ne[3],
           big->nb[1], big->nb[2], big->nb[3], 0);
+      if (!v) return nullptr;
       return ensure_cont(ctx, v);
     };
 
@@ -2360,6 +2416,8 @@ static Error build_graph(
             if (b->type == GGML_TYPE_BF16) b = ggml_cast(ctx, b, GGML_TYPE_F32);
           }
           a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
+          // Fix BF16 stride alignment issues for native CUDA kernels
+          a = fix_bf16_strides(ctx, a); b = fix_bf16_strides(ctx, b);
 
           if (a->type != b->type) {
             ggml_type tgt = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32)
@@ -2461,6 +2519,8 @@ static Error build_graph(
           }
           // ggml CPU MUL requires contiguous innermost rows (e.g. after permute in RoPE).
           a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
+          // Fix BF16 stride alignment issues for native CUDA kernels
+          a = fix_bf16_strides(ctx, a); b = fix_bf16_strides(ctx, b);
           if (!resolve_broadcast(a, b, "MUL")) {
             ggml_free(ctx);
             return Error::InvalidArgument;
@@ -2482,6 +2542,9 @@ static Error build_graph(
             if (a->type == GGML_TYPE_BF16) a = ggml_cast(ctx, a, GGML_TYPE_F32);
             if (b->type == GGML_TYPE_BF16) b = ggml_cast(ctx, b, GGML_TYPE_F32);
           }
+          a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
+          // Fix BF16 stride alignment issues for native CUDA kernels
+          a = fix_bf16_strides(ctx, a); b = fix_bf16_strides(ctx, b);
 
           if (!resolve_broadcast(a, b, "DIV")) {
             ggml_free(ctx);
@@ -2563,9 +2626,14 @@ static Error build_graph(
           break;
         }
 
-        case ggml_ir::OpCode::SILU:
-          gt = ggml_silu(ctx, srcs[0]);
+        case ggml_ir::OpCode::SILU: {
+          struct ggml_tensor* x = srcs[0];
+          ggml_type orig = x->type;
+          if (x->type == GGML_TYPE_BF16) x = ggml_cast(ctx, x, GGML_TYPE_F32);
+          gt = ggml_silu(ctx, x);
+          if (orig == GGML_TYPE_BF16) gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
           break;
+        }
 
         case ggml_ir::OpCode::RELU:
           gt = ggml_relu(ctx, srcs[0]);
@@ -2575,9 +2643,14 @@ static Error build_graph(
           gt = ggml_tanh(ctx, srcs[0]);
           break;
 
-        case ggml_ir::OpCode::GELU:
-          gt = ggml_gelu(ctx, srcs[0]);
+        case ggml_ir::OpCode::GELU: {
+          struct ggml_tensor* x = srcs[0];
+          ggml_type orig = x->type;
+          if (x->type == GGML_TYPE_BF16) x = ggml_cast(ctx, x, GGML_TYPE_F32);
+          gt = ggml_gelu(ctx, x);
+          if (orig == GGML_TYPE_BF16) gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
           break;
+        }
 
         case ggml_ir::OpCode::LINEAR: {
           // src_ids: [x, w, b?] where w is [out, in] in PyTorch.
@@ -3110,8 +3183,12 @@ static Error build_graph(
           }
 
           size_t offset = static_cast<size_t>(start) * a->nb[ax];
-          gt = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3],
+          gt = safe_ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3],
                             a->nb[1], a->nb[2], a->nb[3], offset);
+          if (!gt) {
+            fprintf(stderr, "Slice operation: view creation failed\n");
+            return Error::Internal;
+          }
           // Only make contiguous if the slice created a non-contiguous view.
           // Slicing the innermost dimension or taking the full outer dimension
           // produces a contiguous result and doesn't need a copy.
@@ -3175,12 +3252,16 @@ static Error build_graph(
           struct ggml_tensor* result = nullptr;
           for (int64_t h = 0; h < H; ++h) {
             // Create a view of one head: shape [D, T, 1, B]
-            struct ggml_tensor* head_slice = ggml_view_4d(
+            struct ggml_tensor* head_slice = safe_ggml_view_4d(
                 ctx, src,
                 D, T, 1, B,
                 src->nb[1], src->nb[2], src->nb[3],
                 h * head_stride  // offset in bytes to head h
             );
+            if (!head_slice) {
+              fprintf(stderr, "Head slice creation failed for head %ld\n", h);
+              return Error::Internal;
+            }
             for (int r = 0; r < reps; ++r) {
               if (result == nullptr) {
                 result = head_slice;
@@ -3388,18 +3469,63 @@ static Error build_graph(
               // KV cache update: scatter along ne[2] (seq dim) with contiguous
               // positions.  Use ggml_cpy into a view of the cache slice.
               // Read start position from the first index element.
-              int64_t start_pos = host_acc.read_i32(idx);
+
+              // Debug: examine index tensor before reading
+              fprintf(stderr, "[KV_CACHE_DEBUG] idx tensor: type=%s, ne=[%ld,%ld,%ld,%ld], nbytes=%zu\n",
+                      ggml_type_name(idx->type), idx->ne[0], idx->ne[1], idx->ne[2], idx->ne[3], ggml_nbytes(idx));
+
+              int64_t start_pos;
+              if (idx->type == GGML_TYPE_I64) {
+                start_pos = host_acc.read_i64(idx);
+                fprintf(stderr, "[KV_CACHE_DEBUG] read as I64: start_pos=%ld\n", start_pos);
+              } else if (idx->type == GGML_TYPE_I32) {
+                int32_t start_pos_i32 = host_acc.read_i32(idx);
+                start_pos = static_cast<int64_t>(start_pos_i32);
+                fprintf(stderr, "[KV_CACHE_DEBUG] read as I32: start_pos_i32=%d -> start_pos=%ld\n", start_pos_i32, start_pos);
+              } else {
+                fprintf(stderr, "[KV_CACHE_DEBUG] ERROR: Unsupported index tensor type: %s\n", ggml_type_name(idx->type));
+                start_pos = 0;
+              }
+
+              // Debug: dump first few bytes of index tensor
+              const void* idx_data = host_acc.get(idx);
+              if (idx_data && ggml_nbytes(idx) >= 4) {
+                const uint8_t* bytes = static_cast<const uint8_t*>(idx_data);
+                fprintf(stderr, "[KV_CACHE_DEBUG] idx raw bytes: %02x %02x %02x %02x\n",
+                        bytes[0], bytes[1], bytes[2], bytes[3]);
+              }
+
               int64_t seq_len_new = val->ne[ggml_scatter_axis];
+
+              // Debug: print values before calculating offset
+              fprintf(stderr, "[KV_CACHE_DEBUG] start_pos=%ld, seq_len_new=%ld, scatter_axis=%d\n",
+                      start_pos, seq_len_new, ggml_scatter_axis);
+              fprintf(stderr, "[KV_CACHE_DEBUG] dst->nb[%d]=%zu, dst->ne[%d]=%ld\n",
+                      ggml_scatter_axis, dst->nb[ggml_scatter_axis], ggml_scatter_axis, dst->ne[ggml_scatter_axis]);
+
+              // Validate start_pos is reasonable
+              if (start_pos < 0 || start_pos >= dst->ne[ggml_scatter_axis]) {
+                fprintf(stderr, "[KV_CACHE_ERROR] Invalid start_pos=%ld (must be in range [0, %ld))\n",
+                        start_pos, dst->ne[ggml_scatter_axis]);
+                fprintf(stderr, "[KV_CACHE_ERROR] This suggests corrupted index tensor data\n");
+                return Error::InvalidArgument;
+              }
 
               // View into cache at [start_pos..start_pos+seq_len) along scatter axis.
               size_t offset_bytes = start_pos * dst->nb[ggml_scatter_axis];
+
+              fprintf(stderr, "[KV_CACHE_DEBUG] offset_bytes=%zu (0x%lx)\n", offset_bytes, offset_bytes);
               int64_t view_ne[4];
               for (int d = 0; d < 4; d++) view_ne[d] = dst->ne[d];
               view_ne[ggml_scatter_axis] = seq_len_new;
 
-              auto* cache_slice = ggml_view_4d(ctx, dst,
+              auto* cache_slice = safe_ggml_view_4d(ctx, dst,
                   view_ne[0], view_ne[1], view_ne[2], view_ne[3],
                   dst->nb[1], dst->nb[2], dst->nb[3], offset_bytes);
+              if (!cache_slice) {
+                fprintf(stderr, "KV cache scatter: view creation failed\n");
+                return Error::Internal;
+              }
 
               auto* val_c = ensure_cont(ctx, val);
               gt = ggml_cpy(ctx, val_c, cache_slice);
@@ -3524,11 +3650,13 @@ static Error build_graph(
           struct ggml_tensor* q = srcs[0];
           struct ggml_tensor* k = srcs[1];
           struct ggml_tensor* v = srcs[2];
+          ggml_type sdpa_orig_type = q->type;
 
-          // flash_attn_ext dispatches via type traits (vec_dot / to_float),
-          // so it supports F16, BF16, and F32 K/V natively.  Do NOT force
-          // F16 — BF16 values that exceed F16 max (~65504) would overflow to
-          // Inf, producing +Inf in the dot product accumulation.
+          // CUDA flash_attn_ext only supports F16 and F32, NOT BF16.
+          // Cast BF16 → F16 for Q/K/V to avoid CUDA kernel fatal error.
+          if (q->type == GGML_TYPE_BF16) q = ggml_cast(ctx, q, GGML_TYPE_F16);
+          if (k->type == GGML_TYPE_BF16) k = ggml_cast(ctx, k, GGML_TYPE_F16);
+          if (v->type == GGML_TYPE_BF16) v = ggml_cast(ctx, v, GGML_TYPE_F16);
 
           // Read is_causal from op_params (int32, default 0).
           bool is_causal = false;
@@ -3617,6 +3745,10 @@ static Error build_graph(
                   (long long)attn->ne[0], (long long)attn->ne[1],
                   (long long)attn->ne[2], (long long)attn->ne[3], attn->type);
           gt = safe_ggml_permute(ctx, attn, 0, 2, 1, 3, "LLAMA_ATTN");
+          // Cast SDPA output back to BF16 if original Q was BF16
+          if (sdpa_orig_type == GGML_TYPE_BF16) {
+            gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
+          }
           break;
         }
 
@@ -3668,7 +3800,10 @@ static Error build_graph(
             if (a->type == GGML_TYPE_BF16) a = ggml_cast(ctx, a, GGML_TYPE_F32);
             if (b->type == GGML_TYPE_BF16) b = ggml_cast(ctx, b, GGML_TYPE_F32);
           }
-  
+          a = ensure_cont(ctx, a); b = ensure_cont(ctx, b);
+          // Fix BF16 stride alignment issues for native CUDA kernels
+          a = fix_bf16_strides(ctx, a); b = fix_bf16_strides(ctx, b);
+
             if (!resolve_broadcast(a, b, "SUB")) {
               ggml_free(ctx);
               return Error::InvalidArgument;
@@ -3757,6 +3892,11 @@ static Error build_graph(
           int ggml_axis = (ndim - 1) - dim;
 
           struct ggml_tensor* x = srcs[0];
+          // CUDA softmax kernel only supports F32 — cast if needed.
+          ggml_type orig_type = x->type;
+          if (x->type == GGML_TYPE_BF16 || x->type == GGML_TYPE_F16) {
+            x = ggml_cast(ctx, x, GGML_TYPE_F32);
+          }
           if (ggml_axis == 0) {
             // Softmax on innermost dim - direct
             gt = ggml_soft_max(ctx, x);
@@ -3771,6 +3911,10 @@ static Error build_graph(
             x = ggml_soft_max(ctx, x);
             // Permute back
             gt = safe_ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3], "SOFTMAX_post");
+          }
+          // Cast back to original type if needed
+          if (orig_type == GGML_TYPE_BF16) {
+            gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
           }
           break;
         }
@@ -4222,12 +4366,28 @@ static Error build_graph(
           int ndim = 4;
           int ggml_axis = (ndim - 1) - seq_dim_pytorch;
 
+          // Debug: examine start_pos tensor before reading
+          fprintf(stderr, "[UPDATE_CACHE_DEBUG] start_pos tensor: type=%s, ne=[%ld,%ld,%ld,%ld], nbytes=%zu\n",
+                  ggml_type_name(start_pos_tensor->type), start_pos_tensor->ne[0], start_pos_tensor->ne[1],
+                  start_pos_tensor->ne[2], start_pos_tensor->ne[3], ggml_nbytes(start_pos_tensor));
+
           // Get start position value
           int64_t start_pos = 0;
           if (start_pos_tensor->type == GGML_TYPE_I64) {
             start_pos = host_acc.read_i64(start_pos_tensor);
+            fprintf(stderr, "[UPDATE_CACHE_DEBUG] read as I64: start_pos=%ld\n", start_pos);
           } else if (start_pos_tensor->type == GGML_TYPE_I32) {
-            start_pos = host_acc.read_i32(start_pos_tensor);
+            int32_t start_pos_i32 = host_acc.read_i32(start_pos_tensor);
+            start_pos = static_cast<int64_t>(start_pos_i32);
+            fprintf(stderr, "[UPDATE_CACHE_DEBUG] read as I32: start_pos_i32=%d -> start_pos=%ld\n", start_pos_i32, start_pos);
+          }
+
+          // Debug: dump first few bytes of start_pos tensor
+          const void* start_pos_data = host_acc.get(start_pos_tensor);
+          if (start_pos_data && ggml_nbytes(start_pos_tensor) >= 4) {
+            const uint8_t* bytes = static_cast<const uint8_t*>(start_pos_data);
+            fprintf(stderr, "[UPDATE_CACHE_DEBUG] start_pos raw bytes: %02x %02x %02x %02x\n",
+                    bytes[0], bytes[1], bytes[2], bytes[3]);
           }
 
           // ggml_set_rows scatters along ne[1]. When the scatter axis differs
@@ -4258,9 +4418,13 @@ static Error build_graph(
             for (int d = 0; d < 4; d++) view_ne[d] = cache->ne[d];
             view_ne[ggml_axis] = seq_len_new;
 
-            auto* cache_slice = ggml_view_4d(ctx, cache,
+            auto* cache_slice = safe_ggml_view_4d(ctx, cache,
                 view_ne[0], view_ne[1], view_ne[2], view_ne[3],
                 cache->nb[1], cache->nb[2], cache->nb[3], offset_bytes);
+            if (!cache_slice) {
+              fprintf(stderr, "KV cache update: view creation failed\n");
+              return Error::Internal;
+            }
 
             auto* val_c = ensure_cont(ctx, value);
             gt = ggml_cpy(ctx, val_c, cache_slice);
@@ -4317,13 +4481,26 @@ static Error build_graph(
           // ggml's native RMS_NORM CUDA kernel is highly optimized and the
           // fused kernel can't match it. 546 nodes but 287 tok/s vs 602
           // nodes with 317 tok/s using separate ops. Needs a better kernel.
-          gt = ggml_rms_norm(ctx, ensure_cont(ctx, srcs[0]), eps);
+          {
+            struct ggml_tensor* rms_in = ensure_cont(ctx, srcs[0]);
+            // CUDA rms_norm kernel only supports F32 input — cast if needed.
+            bool rms_casted = false;
+            if (rms_in->type == GGML_TYPE_BF16 || rms_in->type == GGML_TYPE_F16) {
+              rms_in = ggml_cast(ctx, rms_in, GGML_TYPE_F32);
+              rms_casted = true;
+            }
+            gt = ggml_rms_norm(ctx, rms_in, eps);
 
-          if (has_weight && srcs.size() > 1) {
-            struct ggml_tensor* w = srcs[1];
-            if (metal_f32_binops) w = ensure_f32(ctx, w);
-            if (cuda_bf16_cast && w->type == GGML_TYPE_BF16) w = ggml_cast(ctx, w, GGML_TYPE_F32);
-            gt = ggml_mul(ctx, gt, w);
+            if (has_weight && srcs.size() > 1) {
+              struct ggml_tensor* w = srcs[1];
+              if (metal_f32_binops) w = ensure_f32(ctx, w);
+              if (w->type == GGML_TYPE_BF16) w = ggml_cast(ctx, w, GGML_TYPE_F32);
+              gt = ggml_mul(ctx, gt, w);
+            }
+            // Cast back to original type if we casted for rms_norm
+            if (rms_casted && srcs[0]->type == GGML_TYPE_BF16) {
+              gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
+            }
           }
           break;
         }
@@ -5043,6 +5220,11 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         return Error::MemoryAllocationFailed;
       }
       fprintf(stderr, "[ggml_backend] mutable_buf allocated: %zu MB\n", mutable_total / (1024*1024));
+
+      // Zero-initialize the entire mutable buffer once upfront.
+      // This ensures all KV cache indices and other mutable tensors start
+      // at 0 regardless of whether they have explicit constant_data.
+      ggml_backend_buffer_clear(handle->mutable_buf, 0);
     }
 
     // Second pass: record offsets and copy data
@@ -5111,11 +5293,12 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
           ggml_backend_tensor_set(tmp_tensor, cd.data.data(), 0, copy_size);
         }
       } else if (is_mut) {
+        // Mutable tensors without constant data: already zero-initialized
+        // by the upfront ggml_backend_buffer_clear() call above.
+        // For host buffers, zero just this region (buffer may not have been cleared).
         if (is_host) {
           char* dst = static_cast<char*>(ggml_backend_buffer_get_base(buf)) + offset;
           memset(dst, 0, nbytes);
-        } else {
-          ggml_backend_buffer_clear(buf, 0);
         }
       }
 
@@ -5454,8 +5637,22 @@ Error GgmlBackendInterface::execute(
     std::vector<int64_t> src_buf(nelem);
     ggml_backend_tensor_get(src_i64, src_buf.data(), 0, nelem * sizeof(int64_t));
     std::vector<int32_t> dst_buf(nelem);
+
+    // Debug: Log I64→I32 conversion details
+    fprintf(stderr, "[I64_TO_I32_DEBUG] Converting %zu elements\n", nelem);
     for (size_t j = 0; j < nelem; ++j) {
-      dst_buf[j] = static_cast<int32_t>(src_buf[j]);
+      int64_t src_val = src_buf[j];
+      int32_t dst_val = static_cast<int32_t>(src_val);
+      dst_buf[j] = dst_val;
+
+      // Log suspicious conversions
+      if (src_val != (int64_t)dst_val || src_val < INT32_MIN || src_val > INT32_MAX) {
+        fprintf(stderr, "[I64_TO_I32_DEBUG] SUSPICIOUS: src_i64=%ld -> dst_i32=%d (element %zu)\n",
+                src_val, dst_val, j);
+      } else if (j < 4) {  // Log first few for normal cases
+        fprintf(stderr, "[I64_TO_I32_DEBUG] Normal: src_i64=%ld -> dst_i32=%d (element %zu)\n",
+                src_val, dst_val, j);
+      }
     }
     ggml_backend_tensor_set(dst_i32, dst_buf.data(), 0, nelem * sizeof(int32_t));
   }
