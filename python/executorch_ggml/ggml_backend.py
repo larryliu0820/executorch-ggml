@@ -695,6 +695,18 @@ class GgmlBackend(BackendDetails):
                         else torch.float32
                     )
                     value = node.args[0]
+
+                    # Dynamic scalar: value is a graph Node (from sym_size etc.)
+                    # For fixed-shape exports, use the concrete value from
+                    # the node's fake tensor metadata.
+                    if isinstance(value, torch.fx.Node):
+                        node_fake = node.meta.get("val")
+                        if node_fake is not None and isinstance(node_fake, torch.Tensor):
+                            value = node_fake.item()
+                        else:
+                            value = 0  # fallback for unknown symbolic scalars
+                    const = torch.tensor(value, dtype=out_dtype).cpu()
+
                     const = torch.tensor(value, dtype=out_dtype).cpu()
 
                     tid = alloc_id()

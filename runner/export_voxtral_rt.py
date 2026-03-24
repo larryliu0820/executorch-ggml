@@ -83,7 +83,10 @@ def main():
         model_dtype = torch.float16
     else:
         quant_config = GgmlQuantConfig(quant_type=GgmlQuantType(args.dtype.lower()))
-        model_dtype = torch.bfloat16
+        # Quantized models use FP32 for export; GGML quantizes at lowering time.
+        # BF16 causes dtype mismatches during CPU-traced export (e.g. GELU returns
+        # FP32 but conv bias stays BF16).
+        model_dtype = torch.float32
 
     print(f"Loading model from {args.model_path}...")
     model = load_model(
@@ -93,10 +96,13 @@ def main():
         dtype=model_dtype,
     )
 
-    # Fuse encoder RoPE into ggml_rope_ext
-    from executorch_ggml.modules.rope import swap_encoder_rope
-    swap_encoder_rope(model, freq_base=model.config.enc_rope_theta)
-    print("  Applied fused RoPE (swap_encoder_rope)")
+    # Encoder RoPE fusion — only for offline mode. The streaming encoder
+    # (StreamingAudioEncoderExport) has its own RoPE handling and references
+    # the vanilla encoder layers directly.
+    if not args.streaming:
+        from executorch_ggml.modules.rope import swap_encoder_rope
+        swap_encoder_rope(model, freq_base=model.config.enc_rope_theta)
+        print("  Applied fused RoPE (swap_encoder_rope)")
 
     # Replace llama custom ops with standard ATen ops for GGML export
     from executorch_ggml.modules.voxtral_attention import swap_voxtral_attention
@@ -114,18 +120,19 @@ def main():
     print(f"  Applied fold_decoder_rms_norm_weights ({n_fold} folded)")
 
     print(f"\nExporting components (dtype={args.dtype})...")
-    if args.streaming:
-        programs, metadata = export_streaming_ggml(
-            model, args.max_seq_len, args.max_enc_len, dtype=model_dtype
-        )
-    else:
-        programs, metadata = export_all_ggml(model, args.max_seq_len, dtype=model_dtype)
+    with torch.no_grad():
+        if args.streaming:
+            programs, metadata = export_streaming_ggml(
+                model, args.max_seq_len, args.max_enc_len, dtype=model_dtype
+            )
+        else:
+            programs, metadata = export_all_ggml(model, args.max_seq_len, dtype=model_dtype)
 
-    t0 = time.time()
-    et = lower_to_ggml(programs, metadata=metadata, quant_config=quant_config,
-                       target_dtype=args.dtype)
-    t1 = time.time()
-    print(f"Lowering took {t1 - t0:.1f}s")
+        t0 = time.time()
+        et = lower_to_ggml(programs, metadata=metadata, quant_config=quant_config,
+                           target_dtype=args.dtype)
+        t1 = time.time()
+        print(f"Lowering took {t1 - t0:.1f}s")
 
     out_filename = f"model_{args.dtype.lower()}.pte"
     out_path = os.path.join(args.output_dir, out_filename)

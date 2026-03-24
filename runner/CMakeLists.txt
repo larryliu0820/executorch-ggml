@@ -180,6 +180,72 @@ if(EXECUTORCH_GGML_BUILD_LLAMA_RUNNER)
   target_compile_options(llm_main PRIVATE -Wno-deprecated-declarations)
 
   message(STATUS "llm_main target configured (llama runner + GGML backend)")
+
+# ---------------------------------------------------------------------------
+# voxtral_rt: Voxtral Realtime streaming runner linked with GGML backend
+# ---------------------------------------------------------------------------
+# Compiles the upstream voxtral_realtime_runner source directly — no patches.
+# The GGML backend self-registers at static init; PTE files with GGML
+# delegates are handled automatically.
+
+set(ET_VOXTRAL_DIR "${EXECUTORCH_DIR}/examples/models/voxtral_realtime")
+
+add_executable(voxtral_rt
+  "${ET_VOXTRAL_DIR}/main.cpp"
+  "${ET_VOXTRAL_DIR}/voxtral_realtime_runner.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/pal_init.cpp"
+)
+
+target_include_directories(voxtral_rt PRIVATE
+  "${ET_VOXTRAL_DIR}"
+  "${EXECUTORCH_DIR}/.."
+  "${EXECUTORCH_DIR}/extension/llm/tokenizers/include"
+  "${CMAKE_SOURCE_DIR}/runtime"
+  "${CMAKE_SOURCE_DIR}/schema"
+  "${LLAMA_CPP_DIR}/ggml/include"
+)
+
+if(APPLE)
+  target_link_libraries(voxtral_rt PUBLIC
+    -Wl,-force_load,$<TARGET_FILE:executorch_ggml_runtime>
+    ggml ggml-base ggml-cpu
+    ${_link_libs}
+    extension_llm_runner extension_module extension_data_loader
+    extension_tensor extension_flat_tensor)
+else()
+  target_link_libraries(voxtral_rt PUBLIC
+    -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
+    ggml ggml-base ggml-cpu
+    -Wl,--no-as-needed ${_link_libs} -Wl,--as-needed
+    extension_llm_runner extension_module extension_data_loader
+    extension_tensor extension_flat_tensor)
+endif()
+if(TARGET ggml-blas)
+  target_link_libraries(voxtral_rt PRIVATE ggml-blas)
+endif()
+if(TARGET ggml-metal)
+  target_link_libraries(voxtral_rt PRIVATE ggml-metal)
+endif()
+if(TARGET ggml-cuda)
+  target_link_libraries(voxtral_rt PRIVATE ggml-cuda)
+  target_link_libraries(voxtral_rt PRIVATE -Wl,--no-as-needed -L/usr/local/cuda/lib64 -lcudart -Wl,--as-needed)
+endif()
+
+if(APPLE)
+  set_target_properties(voxtral_rt PROPERTIES
+    BUILD_RPATH "${CMAKE_BINARY_DIR}/ggml/src"
+    INSTALL_RPATH "@executable_path"
+  )
+else()
+  set_target_properties(voxtral_rt PROPERTIES
+    BUILD_RPATH "${CMAKE_BINARY_DIR}/ggml/src"
+  )
+endif()
+
+target_compile_options(voxtral_rt PRIVATE -Wno-deprecated-declarations)
+
+message(STATUS "voxtral_rt target configured (streaming runner + GGML backend)")
+
 else()
   message(STATUS "Skipping llm_main: EXECUTORCH_GGML_BUILD_LLAMA_RUNNER is OFF")
 endif()

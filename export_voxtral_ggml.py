@@ -88,7 +88,7 @@ def export_all_ggml(model, max_seq_len, dtype=torch.float32):
         audio_encoder,
         (sample_mel,),
         dynamic_shapes={"mel": {2: Dim.AUTO}},
-        strict=True,
+        strict=False,
     )
     print(f"  audio_encoder exported (sample input: {sample_mel.shape})")
 
@@ -106,7 +106,7 @@ def export_all_ggml(model, max_seq_len, dtype=torch.float32):
             "input_embeds": {1: seq_dim},
             "cache_position": {0: seq_dim},
         },
-        strict=True,
+        strict=False,
     )
     print(f"  text_decoder exported (sample input: {sample_embeds.shape})")
 
@@ -120,7 +120,7 @@ def export_all_ggml(model, max_seq_len, dtype=torch.float32):
         tok_emb,
         (sample_ids,),
         dynamic_shapes={"token_ids": {1: tok_seq_dim}},
-        strict=True,
+        strict=False,
     )
     print(f"  token_embedding exported (sample input: {sample_ids.shape})")
 
@@ -149,6 +149,21 @@ def export_streaming_ggml(model, max_seq_len, max_enc_len=750, dtype=torch.float
     # --- Streaming audio encoder ---
     print("\nExporting encode_audio_chunk...")
     streaming_enc = StreamingAudioEncoderExport(model, max_enc_len=max_enc_len)
+
+    # Swap custom KVCache/SDPA with standard ops for GGML export
+    from executorch.examples.models.voxtral_realtime.model import KVCache, SDPA
+    from executorch_ggml.modules.voxtral_attention import IndexCopyKVCache, StandardSDPA
+    for i, kv in enumerate(streaming_enc.kv_caches):
+        if isinstance(kv, KVCache):
+            new_kv = IndexCopyKVCache(kv.max_seq_len, kv.n_kv_heads, kv.head_dim)
+            new_kv.k_cache = kv.k_cache
+            new_kv.v_cache = kv.v_cache
+            streaming_enc.kv_caches[i] = new_kv
+    if isinstance(streaming_enc.sdpa, SDPA):
+        streaming_enc.sdpa = StandardSDPA(
+            streaming_enc.n_heads, streaming_enc.n_heads, streaming_enc.head_dim,
+        )
+    print("  Swapped encoder KVCache/SDPA for GGML export")
 
     # CRITICAL FIX: Only convert float parameters to BF16, preserve integer types
     if param_dtype == torch.bfloat16:
@@ -179,7 +194,7 @@ def export_streaming_ggml(model, max_seq_len, max_enc_len=750, dtype=torch.float
         streaming_enc,
         (sample_mel_chunk, sample_enc_pos),
         dynamic_shapes=None,
-        strict=True,
+        strict=False,
     )
     print(f"  encode_audio_chunk exported (fixed shapes: mel_chunk={sample_mel_chunk.shape})")
 
@@ -197,7 +212,7 @@ def export_streaming_ggml(model, max_seq_len, max_enc_len=750, dtype=torch.float
             "input_embeds": {1: seq_dim},
             "cache_position": {0: seq_dim},
         },
-        strict=True,
+        strict=False,
     )
     print(f"  text_decoder exported (sample input: {sample_embeds.shape})")
 
@@ -211,7 +226,7 @@ def export_streaming_ggml(model, max_seq_len, max_enc_len=750, dtype=torch.float
         tok_emb,
         (sample_ids,),
         dynamic_shapes={"token_ids": {1: tok_seq_dim}},
-        strict=True,
+        strict=False,
     )
     print(f"  token_embedding exported (sample input: {sample_ids.shape})")
 
@@ -255,6 +270,12 @@ def lower_to_ggml(programs, metadata=None, quant_config=None, target_dtype=None)
     """Lower exported programs to ExecuTorch with GGML backend."""
     print("\nLowering to ExecuTorch with GGML backend...")
 
+    # Streaming encoder uses data-dependent scalar_tensor ops for KV cache
+    # masks that the GGML backend can't handle. Lower it separately with
+    # portable ops (no delegation), then merge with the GGML-delegated
+    # decoder/embedding methods.
+    encoder_prog = programs.pop("encode_audio_chunk", None)
+
     partitioner = {key: [GgmlPartitioner(quant_config=quant_config)] for key in programs}
 
     constant_methods = {}
@@ -273,16 +294,54 @@ def lower_to_ggml(programs, metadata=None, quant_config=None, target_dtype=None)
     elif target_dtype == "FP16":
         print("  FP16 cast pass not yet implemented, using F32")
 
-    et_prog = to_edge_transform_and_lower(
-        programs,
-        transform_passes=transform_passes,
-        partitioner=partitioner,
-        compile_config=EdgeCompileConfig(
-            _check_ir_validity=False,
-            _skip_dim_order=True,
-        ),
-        constant_methods=constant_methods if constant_methods else None,
-    )
+    if encoder_prog is not None:
+        # Lower encoder separately with portable backend (no delegation).
+        # Detach parameters to avoid "leaf Variable requires grad" during
+        # edge pass execution (the encoder graph has in-place KV cache ops).
+        gm = encoder_prog.graph_module
+        for name, param in list(gm.named_parameters()):
+            parts = name.split(".")
+            mod = gm
+            for p in parts[:-1]:
+                mod = getattr(mod, p)
+            setattr(mod, parts[-1], torch.nn.Parameter(param.detach()))
+        print("  Lowering encode_audio_chunk (portable, no delegation)...")
+        enc_edge = to_edge_transform_and_lower(
+            {"encode_audio_chunk": encoder_prog},
+            compile_config=EdgeCompileConfig(
+                _check_ir_validity=False,
+                _skip_dim_order=True,
+            ),
+        )
+        # Lower decoder + embedding with GGML backend.
+        print("  Lowering decoder + embedding (GGML)...")
+        dec_edge = to_edge_transform_and_lower(
+            programs,
+            transform_passes=transform_passes,
+            partitioner=partitioner,
+            compile_config=EdgeCompileConfig(
+                _check_ir_validity=False,
+                _skip_dim_order=True,
+            ),
+            constant_methods=constant_methods if constant_methods else None,
+        )
+        # Merge: take encoder from enc_edge, rest from dec_edge.
+        # EdgeProgramManager stores programs in ._edge_programs dict.
+        for name, prog in enc_edge._edge_programs.items():
+            dec_edge._edge_programs[name] = prog
+        et_prog = dec_edge
+    else:
+        et_prog = to_edge_transform_and_lower(
+            programs,
+            transform_passes=transform_passes,
+            partitioner=partitioner,
+            compile_config=EdgeCompileConfig(
+                _check_ir_validity=False,
+                _skip_dim_order=True,
+            ),
+            constant_methods=constant_methods if constant_methods else None,
+        )
+
     return et_prog.to_executorch(
         config=ExecutorchBackendConfig(
             extract_delegate_segments=True,
