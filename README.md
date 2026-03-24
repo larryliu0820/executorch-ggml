@@ -15,6 +15,18 @@ ggml provides highly optimized, portable C kernels for tensor operations — qua
 - **Portable deployment** — ggml runs on x86, ARM, Apple Silicon, and GPU backends without framework-level dependencies.
 - **Incremental adoption** — the partitioner only delegates ops that ggml supports. Unsupported ops fall back to ExecuTorch's default CPU executor. You can start with a few ops and expand coverage over time.
 
+## Performance
+
+Voxtral-Mini-4B-Realtime decoder on NVIDIA A100 (single-token decode, 100 steps):
+
+| Format | tok/s | ms/tok | PTE Size | GPU Memory | vs FP32 |
+|--------|------:|-------:|---------:|-----------:|---------|
+| FP32   |  78.8 |  12.70 |  ~16 GB  |   13.9 GB  | baseline |
+| BF16   |  85.5 |  11.70 |  8.5 GB  |    ~7 GB   | 1.09x faster, 50% less memory |
+| Q8_0   | 101.1 |   9.89 |  4.5 GB  |    ~4 GB   | 1.28x faster, 71% less memory |
+
+Key optimizations: fused RoPE (`ggml_rope_ext`), RMS norm weight folding, SwiGLU fusion (`ggml_swiglu_split`), flash attention with GQA, skip-output-copy with CUDA argmax, and BF16 activation passthrough (avoids redundant F32↔BF16 cast chains on CUDA).
+
 ## How It Works
 
 ```
@@ -27,7 +39,7 @@ torch.export.export()      # Produces an ExportedProgram (ATen dialect)
 executorch.exir.to_edge()  # Converts to Edge dialect
     │
     ▼
-ExportedProgram rewrites   # (optional) e.g. BN folding
+ExportedProgram rewrites   # (optional) e.g. BN folding, BF16 cast pass
     │
     ▼
 GgmlPartitioner            # Tags supported Edge ops for delegation
@@ -45,14 +57,13 @@ GgmlBackendInterface       # C++ runtime: deserializes IR, builds ggml_cgraph,
 
 ## Supported Models
 
-| Model | Type | Status | Notes |
-|-------|------|--------|-------|
-| [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | LLM | Full (F32 + Q8_0) | Text generation with KV cache, fused SDPA |
-| [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) | ASR | Full (BF16) | Audio encoder (fused RoPE + RMS norm) + text decoder with KV cache |
-| [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | ASR | Full (F32 + Q8_0) | Speech-to-text, FastConformer encoder + TDT decoder |
-| MobileNetV2 | Vision | Full | Requires `BatchNormFoldingRewritePass` for Conv+BN |
-| Linear + ReLU | MLP | Full | Basic MLP architectures |
-| Custom CNNs | Vision | Partial | Conv2d, depthwise conv, pooling, activations |
+| Model | Type | Formats | Notes |
+|-------|------|---------|-------|
+| [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) | ASR | FP32, BF16, Q8_0 | 101 tok/s Q8_0 on A100; fused RoPE, RMS norm fold, SwiGLU fusion |
+| [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | LLM | FP32, Q8_0 | Text generation with KV cache, fused SDPA |
+| [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | ASR | FP32, Q8_0 | FastConformer encoder + TDT decoder |
+| MobileNetV2 | Vision | FP32 | Requires `BatchNormFoldingRewritePass` for Conv+BN |
+| Custom CNNs | Vision | FP32 | Conv2d, depthwise conv, pooling, activations |
 
 Unsupported ops automatically fall back to ExecuTorch's CPU executor.
 
@@ -85,6 +96,49 @@ pip install -e .
    ```
 
 These methods will install the latest `executorch` nightly version from PyTorch's nightly wheel server.
+
+### Voxtral-Mini-4B-Realtime (Speech Recognition)
+
+**Export:**
+```bash
+# BF16 (8.5 GB, 85 tok/s on A100)
+python runner/export_voxtral_rt.py \
+  --model-path /path/to/Voxtral-Mini-4B-Realtime-2602 \
+  --dtype BF16
+
+# Q8_0 (4.5 GB, 101 tok/s on A100)
+python runner/export_voxtral_rt.py \
+  --model-path /path/to/Voxtral-Mini-4B-Realtime-2602 \
+  --dtype Q8_0
+```
+
+**Get test audio (30s LibriSpeech clip):**
+```bash
+python -c "from datasets import load_dataset; import soundfile as sf; s = load_dataset('distil-whisper/librispeech_long', 'clean', split='validation')[0]['audio']; sf.write('test_audio.wav', s['array'][:s['sampling_rate']*30], s['sampling_rate'])"
+```
+
+**Run:**
+```bash
+python runner/run_voxtral_rt.py \
+  --model voxtral_ggml/model_q8_0.pte \
+  --model-path /path/to/Voxtral-Mini-4B-Realtime-2602 \
+  --audio test_audio.wav
+```
+
+**C++ Benchmark:**
+```bash
+# Build (requires CUDA)
+cmake -B build -DEXECUTORCH_GGML_BUILD_LLAMA_RUNNER=ON -DCMAKE_CUDA_ARCHITECTURES=80
+cmake --build build --target benchmark_voxtral
+
+# Run
+GGML_BACKEND_DEVICE=cuda ./build/benchmark/benchmark_voxtral voxtral_ggml/model_q8_0.pte
+```
+
+Requires `mistral-common` for the tokenizer:
+```bash
+pip install mistral-common
+```
 
 ### Python (ahead-of-time compilation)
 
@@ -133,20 +187,13 @@ with open("mobilenet_v2.pte", "wb") as f:
 
 **Export:**
 ```bash
-# F32
+# Q8_0 quantized
 python runner/export_qwen3_q8.py
-
-# This produces qwen3/qwen3_q8_0.pte (Q8_0 quantized)
-# For F32, export with the same script but without quant_config (see code)
 ```
 
 **Run:**
 ```bash
-# Q8_0 (~370 MB)
 python runner/run_qwen3.py --model qwen3/qwen3_q8_0.pte
-
-# F32 (~1.2 GB)
-python runner/run_qwen3.py --model qwen3/qwen3.pte
 ```
 
 Requires `optimum-executorch` for the export wrapper:
@@ -156,17 +203,8 @@ pip install optimum[executorch]
 
 ### Parakeet TDT 0.6B (Speech Recognition)
 
-**Get test audio (30s LibriSpeech clip):**
-```bash
-python -c "from datasets import load_dataset; import soundfile as sf; s = load_dataset('hf-internal-testing/librispeech_asr_demo', 'clean', split='validation')[0]['audio']; sf.write('test_audio.wav', s['array'][:s['sampling_rate']*30], s['sampling_rate'])"
-```
-
 **Export:**
 ```bash
-# F32 model
-python runner/export_parakeet.py --dtype F32 --audio test_audio.wav
-
-# Q8_0 model (default)
 python runner/export_parakeet.py --dtype Q8_0 --audio test_audio.wav
 ```
 
@@ -174,8 +212,6 @@ python runner/export_parakeet.py --dtype Q8_0 --audio test_audio.wav
 ```bash
 python runner/run_parakeet.py --model parakeet_ggml/model_q8_0.pte --audio test_audio.wav
 ```
-
-This runs eager PyTorch, Q8_0, and F32 side by side and compares transcriptions.
 
 Requires NeMo for the model:
 ```bash
@@ -185,35 +221,6 @@ pip install nemo_toolkit[asr]
 To force CPU-only execution (no Metal GPU):
 ```bash
 GGML_BACKEND_DEVICE=cpu python runner/run_parakeet.py --model parakeet_ggml/model_q8_0.pte --audio test_audio.wav
-```
-
-### Voxtral-Mini-4B-Realtime (Speech Recognition)
-
-**Export:**
-```bash
-python runner/export_voxtral_rt.py \
-  --model-path /path/to/Voxtral-Mini-4B-Realtime-2602 \
-  --dtype BF16
-```
-
-**Get test audio (30s LibriSpeech clip):**
-```bash
-python -c "from datasets import load_dataset; import soundfile as sf; s = load_dataset('distil-whisper/librispeech_long', 'clean', split='validation')[0]['audio']; sf.write('test_audio.wav', s['array'][:s['sampling_rate']*30], s['sampling_rate'])"
-```
-
-**Run:**
-```bash
-DYLD_LIBRARY_PATH=python/executorch_ggml python runner/run_voxtral_rt.py \
-  --model voxtral_ggml/model_bf16.pte \
-  --model-path /path/to/Voxtral-Mini-4B-Realtime-2602 \
-  --audio test_audio.wav
-```
-
-The encoder uses fused RoPE (`ggml_rope_ext`) and native RMS norm for the 32-layer causal whisper encoder. The decoder follows the Voxtral Realtime inference protocol: at each position, the input is the element-wise sum of `audio_embeds[pos]` and `token_embedding(prev_token)`.
-
-Requires `mistral-common` for the tokenizer:
-```bash
-pip install mistral-common
 ```
 
 ### C++ (runtime)
