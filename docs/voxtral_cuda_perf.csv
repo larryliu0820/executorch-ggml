@@ -12,3 +12,5 @@ C++ baseline (CPU argmax verified),decoder,471,1,12.88,77.7,tok/s,"C++ benchmark
 BF16 (no decoder opts),decoder,~811,1,17.67,56.6,tok/s,"BF16 4B; 7.0 GB; missing rope fusion + norm fold"
 BF16 + decoder opts + skip_bf16_castback,decoder,552,1,11.97,83.5,tok/s,"BF16 with all FP32 opts + F32 activation passthrough"
 BF16 + skip_output_copy,decoder,552,1,11.70,85.5,tok/s,"BF16 + skip_copy; 7 GB GPU; 50% less memory than FP32"
+Q8_0 (all opts),decoder,552,1,10.33,96.8,tok/s,"Q8_0 4.5 GB PTE; ~4 GB GPU; 71% less memory than FP32"
+Q8_0 + skip_output_copy,decoder,552,1,9.89,101.1,tok/s,"Q8_0 + skip_copy; 101 tok/s; 30% faster than FP32"

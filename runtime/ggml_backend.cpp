@@ -2442,9 +2442,21 @@ static Error build_graph(
           break;
         }
 
-        case ggml_ir::OpCode::MUL_MAT:
-          gt = ggml_mul_mat(ctx, srcs[0], srcs[1]);
+        case ggml_ir::OpCode::MUL_MAT: {
+          struct ggml_tensor* mm_w = srcs[0];
+          struct ggml_tensor* mm_x = srcs[1];
+          // CUDA cuBLAS BF16 path only supports F32/F16/BF16 activations.
+          // When weights are BF16 (unquantized) and activation is another type
+          // (e.g. Q8_0 from a quantized graph), cast activation to F32.
+          if (mm_w->type == GGML_TYPE_BF16 &&
+              mm_x->type != GGML_TYPE_F32 &&
+              mm_x->type != GGML_TYPE_F16 &&
+              mm_x->type != GGML_TYPE_BF16) {
+            mm_x = safe_ggml_cast(ctx, mm_x, GGML_TYPE_F32, &host_acc);
+          }
+          gt = ggml_mul_mat(ctx, mm_w, mm_x);
           break;
+        }
 
         case ggml_ir::OpCode::MUL: {
           // ggml_mul(a, b) requires ggml_can_repeat(b, a) — b broadcasts to a.
@@ -2664,6 +2676,13 @@ static Error build_graph(
           // Compute: y = w @ x, then add bias if present.
           struct ggml_tensor* x = srcs[0];
           struct ggml_tensor* w = srcs[1];
+          // CUDA cuBLAS BF16 path only supports F32/F16/BF16 activations.
+          if (w->type == GGML_TYPE_BF16 &&
+              x->type != GGML_TYPE_F32 &&
+              x->type != GGML_TYPE_F16 &&
+              x->type != GGML_TYPE_BF16) {
+            x = safe_ggml_cast(ctx, x, GGML_TYPE_F32, &host_acc);
+          }
           struct ggml_tensor* y = ggml_mul_mat(ctx, w, x);
           if (srcs.size() > 2) {
             struct ggml_tensor* b = srcs[2];
