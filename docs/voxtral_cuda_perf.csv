@@ -9,3 +9,6 @@ Baseline (swap_voxtral_attention only),decoder,811,2,95.0,11,tok/s,"FP32 4B mode
 + fold_decoder_attention_norm,decoder,471,1,13.1,76,tok/s,"-26 MUL nodes from attention_norm weight folding"
 + skip_output_copy + CUDA argmax,decoder,471,1,12.70,78.8,tok/s,"C++ benchmark; skip 512KB logits D2H; -0.18ms/tok"
 C++ baseline (CPU argmax verified),decoder,471,1,12.88,77.7,tok/s,"C++ benchmark_voxtral; 100 decode steps; FP32 A100"
+BF16 (no decoder opts),decoder,~811,1,17.67,56.6,tok/s,"BF16 4B; 7.0 GB; missing rope fusion + norm fold"
+BF16 + decoder opts + skip_bf16_castback,decoder,552,1,11.97,83.5,tok/s,"BF16 with all FP32 opts + F32 activation passthrough"
+BF16 + skip_output_copy,decoder,552,1,11.70,85.5,tok/s,"BF16 + skip_copy; 7 GB GPU; 50% less memory than FP32"

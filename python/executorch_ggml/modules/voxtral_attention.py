@@ -77,13 +77,18 @@ def swap_voxtral_attention(model: nn.Module) -> None:
     """Replace KVCache and SDPA in all decoder attention layers.
 
     Walks model.decoder.layers and swaps kv_cache and sdpa in-place,
-    copying existing cache buffer data.
+    copying existing cache buffer data.  Idempotent — skips layers
+    already swapped (e.g. by swap_decoder_rope).
     """
     from executorch.examples.models.voxtral_realtime.model import KVCache, SDPA
 
     decoder = model.decoder if hasattr(model, "decoder") else model
     for layer in decoder.layers:
         attn = layer.attention
+
+        # Skip if already replaced by swap_decoder_rope (GgmlDecoderAttention)
+        if not hasattr(attn, "kv_cache"):
+            continue
 
         # Swap KVCache
         if isinstance(attn.kv_cache, KVCache):

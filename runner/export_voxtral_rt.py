@@ -103,6 +103,16 @@ def main():
     swap_voxtral_attention(model)
     print("  Applied standard attention (swap_voxtral_attention)")
 
+    # Fuse decoder RoPE into ggml_rope_ext (saves ~210 graph nodes)
+    from executorch_ggml.modules.voxtral_decoder_rope import swap_decoder_rope
+    n_rope = swap_decoder_rope(model, freq_base=model.config.rope_theta)
+    print(f"  Applied fused decoder RoPE ({n_rope} layers)")
+
+    # Fold RMS norm weights into subsequent linear projections (saves ~26 nodes)
+    from executorch_ggml.passes.fold_decoder_rms_norm_weights import fold_decoder_rms_norm_weights
+    n_fold = fold_decoder_rms_norm_weights(model)
+    print(f"  Applied fold_decoder_rms_norm_weights ({n_fold} folded)")
+
     print(f"\nExporting components (dtype={args.dtype})...")
     if args.streaming:
         programs, metadata = export_streaming_ggml(
@@ -112,7 +122,8 @@ def main():
         programs, metadata = export_all_ggml(model, args.max_seq_len, dtype=model_dtype)
 
     t0 = time.time()
-    et = lower_to_ggml(programs, metadata=metadata, quant_config=quant_config)
+    et = lower_to_ggml(programs, metadata=metadata, quant_config=quant_config,
+                       target_dtype=args.dtype)
     t1 = time.time()
     print(f"Lowering took {t1 - t0:.1f}s")
 

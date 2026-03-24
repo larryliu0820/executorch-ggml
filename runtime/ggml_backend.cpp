@@ -1755,6 +1755,12 @@ static Error build_graph(
   const bool metal_f32_binops = false;
 #endif
   const bool cuda_bf16_cast = (handle->backend != handle->backend_cpu) && !metal_f32_binops;
+  // On CUDA, don't cast activations back to BF16 after ops that had to convert
+  // to F32. Keeping activations in F32 avoids wasteful F32→BF16→F32 chains
+  // (each is a separate kernel launch). ggml_mul_mat handles mixed types
+  // natively (BF16 weights × F32 activations), and the output copy path
+  // already handles F32→BF16 conversion.
+  const bool skip_bf16_castback = cuda_bf16_cast;
 
   // --- Tear down previous context (no-op on first call) ---
   // Preserve the scheduler — it will be reset+realloc'd in execute().
@@ -2631,7 +2637,7 @@ static Error build_graph(
           ggml_type orig = x->type;
           if (x->type == GGML_TYPE_BF16) x = ggml_cast(ctx, x, GGML_TYPE_F32);
           gt = ggml_silu(ctx, x);
-          if (orig == GGML_TYPE_BF16) gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
+          if (orig == GGML_TYPE_BF16 && !skip_bf16_castback) gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
           break;
         }
 
@@ -2648,7 +2654,7 @@ static Error build_graph(
           ggml_type orig = x->type;
           if (x->type == GGML_TYPE_BF16) x = ggml_cast(ctx, x, GGML_TYPE_F32);
           gt = ggml_gelu(ctx, x);
-          if (orig == GGML_TYPE_BF16) gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
+          if (orig == GGML_TYPE_BF16 && !skip_bf16_castback) gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
           break;
         }
 
@@ -3746,7 +3752,8 @@ static Error build_graph(
                   (long long)attn->ne[2], (long long)attn->ne[3], attn->type);
           gt = safe_ggml_permute(ctx, attn, 0, 2, 1, 3, "LLAMA_ATTN");
           // Cast SDPA output back to BF16 if original Q was BF16
-          if (sdpa_orig_type == GGML_TYPE_BF16) {
+          // (skip on CUDA — keep activations in F32 to avoid cast chains)
+          if (sdpa_orig_type == GGML_TYPE_BF16 && !skip_bf16_castback) {
             gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
           }
           break;
@@ -3913,7 +3920,8 @@ static Error build_graph(
             gt = safe_ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3], "SOFTMAX_post");
           }
           // Cast back to original type if needed
-          if (orig_type == GGML_TYPE_BF16) {
+          // (skip on CUDA — keep activations in F32 to avoid cast chains)
+          if (orig_type == GGML_TYPE_BF16 && !skip_bf16_castback) {
             gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
           }
           break;
@@ -4498,7 +4506,8 @@ static Error build_graph(
               gt = ggml_mul(ctx, gt, w);
             }
             // Cast back to original type if we casted for rms_norm
-            if (rms_casted && srcs[0]->type == GGML_TYPE_BF16) {
+            // (skip on CUDA — keep activations in F32 to avoid cast chains)
+            if (rms_casted && srcs[0]->type == GGML_TYPE_BF16 && !skip_bf16_castback) {
               gt = ggml_cast(ctx, gt, GGML_TYPE_BF16);
             }
           }
