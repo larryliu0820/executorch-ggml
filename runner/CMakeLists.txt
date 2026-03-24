@@ -190,6 +190,21 @@ if(EXECUTORCH_GGML_BUILD_LLAMA_RUNNER)
 
 set(ET_VOXTRAL_DIR "${EXECUTORCH_DIR}/examples/models/voxtral_realtime")
 
+# Use optimized CPU ops (superset of portable ops, includes STFT/FFT for mel
+# preprocessor). Cannot link both portable_ops_lib and optimized_native_cpu_ops_lib
+# (duplicate op registration aborts at static init).
+set(_voxtral_ops_lib)
+if(TARGET optimized_native_cpu_ops_lib)
+  set(_voxtral_ops_lib optimized_native_cpu_ops_lib)
+else()
+  set(_voxtral_ops_lib portable_ops_lib)
+endif()
+
+# Ensure static constructors (op/backend registration) are loaded from shared
+# libs — mirrors upstream voxtral_realtime CMakeLists.txt.
+executorch_target_link_options_shared_lib(executorch)
+executorch_target_link_options_shared_lib(${_voxtral_ops_lib})
+
 add_executable(voxtral_rt
   "${ET_VOXTRAL_DIR}/main.cpp"
   "${ET_VOXTRAL_DIR}/voxtral_realtime_runner.cpp"
@@ -205,30 +220,27 @@ target_include_directories(voxtral_rt PRIVATE
   "${LLAMA_CPP_DIR}/ggml/include"
 )
 
-# Use optimized CPU ops (superset of portable ops, includes STFT/FFT for mel
-# preprocessor). Cannot link both portable_ops_lib and optimized_native_cpu_ops_lib
-# (duplicate op registration aborts at static init).
-set(_voxtral_ops_lib)
-if(TARGET optimized_native_cpu_ops_lib)
-  set(_voxtral_ops_lib optimized_native_cpu_ops_lib optimized_kernels)
-else()
-  set(_voxtral_ops_lib portable_ops_lib portable_kernels)
-endif()
+set(_voxtral_link_libs
+  gflags
+  extension_llm_runner extension_module extension_data_loader
+  extension_tensor extension_flat_tensor)
 
 if(APPLE)
   target_link_libraries(voxtral_rt PUBLIC
     -Wl,-force_load,$<TARGET_FILE:executorch_ggml_runtime>
-    ggml ggml-base ggml-cpu
-    executorch gflags ${_voxtral_ops_lib}
-    extension_llm_runner extension_module extension_data_loader
-    extension_tensor extension_flat_tensor)
+    -Wl,-force_load,$<TARGET_FILE:${_voxtral_ops_lib}>
+    ggml ggml-base ggml-cpu executorch
+    ${_voxtral_link_libs})
 else()
+  # --whole-archive on GGML runtime for backend registration.
+  # --no-as-needed on executorch + ops lib to ensure their static
+  # constructors (op/backend registration) are loaded even though
+  # voxtral_rt has no direct symbol references to them.
   target_link_libraries(voxtral_rt PUBLIC
     -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
     ggml ggml-base ggml-cpu
-    -Wl,--no-as-needed executorch gflags ${_voxtral_ops_lib} -Wl,--as-needed
-    extension_llm_runner extension_module extension_data_loader
-    extension_tensor extension_flat_tensor)
+    -Wl,--no-as-needed executorch ${_voxtral_ops_lib} -Wl,--as-needed
+    ${_voxtral_link_libs})
 endif()
 if(TARGET ggml-blas)
   target_link_libraries(voxtral_rt PRIVATE ggml-blas)
@@ -259,3 +271,4 @@ message(STATUS "voxtral_rt target configured (streaming runner + GGML backend)")
 else()
   message(STATUS "Skipping llm_main: EXECUTORCH_GGML_BUILD_LLAMA_RUNNER is OFF")
 endif()
+
