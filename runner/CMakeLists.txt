@@ -205,18 +205,28 @@ target_include_directories(voxtral_rt PRIVATE
   "${LLAMA_CPP_DIR}/ggml/include"
 )
 
+# Use optimized CPU ops (superset of portable ops, includes STFT/FFT for mel
+# preprocessor). Cannot link both portable_ops_lib and optimized_native_cpu_ops_lib
+# (duplicate op registration aborts at static init).
+set(_voxtral_ops_lib)
+if(TARGET optimized_native_cpu_ops_lib)
+  set(_voxtral_ops_lib optimized_native_cpu_ops_lib optimized_kernels)
+else()
+  set(_voxtral_ops_lib portable_ops_lib portable_kernels)
+endif()
+
 if(APPLE)
   target_link_libraries(voxtral_rt PUBLIC
     -Wl,-force_load,$<TARGET_FILE:executorch_ggml_runtime>
     ggml ggml-base ggml-cpu
-    ${_link_libs}
+    executorch gflags ${_voxtral_ops_lib}
     extension_llm_runner extension_module extension_data_loader
     extension_tensor extension_flat_tensor)
 else()
   target_link_libraries(voxtral_rt PUBLIC
     -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
     ggml ggml-base ggml-cpu
-    -Wl,--no-as-needed ${_link_libs} -Wl,--as-needed
+    -Wl,--no-as-needed executorch gflags ${_voxtral_ops_lib} -Wl,--as-needed
     extension_llm_runner extension_module extension_data_loader
     extension_tensor extension_flat_tensor)
 endif()
