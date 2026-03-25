@@ -58,17 +58,22 @@ class GgmlDecoderAttention(nn.Module):
         self.k_cache.index_copy_(1, input_pos, k)
         self.v_cache.index_copy_(1, input_pos, v)
 
-        # SDPA with native GQA
+        # SDPA with native GQA. Slice cache to valid positions only —
+        # attending to zero-filled entries produces wrong output.
+        # Use is_causal only during prefill (S_q == S_kv); during decode
+        # the cache already enforces causality.
+        kv_len = input_pos[0].item() + T
         q = q.transpose(1, 2)
-        k_full = self.k_cache.transpose(1, 2)
-        v_full = self.v_cache.transpose(1, 2)
+        k_slice = self.k_cache[:, :kv_len, :, :].transpose(1, 2)
+        v_slice = self.v_cache[:, :kv_len, :, :].transpose(1, 2)
 
         if attn_mask is None:
+            is_causal = (T == kv_len)
             y = F.scaled_dot_product_attention(
-                q, k_full, v_full, is_causal=True, enable_gqa=self.enable_gqa)
+                q, k_slice, v_slice, is_causal=is_causal, enable_gqa=self.enable_gqa)
         else:
             y = F.scaled_dot_product_attention(
-                q, k_full, v_full, attn_mask=attn_mask, enable_gqa=self.enable_gqa)
+                q, k_slice, v_slice, attn_mask=attn_mask, enable_gqa=self.enable_gqa)
 
         attn_dim = self.n_heads * self.head_dim
         return self.wo(y.transpose(1, 2).contiguous().view(B, T, attn_dim))

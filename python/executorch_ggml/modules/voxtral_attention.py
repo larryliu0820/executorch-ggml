@@ -59,13 +59,23 @@ class StandardSDPA(nn.Module):
         seqlen: int,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = q.transpose(1, 2)  # (B, H, S_q, D)
+
+        # K, V are the full cache (B, max_seq_len, H, D). Slice to valid
+        # positions [0, start_pos + seqlen) — attending to zero-filled
+        # entries produces wrong output. After slicing, use is_causal=False
+        # because causality is already enforced by the cache (it only
+        # contains past positions). Using is_causal=True would wrongly
+        # mask Q[i] from attending to K[j>i] within the valid slice.
+        kv_len = input_pos[0].item() + seqlen
+        k = k[:, :kv_len, :, :].transpose(1, 2)
+        v = v[:, :kv_len, :, :].transpose(1, 2)
 
         if mask is None:
+            # Causal during prefill (S_q == S_kv), not during decode
+            is_causal = (seqlen == kv_len)
             y = F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, enable_gqa=self.enable_gqa)
+                q, k, v, is_causal=is_causal, enable_gqa=self.enable_gqa)
         else:
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask, enable_gqa=self.enable_gqa)
