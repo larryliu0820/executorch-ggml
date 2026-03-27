@@ -113,8 +113,7 @@ static struct ggml_tensor* safe_ggml_cast(
   if (src->type == target) return src;
   // I64 source: eager CPU conversion
   if (src->type == GGML_TYPE_I64 && target == GGML_TYPE_I32) {
-    auto* r = eager_cast_i64_to_i32(ctx, src, acc);
-    return r;
+    return eager_cast_i64_to_i32(ctx, src, acc);
   }
   // I64 -> F32: eager host conversion (avoids CUDA buffer aliasing in CPY)
   if (src->type == GGML_TYPE_I64 && target == GGML_TYPE_F32) {
@@ -154,9 +153,9 @@ static struct ggml_tensor* safe_ggml_cast(
     return i32;
   }
   // Eager I32->F32 cast (avoids CUDA buffer aliasing in CPY).
-  // Skip if the source is input-derived -- must stay as a graph op for reuse.
-  if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_F32 &&
-      src->data && !(acc && acc->is_input_derived(src))) {
+  // Input-derived tensors are also cast eagerly — has_input_derived_eager
+  // forces graph rebuilding so the values stay fresh across calls.
+  if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_F32 && src->data) {
     const void* src_data = acc ? acc->get(src) : src->data;
     if (src_data) {
       int64_t n = ggml_nelements(src);

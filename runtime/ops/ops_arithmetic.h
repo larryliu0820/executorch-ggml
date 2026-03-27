@@ -58,6 +58,10 @@ static inline struct ggml_tensor* build_op_add(BuildContext& bc) {
   if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
   if (a->type == GGML_TYPE_I32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
   if (b->type == GGML_TYPE_I32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+  // Retry eager after I32/I64→F32 casts (inputs may now have F32 host data)
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, '+', bc.host_acc)) {
+    return eager;
+  }
 
   if (bc.metal_f32_binops) { a = ensure_f32(bc.ctx, a); b = ensure_f32(bc.ctx, b); }
   if (bc.cuda_bf16_cast) {
@@ -132,6 +136,10 @@ static inline struct ggml_tensor* build_op_sub(BuildContext& bc) {
     if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
     if (a->type == GGML_TYPE_I32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
     if (b->type == GGML_TYPE_I32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+    // Retry eager after I32/I64→F32 casts
+    if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, '-', bc.host_acc)) {
+      return eager;
+    }
     if (bc.metal_f32_binops) { a = ensure_f32(bc.ctx, a); b = ensure_f32(bc.ctx, b); }
     if (bc.cuda_bf16_cast) {
       if (a->type == GGML_TYPE_BF16) a = ggml_cast(bc.ctx, a, GGML_TYPE_F32);
@@ -222,6 +230,10 @@ static inline struct ggml_tensor* build_op_mul(BuildContext& bc) {
   if (b->type == GGML_TYPE_I32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
   if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
   if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+  // Retry eager after I32/I64→F32 casts
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, '*', bc.host_acc)) {
+    return eager;
+  }
   // ggml_scale for non-input-derived scalars
   if (ggml_nelements(b) == 1 && b->data && b->type == GGML_TYPE_F32
       && !bc.input_derived.count(b)) {
@@ -317,6 +329,15 @@ static inline struct ggml_tensor* build_op_div(BuildContext& bc) {
   if (b->type == GGML_TYPE_I32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
   if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
   if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+  // Retry eager after I32/I64→F32 casts
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, '/', bc.host_acc)) {
+    if (rounding_mode == 1 && eager) {
+      float* d = static_cast<float*>(eager->data);
+      int64_t n = ggml_nelements(eager);
+      for (int64_t i = 0; i < n; i++) d[i] = std::floor(d[i]);
+    }
+    return eager;
+  }
   if (bc.metal_f32_binops) { a = ensure_f32(bc.ctx, a); b = ensure_f32(bc.ctx, b); }
   if (bc.cuda_bf16_cast) {
     if (a->type == GGML_TYPE_BF16) a = ggml_cast(bc.ctx, a, GGML_TYPE_F32);

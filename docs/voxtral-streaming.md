@@ -4,9 +4,9 @@
 
 **Offline mode**: Working. Correct transcription, 65-84 tok/s Q8_0 on A100.
 
-**Streaming mode**: Export, load, and multi-chunk execution work with GGML delegation. Output is NaN due to eager computation chain data pointer issue. See [Current Blocker](#current-blocker).
+**Streaming mode**: Export, load, and multi-chunk execution work with GGML delegation. NaN bug fixed — ring buffer mask now computes entirely on the host via eager ops. Next step: end-to-end transcription accuracy validation.
 
-**Key proof point**: Eager (PyTorch) streaming encoder + GGML Q8_0 decoder produces correct transcription ("Mr. Quilter is the apostle of the middle classes..."). This proves the decoder is compatible with streaming encoder embeddings. The remaining work is purely GGML streaming encoder accuracy.
+**Key proof point**: Eager (PyTorch) streaming encoder + GGML Q8_0 decoder produces correct transcription ("Mr. Quilter is the apostle of the middle classes..."). This proves the decoder is compatible with streaming encoder embeddings.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ Voxtral streaming uses separate `.pte` files:
 
 | File | Method | Description | Status |
 |------|--------|-------------|--------|
-| `streaming_enc_test.pte` | `e` | Streaming encoder: conv frontend + 32-layer transformer with ring buffer KV cache | Exports + runs multi-chunk. Output NaN (accuracy issue). |
+| `streaming_enc_test.pte` | `e` | Streaming encoder: conv frontend + 32-layer transformer with ring buffer KV cache | Exports + runs multi-chunk. Output valid (NaN fixed). |
 | `model_q8_0.pte` | `audio_encoder` | Offline encoder (all mel frames at once) | Working |
 | `model_q8_0.pte` | `text_decoder` | 26-layer decoder with KV cache | Working (65-84 tok/s) |
 | `model_q8_0.pte` | `token_embedding` | Token embedding lookup | Working |
@@ -109,19 +109,32 @@ C++ comparison handlers assumed 2 sources. Scalar variants (ge.Scalar, lt.Scalar
 
 C++ handler accessed `bc.srcs[1]` unconditionally. Scalar remainder only has 1 source. Fixed bounds check.
 
-## Current Blocker
+### 19. I32→F32 eager cast blocked by `input_derived` guard
 
-### NaN output from streaming encoder
+Position input (I32) marked `input_derived` caused `safe_ggml_cast` to skip eager path → graph node with no host data → downstream mask ops all fall through to CUDA → NaN. Fix: remove guard; `has_input_derived_eager` forces rebuild.
 
-The streaming encoder exports and runs multi-chunk without crashes, but all output values are NaN. The ring buffer mask computation chain uses ~15 input-derived IR ops that must be evaluated eagerly on the host. The `try_eager_f32_binop` + eager I64 ops + eager casts infrastructure is in place, but somewhere in the chain the host data pointer becomes null, causing downstream ops to fall through to the CUDA graph path where buffer aliasing produces NaN.
+### 20. Eager F32 binop not retried after type normalization
 
-**Next debugging step**: Add tracing to `try_eager_f32_binop` and `safe_ggml_cast` to find which tensor in the mask chain first loses its host data pointer. The chain is:
-1. `ARANGE(I64)` → eager host data (confirmed working)
-2. `REMAINDER(I64)` → eager host modulo (confirmed working)
-3. `CAST(I64→F32)` → eager in `safe_ggml_cast` (suspected: data pointer lost after Phase C clear)
-4. `GE/LT(F32)` → `try_eager_f32_binop` (needs data from step 3)
-5. `WHERE(F32)` → eager selection (needs data from step 4)
-6. `SDPA mask` → F16 cast for flash attention
+`try_eager_f32_binop` in ADD/SUB/MUL/DIV ran before I32/I64→F32 casts (→ skip). After casts, both inputs had F32 host data, but code had passed the eager window. Fix: retry `try_eager_f32_binop` after casts.
+
+### 21. Scalar comparisons used REPEAT (no host data)
+
+GE/LT/GT scalar variants wrapped constant in `ggml_repeat_4d` (graph node). `try_eager_f32_binop` couldn't read it. Fix: pass scalar directly; eager broadcasting handles it via modulo indexing.
+
+## Fixed: NaN output from streaming encoder
+
+The ring buffer mask computation chain uses ~15 input-derived IR ops that must be evaluated eagerly on the host. Three bugs prevented this:
+
+1. **I32→F32 eager cast blocked by `input_derived` guard**: The position input (I32) was marked `input_derived`, which caused `safe_ggml_cast` to skip the eager path and create a graph node (no host data). Fix: remove the guard — `has_input_derived_eager` already forces graph rebuilding, so eager input-derived constants are safe.
+
+2. **`try_eager_f32_binop` called before I32/I64→F32 casts**: In ADD/SUB/MUL/DIV, the eager check ran first (seeing I32/I64 types → skip), then the types were cast to F32 with host data, but the code had already passed the eager window. Fix: add a second `try_eager_f32_binop` call after the type normalization.
+
+3. **Scalar comparisons used `ggml_repeat_4d`**: GE/LT/GT scalar variants wrapped the constant in REPEAT (a graph node with no host data), preventing `try_eager_f32_binop` from reading it. Fix: pass the scalar directly — `try_eager_f32_binop` handles broadcasting via modulo indexing.
+
+## Next Steps
+
+- End-to-end streaming transcription accuracy validation (GGML encoder → GGML decoder)
+- Performance benchmarking of streaming encoder on A100
 
 ## How to Export + Run
 
@@ -183,9 +196,9 @@ EOF
 | File | Changes |
 |------|---------|
 | `runtime/ops/helpers.h` | `try_eager_f32_binop` for arbitrary-size eager F32 binary ops |
-| `runtime/ops/host_data_accessor.h` | Eager I64→F32, I32→F32 (non-scalar) casts in `safe_ggml_cast` |
-| `runtime/ops/ops_arithmetic.h` | `try_eager_f32_binop` in ADD/SUB/MUL/DIV, I32→F32 casts, I64 eager MUL/DIV, floor div |
-| `runtime/ops/ops_comparison.h` | `try_eager_f32_binop` in GE/LT/GT/LE/AND, scalar variant support for GE/LT/GT |
+| `runtime/ops/host_data_accessor.h` | Eager I64→F32, I32→F32 casts (including input-derived) in `safe_ggml_cast` |
+| `runtime/ops/ops_arithmetic.h` | `try_eager_f32_binop` in ADD/SUB/MUL/DIV (before AND after type casts), I64 eager MUL/DIV, floor div |
+| `runtime/ops/ops_comparison.h` | `try_eager_f32_binop` in GE/LT/GT/LE/AND, scalar as direct F32 (not REPEAT) |
 | `runtime/ops/ops_creation.h` | Eager I64 ARANGE, eager WHERE with -inf clamping, REMAINDER handler |
 | `runtime/ops/ops_shape.h` | Negative SLICE index resolution |
 | `runtime/ops/ops_special.h` | `was_boolean` SDPA mask fix |

@@ -90,8 +90,7 @@ static inline struct ggml_tensor* build_op_le(BuildContext& bc) {
     memcpy(&le_is_scalar, t->op_params()->data() + 8, 4);
   }
   if (le_is_scalar) {
-    b = ggml_repeat_4d(bc.ctx, make_f32_scalar(bc.ctx, (float)le_scalar),
-                       a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+    b = make_f32_scalar(bc.ctx, (float)le_scalar);
   } else {
     b = bc.srcs[1];
   }
@@ -127,8 +126,7 @@ static inline struct ggml_tensor* build_op_lt(BuildContext& bc) {
     memcpy(&lt_is_scalar, bc.ir_tensor->op_params()->data() + 8, 4);
   }
   if (lt_is_scalar) {
-    b = ggml_repeat_4d(bc.ctx, make_f32_scalar(bc.ctx, (float)lt_scalar),
-                       a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+    b = make_f32_scalar(bc.ctx, (float)lt_scalar);
   } else {
     b = bc.srcs[1];
   }
@@ -163,8 +161,7 @@ static inline struct ggml_tensor* build_op_gt(BuildContext& bc) {
     memcpy(&gt_is_scalar, bc.ir_tensor->op_params()->data() + 8, 4);
   }
   if (gt_is_scalar) {
-    b = ggml_repeat_4d(bc.ctx, make_f32_scalar(bc.ctx, (float)gt_scalar),
-                       a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+    b = make_f32_scalar(bc.ctx, (float)gt_scalar);
   } else {
     b = bc.srcs[1];
   }
@@ -199,8 +196,9 @@ static inline struct ggml_tensor* build_op_ge(BuildContext& bc) {
     memcpy(&ge_is_scalar, bc.ir_tensor->op_params()->data() + 8, 4);
   }
   if (ge_is_scalar) {
-    b = ggml_repeat_4d(bc.ctx, make_f32_scalar(bc.ctx, (float)ge_scalar),
-                       a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+    // Use scalar directly (not REPEAT) so try_eager_f32_binop can read its data.
+    // Broadcasting is handled by modulo indexing in eager and resolve_broadcast in graph.
+    b = make_f32_scalar(bc.ctx, (float)ge_scalar);
   } else {
     b = bc.srcs[1];
   }

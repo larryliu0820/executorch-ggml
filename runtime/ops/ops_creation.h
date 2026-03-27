@@ -325,7 +325,7 @@ static inline struct ggml_tensor* build_op_remainder(BuildContext& bc) {
     if (a_host) {
       int64_t n = ggml_nelements(a);
       int64_t divisor = is_scalar ? (int64_t)scalar : 0;
-      if (!is_scalar && b->type == GGML_TYPE_I64) {
+      if (!is_scalar && b && b->type == GGML_TYPE_I64) {
         const void* b_host = bc.host_acc.get(b);
         if (b_host) divisor = static_cast<const int64_t*>(b_host)[0];
       }
