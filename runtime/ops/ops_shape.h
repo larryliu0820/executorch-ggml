@@ -257,6 +257,11 @@ static inline struct ggml_tensor* build_op_slice(BuildContext& bc) {
 
   constexpr int64_t SENTINEL = static_cast<int64_t>(1) << 62;
   int64_t actual_dim = a->ne[ax];
+
+  // Resolve Python-style negative indices (e.g. mel[:, :, -2:])
+  if (start != SENTINEL && start < 0) start += actual_dim;
+  if (end != SENTINEL && end < 0) end += actual_dim;
+
   bool start_is_sentinel = (start == SENTINEL);
   bool end_is_sentinel = (end == SENTINEL);
 

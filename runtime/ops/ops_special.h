@@ -37,14 +37,28 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
       mask = cm_src->second;
     } else {
       struct ggml_tensor* orig_mask = mask;
+      // Track whether the original mask was boolean (I32/I64) vs additive (F32).
+      // Boolean masks need scale+offset to convert 0/1 -> 0/-65504.
+      // Additive masks (e.g. from WHERE with values {0, -65504}) just need F16 cast.
+      bool was_boolean = (mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64);
       if (mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64) {
         mask = safe_ggml_cast(bc.ctx, mask, GGML_TYPE_F32, &bc.host_acc);
       }
       if (mask->type == GGML_TYPE_F32) {
-        struct ggml_tensor* scaled = ggml_scale(bc.ctx, ggml_cont(bc.ctx, mask), 65504.0f);
-        mask = safe_ggml_cast(bc.ctx,
-            ggml_add(bc.ctx, scaled, make_f32_scalar(bc.ctx, -65504.0f)),
-            GGML_TYPE_F16, &bc.host_acc);
+        if (was_boolean) {
+          // Boolean 0/1 mask: scale to {0, -65504} for F16
+          struct ggml_tensor* scaled = ggml_scale(bc.ctx, ggml_cont(bc.ctx, mask), 65504.0f);
+          mask = safe_ggml_cast(bc.ctx,
+              ggml_add(bc.ctx, scaled, make_f32_scalar(bc.ctx, -65504.0f)),
+              GGML_TYPE_F16, &bc.host_acc);
+        } else {
+          // Additive F32 mask (e.g. from WHERE): just cast to F16
+          if (!ggml_is_contiguous(mask)) {
+            // For 2D masks, use F32 cont to avoid CUDA ggml_cont F16 bug
+            mask = ggml_cont(bc.ctx, mask);
+          }
+          mask = safe_ggml_cast(bc.ctx, mask, GGML_TYPE_F16, &bc.host_acc);
+        }
       } else if (mask->type != GGML_TYPE_F16) {
         mask = safe_ggml_cast(bc.ctx, mask, GGML_TYPE_F16, &bc.host_acc);
       }

@@ -352,6 +352,8 @@ static Error build_graph(
     const auto* t = fb_tensors->Get(i);
     const int tid = t->id();
     const auto op = static_cast<ggml_ir::OpCode>(t->op());
+    s_last_processed = i;
+    // (debug removed)
     int64_t ne[4] = {1,1,1,1}; int n_dims = 4;
     resolve_shape(t, ne, n_dims);
 
@@ -530,6 +532,7 @@ static Error build_graph(
         case ggml_ir::OpCode::LLAMA_ATTENTION: gt = build_op_llama_attention(bc); break;
         case ggml_ir::OpCode::UPDATE_CACHE:  gt = build_op_update_cache(bc); break;
         case ggml_ir::OpCode::ROPE:          gt = build_op_rope(bc); break;
+        case ggml_ir::OpCode::REMAINDER:   gt = build_op_remainder(bc); break;
 
         default:
           fprintf(stderr, "[executorch-ggml] Unsupported OpCode %d\n", (int) op);
@@ -1518,7 +1521,7 @@ Error GgmlBackendInterface::execute(
       for (int d = 0; d < et_ndim; ++d) {
         new_sizes[d] = static_cast<executorch::aten::SizesType>(gt->ne[et_ndim - 1 - d]);
       }
-      executorch::ET_RUNTIME_NAMESPACE::resize_tensor(
+      (void)executorch::ET_RUNTIME_NAMESPACE::resize_tensor(
           et_tensor, {new_sizes.data(), new_sizes.size()});
       // Point ET tensor data directly at GPU buffer (zero-copy).
       // WARNING: this data lives on GPU. The caller must not dereference

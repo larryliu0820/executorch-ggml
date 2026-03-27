@@ -51,6 +51,7 @@ _SUPPORTED_OP_NAMES = {
     "aten.index.Tensor",
     "aten.index_put.default",
     "aten.select.int",
+    "aten.select_copy.int",
     "aten.scaled_dot_product_attention.default",
     "aten.alias.default",
     "aten.alias_copy.default",
@@ -80,8 +81,12 @@ _SUPPORTED_OP_NAMES = {
     "aten.le.Tensor",
     "aten.le.Scalar",
     "aten.lt.Tensor",
+    "aten.lt.Scalar",
     "aten.gt.Tensor",
+    "aten.gt.Scalar",
     "aten.ge.Tensor",
+    "aten.ge.Scalar",
+    "aten.remainder.Scalar",
     "aten.bitwise_and.Tensor",
     "aten.bitwise_or.Tensor",
     "aten.logical_not.default",
@@ -238,6 +243,9 @@ def _is_supported_node(node) -> bool:
             "aten.cumsum",
             "aten.sub",  # int64 subtraction for position calc
             "aten.add",  # int64 addition for position calc
+            "aten.mul",  # int64 multiplication for ring buffer
+            "aten.div",  # int64 division for ring buffer
+            "aten.remainder",  # int64 modulo for ring buffer
             "aten.argmax",  # argmax produces int64
             # dtype cast / clone (identity-like for int64 tensors)
             "aten._to_copy",
@@ -268,13 +276,14 @@ def _is_supported_node(node) -> bool:
         ):
             return False
 
-    # aten.mul.Tensor: ggml only supports F32/F16 MUL, not integer MULs.
+    # aten.mul.Tensor: ggml supports F32/F16 MUL + int64 eager MUL for ring buffer.
     if "aten.mul.Tensor" in target_str:
         dtype = out_dtype
         if dtype is not None and dtype not in (
             torch.float32,
             torch.float16,
             torch.bfloat16,
+            torch.int64,  # Allow for ring buffer computation (eager I64 MUL)
         ):
             return False
 

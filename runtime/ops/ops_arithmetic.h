@@ -15,6 +15,10 @@ static inline struct ggml_tensor* build_op_add(BuildContext& bc) {
   if (auto* eager = try_eager_scalar_binop(bc.ctx, a, b, '+', bc.host_acc)) {
     return eager;
   }
+  // Eager F32 binop for streaming encoder ring buffer mask chain.
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, '+', bc.host_acc)) {
+    return eager;
+  }
 
   // For int64 compile-time constants, use eager element-wise add.
   if (a->type == GGML_TYPE_I64 && b->type == GGML_TYPE_I64
@@ -49,9 +53,11 @@ static inline struct ggml_tensor* build_op_add(BuildContext& bc) {
     }
     return gt;
   }
-  // Non-constant I64: cast to F32 and use ggml_add.
+  // Non-constant I64/I32: cast to F32 (CUDA binary ops only support F32/F16/BF16).
   if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
   if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+  if (a->type == GGML_TYPE_I32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+  if (b->type == GGML_TYPE_I32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
 
   if (bc.metal_f32_binops) { a = ensure_f32(bc.ctx, a); b = ensure_f32(bc.ctx, b); }
   if (bc.cuda_bf16_cast) {
@@ -83,6 +89,9 @@ static inline struct ggml_tensor* build_op_sub(BuildContext& bc) {
   struct ggml_tensor* a = bc.srcs[0];
   struct ggml_tensor* b = bc.srcs[1];
   if (auto* eager = try_eager_scalar_binop(bc.ctx, a, b, '-', bc.host_acc)) {
+    return eager;
+  }
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, '-', bc.host_acc)) {
     return eager;
   }
   // For int64 compile-time constants, use eager element-wise sub.
@@ -118,9 +127,11 @@ static inline struct ggml_tensor* build_op_sub(BuildContext& bc) {
     }
     return gt;
   } else {
-    // Non-constant I64: cast to F32 and use ggml_sub.
+    // Non-constant I64/I32: cast to F32.
     if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
     if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+    if (a->type == GGML_TYPE_I32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+    if (b->type == GGML_TYPE_I32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
     if (bc.metal_f32_binops) { a = ensure_f32(bc.ctx, a); b = ensure_f32(bc.ctx, b); }
     if (bc.cuda_bf16_cast) {
       if (a->type == GGML_TYPE_BF16) a = ggml_cast(bc.ctx, a, GGML_TYPE_F32);
@@ -183,6 +194,34 @@ static inline struct ggml_tensor* build_op_mul(BuildContext& bc) {
   if (auto* eager = try_eager_scalar_binop(bc.ctx, a, b, '*', bc.host_acc)) {
     return eager;
   }
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, '*', bc.host_acc)) {
+    return eager;
+  }
+  // I64 eager MUL when both have host data
+  if (a->type == GGML_TYPE_I64 && b->type == GGML_TYPE_I64) {
+    const void* a_host = bc.host_acc.get(a);
+    const void* b_host = bc.host_acc.get(b);
+    if (a_host && b_host) {
+      int64_t out_ne[4];
+      for (int d = 0; d < 4; d++) out_ne[d] = std::max(a->ne[d], b->ne[d]);
+      const int64_t* ad = static_cast<const int64_t*>(a_host);
+      const int64_t* bd = static_cast<const int64_t*>(b_host);
+      int64_t na = ggml_nelements(a), nb = ggml_nelements(b);
+      ggml_set_no_alloc(bc.ctx, false);
+      auto* gt = ggml_new_tensor_4d(bc.ctx, GGML_TYPE_I64, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+      ggml_set_no_alloc(bc.ctx, true);
+      gt->op = GGML_OP_NONE;
+      int64_t* od = static_cast<int64_t*>(gt->data);
+      int64_t n = ggml_nelements(gt);
+      for (int64_t i = 0; i < n; i++) od[i] = ad[i % na] * bd[i % nb];
+      return gt;
+    }
+  }
+  // I32/I64 -> F32 casts BEFORE ggml_scale path (CUDA requires F32 for scale)
+  if (a->type == GGML_TYPE_I32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+  if (b->type == GGML_TYPE_I32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+  if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+  if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
   // ggml_scale for non-input-derived scalars
   if (ggml_nelements(b) == 1 && b->data && b->type == GGML_TYPE_F32
       && !bc.input_derived.count(b)) {
@@ -225,9 +264,59 @@ static inline struct ggml_tensor* build_op_mul_scalar(BuildContext& bc) {
 static inline struct ggml_tensor* build_op_div(BuildContext& bc) {
   struct ggml_tensor* a = bc.srcs[0];
   struct ggml_tensor* b = bc.srcs[1];
+
+  // Read rounding_mode from op_params: 0=trunc (default), 1=floor
+  int32_t rounding_mode = 0;
+  if (bc.ir_tensor->op_params() && bc.ir_tensor->op_params()->size() >= 4) {
+    memcpy(&rounding_mode, bc.ir_tensor->op_params()->data(), sizeof(int32_t));
+  }
+
   if (auto* eager = try_eager_scalar_binop(bc.ctx, a, b, '/', bc.host_acc)) {
     return eager;
   }
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, '/', bc.host_acc)) {
+    // Apply floor if needed
+    if (rounding_mode == 1 && eager) {
+      float* d = static_cast<float*>(eager->data);
+      int64_t n = ggml_nelements(eager);
+      for (int64_t i = 0; i < n; i++) d[i] = std::floor(d[i]);
+    }
+    return eager;
+  }
+  // I64 eager DIV with floor-div support
+  if (a->type == GGML_TYPE_I64 && b->type == GGML_TYPE_I64) {
+    const void* a_host = bc.host_acc.get(a);
+    const void* b_host = bc.host_acc.get(b);
+    if (a_host && b_host) {
+      int64_t out_ne[4];
+      for (int d = 0; d < 4; d++) out_ne[d] = std::max(a->ne[d], b->ne[d]);
+      const int64_t* ad = static_cast<const int64_t*>(a_host);
+      const int64_t* bd = static_cast<const int64_t*>(b_host);
+      int64_t na = ggml_nelements(a), nb = ggml_nelements(b);
+      ggml_set_no_alloc(bc.ctx, false);
+      auto* gt = ggml_new_tensor_4d(bc.ctx, GGML_TYPE_I64, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+      ggml_set_no_alloc(bc.ctx, true);
+      gt->op = GGML_OP_NONE;
+      int64_t* od = static_cast<int64_t*>(gt->data);
+      int64_t n = ggml_nelements(gt);
+      for (int64_t i = 0; i < n; i++) {
+        int64_t dv = bd[i % nb];
+        if (dv == 0) { od[i] = 0; continue; }
+        int64_t q = ad[i % na] / dv;
+        if (rounding_mode == 1) {  // Python floor division
+          int64_t r = ad[i % na] % dv;
+          if (r != 0 && ((r ^ dv) < 0)) q--;
+        }
+        od[i] = q;
+      }
+      return gt;
+    }
+  }
+  // I32/I64 -> F32 casts
+  if (a->type == GGML_TYPE_I32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+  if (b->type == GGML_TYPE_I32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+  if (a->type == GGML_TYPE_I64) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+  if (b->type == GGML_TYPE_I64) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
   if (bc.metal_f32_binops) { a = ensure_f32(bc.ctx, a); b = ensure_f32(bc.ctx, b); }
   if (bc.cuda_bf16_cast) {
     if (a->type == GGML_TYPE_BF16) a = ggml_cast(bc.ctx, a, GGML_TYPE_F32);
@@ -239,7 +328,12 @@ static inline struct ggml_tensor* build_op_div(BuildContext& bc) {
   if (!resolve_broadcast(bc, a, b, "DIV")) {
     return nullptr;
   }
-  return ggml_div(bc.ctx, a, b);
+  auto* result = ggml_div(bc.ctx, a, b);
+  // Apply floor rounding if needed (aten.div.Tensor_mode with mode='floor')
+  if (rounding_mode == 1) {
+    result = ggml_floor(bc.ctx, result);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

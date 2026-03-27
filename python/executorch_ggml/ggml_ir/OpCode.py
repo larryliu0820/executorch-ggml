@@ -63,3 +63,5 @@ class OpCode(object):
     CONV_1D = 80
     CONV_1D_DW = 81
     PAD = 82
+    ROPE = 83
+    REMAINDER = 84

@@ -116,6 +116,22 @@ static struct ggml_tensor* safe_ggml_cast(
     auto* r = eager_cast_i64_to_i32(ctx, src, acc);
     return r;
   }
+  // I64 -> F32: eager host conversion (avoids CUDA buffer aliasing in CPY)
+  if (src->type == GGML_TYPE_I64 && target == GGML_TYPE_F32) {
+    const void* src_data = acc ? acc->get(src) : src->data;
+    if (src_data) {
+      int64_t n = ggml_nelements(src);
+      ggml_set_no_alloc(ctx, false);
+      struct ggml_tensor* f32 = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne);
+      ggml_set_no_alloc(ctx, true);
+      f32->op = GGML_OP_NONE;
+      if (acc) acc->propagate_derived(f32, src);
+      const int64_t* sd = static_cast<const int64_t*>(src_data);
+      float* dd = static_cast<float*>(f32->data);
+      for (int64_t i = 0; i < n; i++) dd[i] = (float)sd[i];
+      return f32;
+    }
+  }
   if (src->type == GGML_TYPE_I64) {
     // I64 -> I32 eager, then I32 -> target via native ggml_cast
     auto* i32 = eager_cast_i64_to_i32(ctx, src, acc);
@@ -137,18 +153,23 @@ static struct ggml_tensor* safe_ggml_cast(
     // I32->I64 as a graph op.  The output copy in execute() handles I32->Long.
     return i32;
   }
-  // Eager scalar cast for I32->F32 (enc_len computation chains).
+  // Eager I32->F32 cast (avoids CUDA buffer aliasing in CPY).
   // Skip if the source is input-derived -- must stay as a graph op for reuse.
   if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_F32 &&
-      ggml_nelements(src) == 1 && src->data &&
-      !(acc && acc->is_input_derived(src))) {
-    int32_t ival = acc ? acc->read_i32(src) : *(const int32_t*)src->data;
-    ggml_set_no_alloc(ctx, false);
-    struct ggml_tensor* dst = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1);
-    ggml_set_no_alloc(ctx, true);
-    dst->op = GGML_OP_NONE;
-    *(float*)dst->data = static_cast<float>(ival);
-    return dst;
+      src->data && !(acc && acc->is_input_derived(src))) {
+    const void* src_data = acc ? acc->get(src) : src->data;
+    if (src_data) {
+      int64_t n = ggml_nelements(src);
+      ggml_set_no_alloc(ctx, false);
+      struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne);
+      ggml_set_no_alloc(ctx, true);
+      dst->op = GGML_OP_NONE;
+      if (acc) acc->propagate_derived(dst, src);
+      const int32_t* sd = static_cast<const int32_t*>(src_data);
+      float* dd = static_cast<float*>(dst->data);
+      for (int64_t i = 0; i < n; i++) dd[i] = static_cast<float>(sd[i]);
+      return dst;
+    }
   }
   // Everything else (F16/BF16/F32 inter-conversions) is natively supported
   return ggml_cast(ctx, src, target);

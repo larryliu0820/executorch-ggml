@@ -114,6 +114,14 @@ class GgmlBackend(BackendDetails):
                 is_constant = tensor_from_state or tensor_from_constants
 
                 if is_constant:
+                    # Prefix auto-generated constant names to avoid collisions
+                    # in multi-method .pte files (different subgraphs may have
+                    # duplicate _lifted_tensor_constant keys).
+                    data_key = fqn
+                    if fqn and fqn.startswith("_lifted_tensor_constant"):
+                        sg_id = id(graph_module) & 0xFFFF
+                        data_key = f"__ggml_sg{sg_id}_{fqn}"
+
                     if tensor_from_state:
                         tensor = edge_program.state_dict[fqn]
                     elif fqn in ctx.ep_constants:
@@ -146,7 +154,7 @@ class GgmlBackend(BackendDetails):
                             quant_bytes = quantize_tensor(
                                 f32_data, quant_config.quant_type,
                             )
-                            data_store.add_named_data(fqn, quant_bytes, alignment=64)
+                            data_store.add_named_data(data_key, quant_bytes, alignment=64)
                             if quant_config.quant_type == GgmlQuantType.Q8_0:
                                 ir_type = TYPE_Q8_0
                             tid = alloc_id()
@@ -156,7 +164,7 @@ class GgmlBackend(BackendDetails):
                                     tensor_type=ir_type,
                                     ne=_pytorch_shape_to_ggml_ne(shape),
                                     op=OP_NONE,
-                                    data_key=fqn,
+                                    data_key=data_key,
                                     is_input=False,
                                     is_mutable=is_mutable,
                                 )
@@ -164,7 +172,7 @@ class GgmlBackend(BackendDetails):
                             node_to_id[node] = tid
                             continue
 
-                    data_store.add_named_data(fqn, t_cpu, alignment=64)
+                    data_store.add_named_data(data_key, t_cpu, alignment=64)
 
                     tid = alloc_id()
                     ir_tensors.append(
@@ -173,7 +181,7 @@ class GgmlBackend(BackendDetails):
                             tensor_type=ir_type,
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_NONE,
-                            data_key=fqn,
+                            data_key=data_key,
                             is_input=False,
                             is_mutable=is_mutable,
                         )

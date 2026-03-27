@@ -421,6 +421,57 @@ static struct ggml_tensor* try_eager_scalar_binop(
   return gt;
 }
 
+// ---------------------------------------------------------------------------
+// Eagerly compute a binary f32 op of ANY size during build_graph.
+// Used for the streaming encoder's ring buffer mask chain where the entire
+// computation is input-derived and must stay on the host to avoid CUDA
+// buffer aliasing issues.
+// Returns a new GGML_OP_NONE tensor with the result, or nullptr if not applicable.
+static struct ggml_tensor* try_eager_f32_binop(
+    struct ggml_context* ctx,
+    struct ggml_tensor* a, struct ggml_tensor* b,
+    char op_char, HostDataAccessor& acc) {
+  if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) return nullptr;
+  const float* ad = static_cast<const float*>(acc.get(a));
+  const float* bd = static_cast<const float*>(acc.get(b));
+  if (!ad || !bd) return nullptr;
+  int64_t out_ne[4];
+  for (int d = 0; d < 4; d++) out_ne[d] = std::max(a->ne[d], b->ne[d]);
+  int64_t n = out_ne[0] * out_ne[1] * out_ne[2] * out_ne[3];
+  if (n > 10000000) return nullptr;  // safety limit
+  ggml_set_no_alloc(ctx, false);
+  struct ggml_tensor* gt = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+      out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+  ggml_set_no_alloc(ctx, true);
+  gt->op = GGML_OP_NONE;
+  float* od = static_cast<float*>(gt->data);
+  for (int64_t i = 0; i < n; i++) {
+    int64_t i0 = i % out_ne[0], rem = i / out_ne[0];
+    int64_t i1 = rem % out_ne[1]; rem /= out_ne[1];
+    int64_t i2 = rem % out_ne[2], i3 = rem / out_ne[2];
+    int64_t ai = (i0 % a->ne[0]) + (i1 % a->ne[1]) * a->ne[0]
+               + (i2 % a->ne[2]) * a->ne[0] * a->ne[1]
+               + (i3 % a->ne[3]) * a->ne[0] * a->ne[1] * a->ne[2];
+    int64_t bi = (i0 % b->ne[0]) + (i1 % b->ne[1]) * b->ne[0]
+               + (i2 % b->ne[2]) * b->ne[0] * b->ne[1]
+               + (i3 % b->ne[3]) * b->ne[0] * b->ne[1] * b->ne[2];
+    float va = ad[ai], vb = bd[bi];
+    switch (op_char) {
+      case '+': od[i] = va + vb; break;
+      case '-': od[i] = va - vb; break;
+      case '*': od[i] = va * vb; break;
+      case '/': od[i] = (vb != 0.0f) ? va / vb : 0.0f; break;
+      case 'g': od[i] = (va >= vb) ? 1.0f : 0.0f; break;  // GE
+      case 'l': od[i] = (va < vb) ? 1.0f : 0.0f; break;   // LT
+      case 'L': od[i] = (va <= vb) ? 1.0f : 0.0f; break;   // LE
+      case 'G': od[i] = (va > vb) ? 1.0f : 0.0f; break;    // GT
+      case '&': od[i] = (va != 0.0f && vb != 0.0f) ? 1.0f : 0.0f; break;
+      default: od[i] = 0.0f; break;
+    }
+  }
+  return gt;
+}
+
 static struct ggml_tensor* safe_ggml_permute(struct ggml_context* ctx, struct ggml_tensor* a,
                                               int axis0, int axis1, int axis2, int axis3,
                                               const char* caller) {

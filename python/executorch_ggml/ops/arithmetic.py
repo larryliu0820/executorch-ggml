@@ -67,7 +67,9 @@ def handle_mul_tensor(ctx, node, target_str):
 
 @register_op("aten.div.Tensor_mode", "aten.div.Tensor")
 def handle_div_tensor(ctx, node, target_str):
-    """div(a, b) -- element-wise divide."""
+    """div(a, b) -- element-wise divide.
+    For div.Tensor_mode, kwargs may include rounding_mode='floor'|'trunc'|None.
+    """
     a_node, b_node = node.args[0], node.args[1]
     a_id = ctx.node_to_id[a_node]
     b_id = ctx.node_to_id[b_node]
@@ -79,6 +81,19 @@ def handle_div_tensor(ctx, node, target_str):
         else torch.float32
     )
 
+    # Encode rounding_mode: 0=trunc/none (default), 1=floor
+    import struct
+    rounding_mode = 0
+    if len(node.args) > 2 and node.args[2] is not None:
+        mode_str = node.args[2]
+        if mode_str == "floor":
+            rounding_mode = 1
+    elif "rounding_mode" in node.kwargs:
+        mode_str = node.kwargs["rounding_mode"]
+        if mode_str == "floor":
+            rounding_mode = 1
+    op_params = struct.pack("<i", rounding_mode) if rounding_mode != 0 else None
+
     _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
     tid = ctx.alloc_id()
     ctx.ir_tensors.append(
@@ -88,6 +103,7 @@ def handle_div_tensor(ctx, node, target_str):
             ne=_pytorch_shape_to_ggml_ne(out_shape),
             op=OP_DIV,
             src_ids=[a_id, b_id],
+            op_params=op_params,
             sym_dim_ids=_vsym,
             sym_dim_exprs=_vexprs,
         )

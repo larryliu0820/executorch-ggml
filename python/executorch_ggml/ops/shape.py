@@ -210,7 +210,7 @@ def handle_slice(ctx, node, target_str):
 # select.int -> SLICE + VIEW
 # ---------------------------------------------------------------------------
 
-@register_op("aten.select.int")
+@register_op("aten.select.int", "aten.select_copy.int")
 def handle_select(ctx, node, target_str):
     """select(x, dim, index) -- picks one slice along dim and squeezes it.
     e.g. [1,1,1024].select(dim=1, index=-1) -> [1,1024]
@@ -248,7 +248,7 @@ def handle_select(ctx, node, target_str):
             ne=_pytorch_shape_to_ggml_ne(sliced_shape),
             op=OP_SLICE,
             src_ids=[src_id],
-            op_params=pack_slice_params(dim, idx, idx + 1, 1),
+            op_params=pack_slice_params(dim, idx, idx + 1, 1, ndim=len(src_shape)),
             sym_dim_ids=_vsym_slice,
             sym_dim_exprs=_vexprs_slice,
         )

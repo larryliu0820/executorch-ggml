@@ -27,6 +27,7 @@ from executorch_ggml.serialize import (
     OP_ANY,
     OP_WHERE,
     OP_ARGMAX,
+    OP_REMAINDER,
     pack_comparison_params,
     pack_any_params,
     pack_argmax_params,
@@ -165,6 +166,56 @@ def handle_ne_scalar(ctx, node, target_str):
 def handle_le_scalar(ctx, node, target_str):
     """le(x, scalar) - element-wise less-than-or-equal with scalar."""
     _handle_comparison_scalar(ctx, node, OP_LE)
+
+
+@register_op("aten.ge.Scalar")
+def handle_ge_scalar(ctx, node, target_str):
+    """ge(x, scalar) - element-wise greater-than-or-equal with scalar."""
+    _handle_comparison_scalar(ctx, node, OP_GE)
+
+
+@register_op("aten.lt.Scalar")
+def handle_lt_scalar(ctx, node, target_str):
+    """lt(x, scalar) - element-wise less-than with scalar."""
+    _handle_comparison_scalar(ctx, node, OP_LT)
+
+
+@register_op("aten.gt.Scalar")
+def handle_gt_scalar(ctx, node, target_str):
+    """gt(x, scalar) - element-wise greater-than with scalar."""
+    _handle_comparison_scalar(ctx, node, OP_GT)
+
+
+@register_op("aten.remainder.Scalar")
+def handle_remainder_scalar(ctx, node, target_str):
+    """remainder(x, scalar) - element-wise remainder (Python-style modulo)."""
+    src_node = node.args[0]
+    scalar = float(node.args[1])
+    src_id = ctx.node_to_id[src_node]
+
+    fake_val = node.meta.get("val")
+    shape = _resolve_shape(fake_val)
+    out_dtype = (
+        getattr(fake_val, "dtype", torch.int64)
+        if fake_val is not None
+        else torch.int64
+    )
+    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
+
+    tid = ctx.alloc_id()
+    ctx.ir_tensors.append(
+        IrTensor(
+            tensor_id=tid,
+            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+            ne=_pytorch_shape_to_ggml_ne(shape),
+            op=OP_REMAINDER,
+            src_ids=[src_id],
+            op_params=pack_comparison_params(scalar, is_scalar=True),
+            sym_dim_ids=_vsym,
+            sym_dim_exprs=_vexprs,
+        )
+    )
+    ctx.node_to_id[node] = tid
 
 
 # ---------------------------------------------------------------------------

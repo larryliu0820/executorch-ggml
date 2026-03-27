@@ -35,6 +35,64 @@ from executorch_ggml.passes import BF16UnsafeOpsCastPass, RemoveGraphAssertsPass
 from executorch_ggml.passes.replace_copy_ops_pass import ReplaceCopyOpsPass
 
 
+def _patch_conv_state_copy(module):
+    """Replace copy_() on conv state buffers with index_copy_() to avoid
+    SpecViolationError when exporting streaming encoder.
+
+    copy_() on a registered buffer whose FQN doesn't match the expected
+    mutated buffer FQN triggers a spec violation in torch.export. Using
+    index_copy_() achieves the same result with explicit indexing.
+    """
+    import types
+
+    orig_forward = module.forward.__func__  # unwrap bound method
+
+    def patched_forward(self, mel_chunk, enc_input_pos):
+        # Auto-reset conv states at session start
+        is_start = (enc_input_pos[:1] == 0).view(1, 1, 1).to(self.conv1_state.dtype)
+        self.conv1_state.mul_(1.0 - is_start)
+        self.conv2_state.mul_(1.0 - is_start)
+
+        # Conv1
+        conv1_input = torch.cat([self.conv1_state, mel_chunk], dim=2)
+        conv1_out = torch.nn.functional.gelu(self.conv1(conv1_input))
+        # Replace copy_() with index_copy_()
+        idx = torch.arange(self.conv1_state.shape[2], device=mel_chunk.device)
+        self.conv1_state.index_copy_(2, idx, mel_chunk[:, :, -2:])
+
+        # Conv2
+        conv2_input = torch.cat([self.conv2_state, conv1_out], dim=2)
+        conv2_out = torch.nn.functional.gelu(self.conv2(conv2_input))
+        idx2 = torch.arange(self.conv2_state.shape[2], device=conv1_out.device)
+        self.conv2_state.index_copy_(2, idx2, conv1_out[:, :, -2:])
+
+        x = conv2_out.transpose(1, 2)  # (1, 4, 1280)
+
+        # RoPE
+        freqs = torch.outer(enc_input_pos.float(), self.inv_freq)
+        freqs_cos = freqs.cos()
+        freqs_sin = freqs.sin()
+
+        # Sliding window mask
+        T = x.size(1)
+        mask = self.kv_caches[0].create_causal_mask(enc_input_pos[0], T)
+
+        # Transformer layers
+        for i, layer in enumerate(self.layers):
+            x = self._streaming_encoder_layer(
+                x, freqs_cos, freqs_sin, enc_input_pos, mask, layer, i
+            )
+
+        # Norm + downsample + adapter
+        x = self.enc_norm(x)
+        B, T, D = x.shape
+        x = x.reshape(B, T // self.downsample_factor, D * self.downsample_factor)
+        x = self.adapter(x)
+        return x
+
+    module.forward = types.MethodType(patched_forward, module)
+
+
 class MelPreprocessor(nn.Module):
     """Wraps torchaudio MelSpectrogram for portable-op export."""
 
@@ -270,11 +328,10 @@ def lower_to_ggml(programs, metadata=None, quant_config=None, target_dtype=None)
     """Lower exported programs to ExecuTorch with GGML backend."""
     print("\nLowering to ExecuTorch with GGML backend...")
 
-    # Streaming encoder uses data-dependent scalar_tensor ops for KV cache
-    # masks that the GGML backend can't handle. Lower it separately with
-    # portable ops (no delegation), then merge with the GGML-delegated
-    # decoder/embedding methods.
-    encoder_prog = programs.pop("encode_audio_chunk", None)
+    # The streaming encoder's ring buffer mask computation uses data-dependent
+    # integer arithmetic. With eager host-side ops (try_eager_f32_binop,
+    # I64 eager MUL/DIV, etc.), the GGML backend handles this natively.
+    encoder_prog = None  # delegate everything to GGML
 
     partitioner = {key: [GgmlPartitioner(quant_config=quant_config)] for key in programs}
 

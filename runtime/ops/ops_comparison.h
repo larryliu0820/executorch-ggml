@@ -95,9 +95,13 @@ static inline struct ggml_tensor* build_op_le(BuildContext& bc) {
   } else {
     b = bc.srcs[1];
   }
+  // Eager F32 comparison when both have host data
+  if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+  if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, 'L', bc.host_acc)) {
+    return eager;
+  }
   if (bc.use_native_cmp_ops) {
-    if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
-    if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
     if (!resolve_broadcast(bc, a, b, "LE")) return nullptr;
     return ggml_add(bc.ctx, ggml_neg(bc.ctx, ggml_step(bc.ctx, ggml_sub(bc.ctx, a, b))), make_f32_scalar(bc.ctx, 1.0f));
   } else {
@@ -114,10 +118,26 @@ static inline struct ggml_tensor* build_op_le(BuildContext& bc) {
 // LT
 // ---------------------------------------------------------------------------
 static inline struct ggml_tensor* build_op_lt(BuildContext& bc) {
-  struct ggml_tensor* a = bc.srcs[0]; struct ggml_tensor* b = bc.srcs[1];
+  struct ggml_tensor* a = bc.srcs[0];
+  struct ggml_tensor* b;
+  double lt_scalar = 0.0;
+  int32_t lt_is_scalar = 0;
+  if (bc.ir_tensor->op_params() && bc.ir_tensor->op_params()->size() >= 12) {
+    memcpy(&lt_scalar, bc.ir_tensor->op_params()->data(), 8);
+    memcpy(&lt_is_scalar, bc.ir_tensor->op_params()->data() + 8, 4);
+  }
+  if (lt_is_scalar) {
+    b = ggml_repeat_4d(bc.ctx, make_f32_scalar(bc.ctx, (float)lt_scalar),
+                       a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+  } else {
+    b = bc.srcs[1];
+  }
+  if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+  if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, 'l', bc.host_acc)) {
+    return eager;
+  }
   if (bc.use_native_cmp_ops) {
-    if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
-    if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
     if (!resolve_broadcast(bc, a, b, "LT")) return nullptr;
     return ggml_step(bc.ctx, ggml_neg(bc.ctx, ggml_sub(bc.ctx, a, b)));
   } else {
@@ -134,10 +154,26 @@ static inline struct ggml_tensor* build_op_lt(BuildContext& bc) {
 // GT
 // ---------------------------------------------------------------------------
 static inline struct ggml_tensor* build_op_gt(BuildContext& bc) {
-  struct ggml_tensor* a = bc.srcs[0]; struct ggml_tensor* b = bc.srcs[1];
+  struct ggml_tensor* a = bc.srcs[0];
+  struct ggml_tensor* b;
+  double gt_scalar = 0.0;
+  int32_t gt_is_scalar = 0;
+  if (bc.ir_tensor->op_params() && bc.ir_tensor->op_params()->size() >= 12) {
+    memcpy(&gt_scalar, bc.ir_tensor->op_params()->data(), 8);
+    memcpy(&gt_is_scalar, bc.ir_tensor->op_params()->data() + 8, 4);
+  }
+  if (gt_is_scalar) {
+    b = ggml_repeat_4d(bc.ctx, make_f32_scalar(bc.ctx, (float)gt_scalar),
+                       a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+  } else {
+    b = bc.srcs[1];
+  }
+  if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+  if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, 'G', bc.host_acc)) {
+    return eager;
+  }
   if (bc.use_native_cmp_ops) {
-    if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
-    if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
     if (!resolve_broadcast(bc, a, b, "GT")) return nullptr;
     return ggml_step(bc.ctx, ggml_sub(bc.ctx, a, b));
   } else {
@@ -154,10 +190,26 @@ static inline struct ggml_tensor* build_op_gt(BuildContext& bc) {
 // GE
 // ---------------------------------------------------------------------------
 static inline struct ggml_tensor* build_op_ge(BuildContext& bc) {
-  struct ggml_tensor* a = bc.srcs[0]; struct ggml_tensor* b = bc.srcs[1];
+  struct ggml_tensor* a = bc.srcs[0];
+  struct ggml_tensor* b;
+  double ge_scalar = 0.0;
+  int32_t ge_is_scalar = 0;
+  if (bc.ir_tensor->op_params() && bc.ir_tensor->op_params()->size() >= 12) {
+    memcpy(&ge_scalar, bc.ir_tensor->op_params()->data(), 8);
+    memcpy(&ge_is_scalar, bc.ir_tensor->op_params()->data() + 8, 4);
+  }
+  if (ge_is_scalar) {
+    b = ggml_repeat_4d(bc.ctx, make_f32_scalar(bc.ctx, (float)ge_scalar),
+                       a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+  } else {
+    b = bc.srcs[1];
+  }
+  if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+  if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, 'g', bc.host_acc)) {
+    return eager;
+  }
   if (bc.use_native_cmp_ops) {
-    if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
-    if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
     if (!resolve_broadcast(bc, a, b, "GE")) return nullptr;
     return ggml_add(bc.ctx, ggml_neg(bc.ctx, ggml_step(bc.ctx, ggml_neg(bc.ctx, ggml_sub(bc.ctx, a, b)))), make_f32_scalar(bc.ctx, 1.0f));
   } else {
@@ -175,9 +227,12 @@ static inline struct ggml_tensor* build_op_ge(BuildContext& bc) {
 // ---------------------------------------------------------------------------
 static inline struct ggml_tensor* build_op_bitwise_and(BuildContext& bc) {
   struct ggml_tensor* a = bc.srcs[0]; struct ggml_tensor* b = bc.srcs[1];
+  if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+  if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
+  if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, '&', bc.host_acc)) {
+    return eager;
+  }
   if (bc.use_native_cmp_ops) {
-    if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
-    if (b->type != GGML_TYPE_F32) b = safe_ggml_cast(bc.ctx, b, GGML_TYPE_F32, &bc.host_acc);
     if (!resolve_broadcast(bc, a, b, "BITWISE_AND")) return nullptr;
     return ggml_mul(bc.ctx, a, b);
   } else {

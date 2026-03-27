@@ -26,8 +26,29 @@ static inline struct ggml_tensor* build_op_arange(BuildContext& bc) {
   }
 
   const int64_t nelem = bc.ne[0] * bc.ne[1] * bc.ne[2] * bc.ne[3];
+
+  // Eager host computation for I64 ARANGE (ggml_arange only supports F32)
+  if (out_type == GGML_TYPE_I64 || out_type == GGML_TYPE_I32) {
+    ggml_type eager_type = (out_type == GGML_TYPE_I64) ? GGML_TYPE_I64 : GGML_TYPE_I32;
+    ggml_set_no_alloc(bc.ctx, false);
+    auto* gt = ggml_new_tensor_4d(bc.ctx, eager_type,
+        bc.ne[0], bc.ne[1], bc.ne[2], bc.ne[3]);
+    ggml_set_no_alloc(bc.ctx, true);
+    gt->op = GGML_OP_NONE;
+    if (eager_type == GGML_TYPE_I64) {
+      int64_t* d = static_cast<int64_t*>(gt->data);
+      for (int64_t i = 0; i < nelem; i++) d[i] = (int64_t)(start + i * step);
+    } else {
+      int32_t* d = static_cast<int32_t*>(gt->data);
+      for (int64_t i = 0; i < nelem; i++) d[i] = (int32_t)(start + i * step);
+    }
+    ggml_set_output(gt);
+    return gt;
+  }
+
   float stop = (float)(start + nelem * step);
   auto* gt = ggml_arange(bc.ctx, (float)start, stop, (float)step);
+  ggml_set_output(gt);  // prevent scheduler buffer aliasing
 
   if (out_type == GGML_TYPE_F16) {
     gt = safe_ggml_cast(bc.ctx, gt, GGML_TYPE_F16, &bc.host_acc);
@@ -209,6 +230,51 @@ static inline struct ggml_tensor* build_op_where(BuildContext& bc) {
   if (cond->type != GGML_TYPE_F32) {
     cond = safe_ggml_cast(bc.ctx, cond, GGML_TYPE_F32, &bc.host_acc);
   }
+  if (x->type != GGML_TYPE_F32) {
+    x = safe_ggml_cast(bc.ctx, x, GGML_TYPE_F32, &bc.host_acc);
+  }
+  if (y->type != GGML_TYPE_F32) {
+    y = safe_ggml_cast(bc.ctx, y, GGML_TYPE_F32, &bc.host_acc);
+  }
+
+  // Eager WHERE when all inputs have host data (avoids 0*inf=NaN in arithmetic fallback)
+  const float* cd = static_cast<const float*>(bc.host_acc.get(cond));
+  const float* xd = static_cast<const float*>(bc.host_acc.get(x));
+  const float* yd = static_cast<const float*>(bc.host_acc.get(y));
+  if (cd && xd && yd) {
+    int64_t out_ne[4];
+    for (int d = 0; d < 4; d++) {
+      out_ne[d] = std::max({cond->ne[d], x->ne[d], y->ne[d]});
+    }
+    int64_t n = out_ne[0] * out_ne[1] * out_ne[2] * out_ne[3];
+    if (n <= 10000000) {
+      ggml_set_no_alloc(bc.ctx, false);
+      auto* gt = ggml_new_tensor_4d(bc.ctx, GGML_TYPE_F32,
+          out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
+      ggml_set_no_alloc(bc.ctx, true);
+      gt->op = GGML_OP_NONE;
+      float* od = static_cast<float*>(gt->data);
+      for (int64_t i = 0; i < n; i++) {
+        int64_t i0 = i % out_ne[0], rem = i / out_ne[0];
+        int64_t i1 = rem % out_ne[1]; rem /= out_ne[1];
+        int64_t i2 = rem % out_ne[2], i3 = rem / out_ne[2];
+        auto bcast = [&](const struct ggml_tensor* t, int64_t i0_, int64_t i1_, int64_t i2_, int64_t i3_) {
+          return (i0_ % t->ne[0]) + (i1_ % t->ne[1]) * t->ne[0]
+               + (i2_ % t->ne[2]) * t->ne[0] * t->ne[1]
+               + (i3_ % t->ne[3]) * t->ne[0] * t->ne[1] * t->ne[2];
+        };
+        float cv = cd[bcast(cond, i0, i1, i2, i3)];
+        float xv = xd[bcast(x, i0, i1, i2, i3)];
+        float yv = yd[bcast(y, i0, i1, i2, i3)];
+        // Clamp -inf to -65504 to avoid NaN in downstream arithmetic
+        if (xv < -65504.0f) xv = -65504.0f;
+        if (yv < -65504.0f) yv = -65504.0f;
+        od[i] = (cv != 0.0f) ? xv : yv;
+      }
+      return gt;
+    }
+  }
+
   cond = ggml_clamp(bc.ctx, cond, 0.0f, 1.0f);
 
   struct ggml_tensor* target = x;
@@ -225,6 +291,10 @@ static inline struct ggml_tensor* build_op_where(BuildContext& bc) {
     y = ggml_repeat(bc.ctx, y, target);
   }
 
+  // Clamp x and y to avoid 0*inf=NaN in cond*x + (1-cond)*y
+  x = ggml_clamp(bc.ctx, x, -65504.0f, 65504.0f);
+  y = ggml_clamp(bc.ctx, y, -65504.0f, 65504.0f);
+
   struct ggml_tensor* one = make_f32_scalar(bc.ctx, 1.0f);
   struct ggml_tensor* one_rep = ggml_repeat(bc.ctx, one, cond);
   struct ggml_tensor* not_cond = ggml_sub(bc.ctx, one_rep, cond);
@@ -232,6 +302,90 @@ static inline struct ggml_tensor* build_op_where(BuildContext& bc) {
   struct ggml_tensor* x_part = ggml_mul(bc.ctx, x, cond);
   struct ggml_tensor* y_part = ggml_mul(bc.ctx, y, not_cond);
   return ggml_add(bc.ctx, x_part, y_part);
+}
+
+// ---------------------------------------------------------------------------
+// REMAINDER
+// ---------------------------------------------------------------------------
+static inline struct ggml_tensor* build_op_remainder(BuildContext& bc) {
+  struct ggml_tensor* a = bc.srcs[0];
+  struct ggml_tensor* b = (bc.srcs.size() > 1) ? bc.srcs[1] : nullptr;
+
+  // Read scalar value from op_params if present (remainder.Scalar)
+  double scalar = 0.0;
+  int32_t is_scalar = 0;
+  if (bc.ir_tensor->op_params() && bc.ir_tensor->op_params()->size() >= 12) {
+    memcpy(&scalar, bc.ir_tensor->op_params()->data(), 8);
+    memcpy(&is_scalar, bc.ir_tensor->op_params()->data() + 8, 4);
+  }
+
+  // Eager I64 remainder
+  if (a->type == GGML_TYPE_I64) {
+    const void* a_host = bc.host_acc.get(a);
+    if (a_host) {
+      int64_t n = ggml_nelements(a);
+      int64_t divisor = is_scalar ? (int64_t)scalar : 0;
+      if (!is_scalar && b->type == GGML_TYPE_I64) {
+        const void* b_host = bc.host_acc.get(b);
+        if (b_host) divisor = static_cast<const int64_t*>(b_host)[0];
+      }
+      if (divisor != 0) {
+        ggml_set_no_alloc(bc.ctx, false);
+        auto* gt = ggml_new_tensor(bc.ctx, GGML_TYPE_I64, GGML_MAX_DIMS, a->ne);
+        ggml_set_no_alloc(bc.ctx, true);
+        gt->op = GGML_OP_NONE;
+        const int64_t* ad = static_cast<const int64_t*>(a_host);
+        int64_t* od = static_cast<int64_t*>(gt->data);
+        for (int64_t i = 0; i < n; i++) {
+          // Python-style modulo: result has same sign as divisor
+          int64_t r = ad[i] % divisor;
+          if (r != 0 && ((r ^ divisor) < 0)) r += divisor;
+          od[i] = r;
+        }
+        return gt;
+      }
+    }
+  }
+
+  // Eager I32 remainder
+  if (a->type == GGML_TYPE_I32) {
+    const void* a_host = bc.host_acc.get(a);
+    if (a_host) {
+      int64_t n = ggml_nelements(a);
+      int32_t divisor = is_scalar ? (int32_t)scalar : 0;
+      if (!is_scalar && b->type == GGML_TYPE_I32) {
+        const void* b_host = bc.host_acc.get(b);
+        if (b_host) divisor = static_cast<const int32_t*>(b_host)[0];
+      }
+      if (divisor != 0) {
+        ggml_set_no_alloc(bc.ctx, false);
+        auto* gt = ggml_new_tensor(bc.ctx, GGML_TYPE_I32, GGML_MAX_DIMS, a->ne);
+        ggml_set_no_alloc(bc.ctx, true);
+        gt->op = GGML_OP_NONE;
+        const int32_t* ad = static_cast<const int32_t*>(a_host);
+        int32_t* od = static_cast<int32_t*>(gt->data);
+        for (int64_t i = 0; i < n; i++) {
+          int32_t r = ad[i] % divisor;
+          if (r != 0 && ((r ^ divisor) < 0)) r += divisor;
+          od[i] = r;
+        }
+        return gt;
+      }
+    }
+  }
+
+  // F32 fallback: a - floor(a/b) * b
+  if (a->type != GGML_TYPE_F32) a = safe_ggml_cast(bc.ctx, a, GGML_TYPE_F32, &bc.host_acc);
+  struct ggml_tensor* b_f32;
+  if (is_scalar) {
+    b_f32 = ggml_repeat_4d(bc.ctx, make_f32_scalar(bc.ctx, (float)scalar),
+                            a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+  } else {
+    b_f32 = b;
+    if (b_f32->type != GGML_TYPE_F32) b_f32 = safe_ggml_cast(bc.ctx, b_f32, GGML_TYPE_F32, &bc.host_acc);
+  }
+  auto* quotient = ggml_floor(bc.ctx, ggml_div(bc.ctx, a, b_f32));
+  return ggml_sub(bc.ctx, a, ggml_mul(bc.ctx, quotient, b_f32));
 }
 
 } // namespace executorch_ggml

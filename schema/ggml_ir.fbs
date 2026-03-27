@@ -88,6 +88,7 @@ enum OpCode : int32 {
     CONV_1D_DW = 81,     // depthwise conv1d
     PAD = 82,            // src_ids: [x] op_params: int32 ndim_pairs, ndim_pairs × (int32 left, int32 right), float32 value
     ROPE = 83,           // src_ids: [x, positions] op_params: int32 n_dims, int32 mode, float32 freq_base
+    REMAINDER = 84,      // src_ids: [a, b?] op_params: float64 scalar, int32 is_scalar
 
     // Bitwise / logical ops
     BITWISE_AND = 70,    // src_ids: [a, b]
