@@ -83,15 +83,16 @@ static bool should_perf_log() {
 }
 
 // Graph cache: skip build_graph for repeated shapes.
-// Disabled by default -- build_graph has data-dependent eager constants
-// that must be recomputed each call. With zero-copy eager constants,
-// build_graph is ~2ms which is acceptable overhead.
-// Enable with GGML_GRAPH_CACHE=1 for stateless models only.
+// Enabled by default — models without input-derived eager constants
+// (has_input_derived_eager=false) get zero-overhead graph reuse.
+// Models WITH input-derived constants auto-disable caching (forced
+// rebuild via has_input_derived_eager flag in execute()).
+// Disable with GGML_NO_GRAPH_CACHE=1 for debugging.
 static int graph_cache_enabled = -1;
 static bool is_graph_cache_disabled() {
   if (graph_cache_enabled < 0) {
-    const char* env = std::getenv("GGML_GRAPH_CACHE");
-    graph_cache_enabled = (env && std::string(env) != "0") ? 1 : 0;
+    const char* env = std::getenv("GGML_NO_GRAPH_CACHE");
+    graph_cache_enabled = (env && std::string(env) == "1") ? 0 : 1;
   }
   return graph_cache_enabled == 0;
 }

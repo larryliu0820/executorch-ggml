@@ -44,6 +44,15 @@ def export_qwen3_q8(max_seq_len: int = 128):
         ),
     )
 
+    # --- Performance optimizations (before export) ---
+    from executorch_ggml.modules.rms_norm import swap_rms_norm
+    from executorch_ggml.passes.fold_rms_norm_weights import fold_rms_norm_weights
+
+    n_rms = swap_rms_norm(eager_model)
+    print(f"  swap_rms_norm: {n_rms} modules")
+    n_fold = fold_rms_norm_weights(eager_model)
+    print(f"  fold_rms_norm_weights: {n_fold} norms folded")
+
     print("Exporting with torch.export...")
     exportable = CausalLMExportableModule(
         eager_model,
@@ -53,6 +62,17 @@ def export_qwen3_q8(max_seq_len: int = 128):
         disable_dynamic_shapes=False,
     )
     ep = exportable.export()["model"]
+
+    # --- AOT graph passes (before edge lowering) ---
+    from executorch_ggml.passes.fuse_rope_pass import fuse_rope_in_graph
+    from executorch_ggml.passes.strip_gqa_expand_pass import strip_gqa_expand
+
+    head_dim = config.hidden_size // config.num_attention_heads
+    freq_base = getattr(config, "rope_theta", 1000000.0)
+    n_rope = fuse_rope_in_graph(ep.graph_module, head_dim=head_dim, freq_base=freq_base)
+    print(f"  fuse_rope: {n_rope} instances")
+    n_gqa = strip_gqa_expand(ep.graph_module)
+    print(f"  strip_gqa_expand: {n_gqa} expansions removed")
 
     print("Lowering with Q8_0 quantization...")
     t0 = time.time()

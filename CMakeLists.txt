@@ -103,6 +103,7 @@ check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
   enable_language(CUDA)
   set(GGML_CUDA ON CACHE BOOL "ggml: use CUDA" FORCE)
+  set(GGML_CUDA_GRAPHS ON CACHE BOOL "ggml: enable CUDA graphs for kernel replay" FORCE)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     execute_process(
       COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
