@@ -75,7 +75,7 @@ def export_qwen3_q8(max_seq_len: int = 128):
 
 def main():
     max_seq_len = 128
-    out_dir = "/Users/larryliu/executorch-ggml/qwen3"
+    out_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "qwen3")
     q8_path = os.path.join(out_dir, "qwen3_q8_0.pte")
     f32_path = os.path.join(out_dir, "qwen3.pte")
 

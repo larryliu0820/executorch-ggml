@@ -86,3 +86,10 @@ def handle_to_dim_order_copy(ctx, node, target_str):
     """Dim-order copy op used by ExecuTorch/Edge — no-op for ggml."""
     src_node = node.args[0]
     ctx.node_to_id[node] = ctx.node_to_id[src_node]
+
+
+@register_op("aten.alias.default", "aten.alias_copy.default")
+def handle_alias(ctx, node, target_str):
+    """alias/alias_copy — no-op identity for ggml."""
+    src_node = node.args[0]
+    ctx.node_to_id[node] = ctx.node_to_id[src_node]
