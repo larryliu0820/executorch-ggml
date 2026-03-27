@@ -577,17 +577,16 @@ static Error build_graph(
   for (auto* out : output_tensors) {
     ggml_build_forward_expand(graph, out);
   }
-  // Strip view-only nodes (RESHAPE, VIEW, PERMUTE, TRANSPOSE) from the graph.
-  // These have no CUDA kernel — removing them reduces per-node iteration overhead
-  // in the scheduler and CUDA graph replay loop (338 vs 294 tok/s).
-  // Safety: keep view nodes that are outputs OR that are needed as sources by
-  // any non-view (compute) node or kept view node — stripping them would leave
-  // the scheduler unable to allocate their buffers, crashing at tensor_get.
+  // Strip view-only nodes from the graph. RESHAPE/VIEW/PERMUTE/TRANSPOSE
+  // are metadata-only ops with no CUDA kernel. Stripping them reduces
+  // per-node dispatch overhead.
+  // Safety: keep view nodes that are outputs OR that a non-view compute
+  // node depends on (transitively). The scheduler allocates through
+  // src[] pointers, but stripping view sources of compute ops can cause
+  // allocation failures on some backends.
   {
     std::unordered_set<struct ggml_tensor*> output_set(
         output_tensors.begin(), output_tensors.end());
-    // First pass: identify which view nodes must be kept because a compute
-    // node (or output) depends on them directly or transitively.
     std::unordered_set<struct ggml_tensor*> keep;
     for (int r = 0; r < graph->n_nodes; r++) {
       struct ggml_tensor* node = graph->nodes[r];
@@ -598,7 +597,7 @@ static Error build_graph(
         keep.insert(node);
       }
     }
-    // Propagate: any view node that is a source of a kept node must also stay.
+    // Propagate: view nodes that are sources of kept nodes must stay.
     bool changed = true;
     while (changed) {
       changed = false;
@@ -607,15 +606,12 @@ static Error build_graph(
         if (!keep.count(node)) continue;
         for (int s = 0; s < GGML_MAX_SRC; s++) {
           auto* src = node->src[s];
-          if (src && !keep.count(src)) {
-            // Check if src is a view node in the graph
-            ggml_op sop = src->op;
-            bool src_is_view = (sop == GGML_OP_RESHAPE || sop == GGML_OP_VIEW ||
-                                sop == GGML_OP_PERMUTE || sop == GGML_OP_TRANSPOSE);
-            if (src_is_view) {
-              keep.insert(src);
-              changed = true;
-            }
+          if (!src || keep.count(src)) continue;
+          ggml_op sop = src->op;
+          if (sop == GGML_OP_RESHAPE || sop == GGML_OP_VIEW ||
+              sop == GGML_OP_PERMUTE || sop == GGML_OP_TRANSPOSE) {
+            keep.insert(src);
+            changed = true;
           }
         }
       }
