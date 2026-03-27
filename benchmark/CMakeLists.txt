@@ -42,6 +42,8 @@ if(TARGET ggml-cuda)
   # Use -Wl,--no-as-needed to force cudart even though benchmark_llm itself
   # doesn't directly reference CUDA symbols.
   target_link_libraries(benchmark_llm PRIVATE -Wl,--no-as-needed -L/usr/local/cuda/lib64 -lcudart -Wl,--as-needed)
+  # Enable CUDA-side argmax for GGML_SKIP_OUTPUT_COPY mode.
+  target_compile_definitions(benchmark_llm PRIVATE GGML_FUSED_KERNELS=1)
 endif()
 if(TARGET portable_ops_lib)
   if(APPLE)

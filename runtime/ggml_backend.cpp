@@ -1519,8 +1519,9 @@ Error GgmlBackendInterface::execute(
 
   // GGML_SKIP_OUTPUT_COPY: skip GPU→CPU copy for output tensors.
   // Instead, point the ET tensor's data pointer directly at the GPU buffer.
-  // The caller must handle GPU data (e.g., use a CUDA argmax sampler).
-  // This saves ~0.15ms/tok for the logits copy (608KB for Qwen3 vocab).
+  // The caller must handle GPU data (e.g., use cuda_argmax_f32).
+  // Off by default — generic callers (Python, etc.) expect CPU-accessible data.
+  // The C++ benchmark enables this automatically via its own flag.
   static int skip_output_copy = -1;
   if (skip_output_copy < 0) {
     const char* env = std::getenv("GGML_SKIP_OUTPUT_COPY");

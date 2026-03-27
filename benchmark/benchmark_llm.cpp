@@ -48,8 +48,21 @@ int main(int argc, char** argv) {
   const char* model_path = argv[1];
   int n_decode = 32;
   int prompt_len = 5;
-  bool skip_copy = (std::getenv("GGML_SKIP_OUTPUT_COPY") &&
-                    std::string(std::getenv("GGML_SKIP_OUTPUT_COPY")) != "0");
+  // When CUDA fused kernels are available, skip the D2H logits copy and
+  // do argmax on GPU.  Set the env var so the runtime also skips.
+#ifdef GGML_FUSED_KERNELS
+  bool skip_copy = true;
+  {
+    const char* env = std::getenv("GGML_SKIP_OUTPUT_COPY");
+    if (env && std::string(env) == "0") {
+      skip_copy = false;
+    } else if (!env) {
+      setenv("GGML_SKIP_OUTPUT_COPY", "1", 0);
+    }
+  }
+#else
+  bool skip_copy = false;
+#endif
 
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "--n-decode") == 0 && i + 1 < argc) {
