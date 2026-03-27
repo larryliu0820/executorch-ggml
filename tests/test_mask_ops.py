@@ -79,7 +79,8 @@ class TestBmmSoftmax:
         q = torch.randn(1, 4, 16)
         k = torch.randn(1, 4, 16)
         v = torch.randn(1, 4, 16)
-        run_model_test(model, (q, k, v))
+        # BMM+softmax+BMM chain accumulates FP rounding on CUDA
+        run_model_test(model, (q, k, v), atol=5e-3, rtol=1e-3)
 
 
 class TestTrigOps:

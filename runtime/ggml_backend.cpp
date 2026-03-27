@@ -4837,17 +4837,51 @@ static Error build_graph(
   // Strip view-only nodes (RESHAPE, VIEW, PERMUTE, TRANSPOSE) from the graph.
   // These have no CUDA kernel — removing them reduces per-node iteration overhead
   // in the scheduler and CUDA graph replay loop (338 vs 294 tok/s).
-  // Note: this prevents ggml's built-in CUDA fusions (RMS_NORM+MUL, etc.) from
-  // firing since they check consecutive nodes. But the node reduction wins.
+  // Safety: keep view nodes that are outputs OR that are needed as sources by
+  // any non-view (compute) node or kept view node — stripping them would leave
+  // the scheduler unable to allocate their buffers, crashing at tensor_get.
   {
+    std::unordered_set<struct ggml_tensor*> output_set(
+        output_tensors.begin(), output_tensors.end());
+    // First pass: identify which view nodes must be kept because a compute
+    // node (or output) depends on them directly or transitively.
+    std::unordered_set<struct ggml_tensor*> keep;
+    for (int r = 0; r < graph->n_nodes; r++) {
+      struct ggml_tensor* node = graph->nodes[r];
+      ggml_op op = node->op;
+      bool is_view = (op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+                      op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE);
+      if (!is_view || output_set.count(node)) {
+        keep.insert(node);
+      }
+    }
+    // Propagate: any view node that is a source of a kept node must also stay.
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (int r = 0; r < graph->n_nodes; r++) {
+        struct ggml_tensor* node = graph->nodes[r];
+        if (!keep.count(node)) continue;
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+          auto* src = node->src[s];
+          if (src && !keep.count(src)) {
+            // Check if src is a view node in the graph
+            ggml_op sop = src->op;
+            bool src_is_view = (sop == GGML_OP_RESHAPE || sop == GGML_OP_VIEW ||
+                                sop == GGML_OP_PERMUTE || sop == GGML_OP_TRANSPOSE);
+            if (src_is_view) {
+              keep.insert(src);
+              changed = true;
+            }
+          }
+        }
+      }
+    }
     int w = 0;
     for (int r = 0; r < graph->n_nodes; r++) {
-      ggml_op op = graph->nodes[r]->op;
-      if (op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
-          op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE) {
-        continue;
+      if (keep.count(graph->nodes[r])) {
+        graph->nodes[w++] = graph->nodes[r];
       }
-      graph->nodes[w++] = graph->nodes[r];
     }
     graph->n_nodes = w;
   }
@@ -5546,9 +5580,12 @@ Error GgmlBackendInterface::execute(
     // Without this, the scheduler places them on CPU (since inputs start on
     // CPU host memory), creating a graph split that prevents CUDA graphs.
     if (handle->backend && handle->backend != handle->backend_cpu) {
+      std::unordered_set<struct ggml_tensor*> pinned_set(
+          active->cpu_pinned.begin(), active->cpu_pinned.end());
       for (int i = 0; i < ggml_graph_n_nodes(active->graph); i++) {
         struct ggml_tensor* node = active->graph->nodes[i];
-        // Only force the first non-view, non-pinned node per input.
+        // Skip nodes that build_graph explicitly pinned to CPU.
+        if (pinned_set.count(node)) continue;
         // Check if any source is an input leaf (on CPU / no buffer).
         bool has_input_leaf = false;
         for (int j = 0; j < GGML_MAX_SRC; j++) {

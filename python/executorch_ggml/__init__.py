@@ -42,14 +42,19 @@ try:
     # the symbols before loading _ggml_backend.so.
     import os
 
+    # Look for _portable_lib.so or _llm_runner.so specifically — they contain
+    # the full runtime symbols (BackendInterface, etc.).  Other ET .so files
+    # like data_loader.so are transitive dependencies that lack these symbols
+    # and will cause "undefined symbol" errors if promoted instead.
     _et_so = None
     for _name, _mod in list(sys.modules.items()):
         if "executorch" not in _name:
             continue
         _f = getattr(_mod, "__file__", None)
         if _f and _f.endswith(".so") and os.path.isfile(_f):
-            _et_so = _f
-            break
+            if "_portable_lib" in _name or "_llm_runner" in _name:
+                _et_so = _f
+                break
 
     if _et_so is not None:
         ctypes.CDLL(_et_so, mode=ctypes.RTLD_GLOBAL)
