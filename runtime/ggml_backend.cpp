@@ -577,50 +577,21 @@ static Error build_graph(
   for (auto* out : output_tensors) {
     ggml_build_forward_expand(graph, out);
   }
-  // Strip view-only nodes from the graph. RESHAPE/VIEW/PERMUTE/TRANSPOSE
-  // are metadata-only ops with no CUDA kernel. Stripping them reduces
-  // per-node dispatch overhead.
-  // Safety: keep view nodes that are outputs OR that a non-view compute
-  // node depends on (transitively). The scheduler allocates through
-  // src[] pointers, but stripping view sources of compute ops can cause
-  // allocation failures on some backends.
+  // Strip RESHAPE nodes from the graph. RESHAPE is pure metadata (same
+  // data pointer, different ne[]) with no compute kernel. Stripping
+  // reduces per-node dispatch overhead and CUDA graph capture time.
+  // The gallocr handles stripped tensors via src[] chain traversal.
+  // Safety: keep RESHAPE nodes that ARE graph outputs.
   {
     std::unordered_set<struct ggml_tensor*> output_set(
         output_tensors.begin(), output_tensors.end());
-    std::unordered_set<struct ggml_tensor*> keep;
-    for (int r = 0; r < graph->n_nodes; r++) {
-      struct ggml_tensor* node = graph->nodes[r];
-      ggml_op op = node->op;
-      bool is_view = (op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
-                      op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE);
-      if (!is_view || output_set.count(node)) {
-        keep.insert(node);
-      }
-    }
-    // Propagate: view nodes that are sources of kept nodes must stay.
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (int r = 0; r < graph->n_nodes; r++) {
-        struct ggml_tensor* node = graph->nodes[r];
-        if (!keep.count(node)) continue;
-        for (int s = 0; s < GGML_MAX_SRC; s++) {
-          auto* src = node->src[s];
-          if (!src || keep.count(src)) continue;
-          ggml_op sop = src->op;
-          if (sop == GGML_OP_RESHAPE || sop == GGML_OP_VIEW ||
-              sop == GGML_OP_PERMUTE || sop == GGML_OP_TRANSPOSE) {
-            keep.insert(src);
-            changed = true;
-          }
-        }
-      }
-    }
     int w = 0;
     for (int r = 0; r < graph->n_nodes; r++) {
-      if (keep.count(graph->nodes[r])) {
-        graph->nodes[w++] = graph->nodes[r];
+      if (graph->nodes[r]->op == GGML_OP_RESHAPE &&
+          !output_set.count(graph->nodes[r])) {
+        continue;
       }
+      graph->nodes[w++] = graph->nodes[r];
     }
     graph->n_nodes = w;
   }
