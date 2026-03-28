@@ -101,6 +101,41 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
     }
   }
 
+  // Auto-slice K/V to valid positions when using KV cache.
+  // The Python model slices cache to [0, start_pos+seq_len), but this slice
+  // is data-dependent and lost during export. Detect the case where K has
+  // many more positions than Q (indicating a full cache) and find the valid
+  // length from the input_derived position tensor.
+  if (k->ne[1] > q->ne[1] * 2) {
+    // K has much more positions than Q — this is a KV cache read.
+    // Find kv_valid_len from the input pairs (cache_position input).
+    int64_t kv_valid_len = q->ne[1];  // default: same as Q
+    for (auto& [idx, inp] : bc.input_pairs) {
+      if (inp->type == GGML_TYPE_I32 && ggml_nelements(inp) == q->ne[1]) {
+        // This is the cache_position input. kv_valid_len = max(pos) + 1.
+        const int32_t* pos_data = static_cast<const int32_t*>(bc.host_acc.get(inp));
+        if (pos_data) {
+          int32_t max_pos = 0;
+          for (int64_t i = 0; i < ggml_nelements(inp); i++) {
+            if (pos_data[i] > max_pos) max_pos = pos_data[i];
+          }
+          kv_valid_len = max_pos + q->ne[1];
+          break;
+        }
+      }
+    }
+    if (kv_valid_len > 0 && kv_valid_len < k->ne[1]) {
+      k = ggml_view_4d(bc.ctx, k, k->ne[0], kv_valid_len, k->ne[2], k->ne[3],
+                        k->nb[1], k->nb[2], k->nb[3], 0);
+      v = ggml_view_4d(bc.ctx, v, v->ne[0], kv_valid_len, v->ne[2], v->ne[3],
+                        v->nb[1], v->nb[2], v->nb[3], 0);
+      if (mask && mask->ne[0] > kv_valid_len) {
+        mask = ggml_view_4d(bc.ctx, mask, kv_valid_len, mask->ne[1], mask->ne[2], mask->ne[3],
+                            mask->nb[1], mask->nb[2], mask->nb[3], 0);
+      }
+    }
+  }
+
   float scale = 1.0f;
   if (q->ne[0] > 0) {
     scale = 1.0f / std::sqrt((float) q->ne[0]);
@@ -179,18 +214,14 @@ static inline struct ggml_tensor* build_op_update_cache(BuildContext& bc) {
     int64_t view_ne[4];
     for (int d = 0; d < 4; d++) view_ne[d] = cache->ne[d];
     view_ne[ggml_axis] = seq_len_new;
-
     auto* cache_slice = safe_ggml_view_4d(bc.ctx, cache,
         view_ne[0], view_ne[1], view_ne[2], view_ne[3],
         cache->nb[1], cache->nb[2], cache->nb[3], offset_bytes);
-    if (!cache_slice) {
-      fprintf(stderr, "KV cache update: view creation failed\n");
-      return nullptr;
-    }
-
+    if (!cache_slice) return nullptr;
     auto* val_c = ensure_cont(bc.ctx, value);
-    gt = ggml_cpy(bc.ctx, val_c, cache_slice);
-    gt = cache;  // return full cache for downstream reads
+    auto* cpy = ggml_cpy(bc.ctx, val_c, cache_slice);
+    ggml_set_output(cpy);
+    gt = cache;
   }
   return gt;
 }

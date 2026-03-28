@@ -208,8 +208,13 @@ static inline struct ggml_tensor* build_op_index_put(BuildContext& bc) {
       }
 
       auto* val_c = ensure_cont(bc.ctx, val);
-      gt = ggml_cpy(bc.ctx, val_c, cache_slice);
-      gt = dst;  // downstream will see updated cache
+      auto* cpy = ggml_cpy(bc.ctx, val_c, cache_slice);
+      // cpy writes to cache_slice (a view of dst). Mark as output so
+      // ggml_build_forward_expand adds it to the graph. Without this,
+      // dst (a leaf) has no dependency on cpy, and the scheduler may
+      // read stale cache values before the write executes.
+      ggml_set_output(cpy);
+      gt = dst;
     }
     ggml_set_output(gt);
   } else {

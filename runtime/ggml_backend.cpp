@@ -577,6 +577,14 @@ static Error build_graph(
   // === Build compute graph ===
   auto t_bg_graph_start = std::chrono::high_resolution_clock::now();
   struct ggml_cgraph* graph = ggml_new_graph_custom(ctx, est_graph_size, false);
+  // Add cache write (ggml_cpy) nodes FIRST so they appear before SDPA
+  // reads in the graph's topological order. These are side-effect writes
+  // to mutable KV cache buffers (INDEX_PUT with scatter_axis != 1).
+  for (struct ggml_tensor* t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+    if (t->op == GGML_OP_CPY && (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+      ggml_build_forward_expand(graph, t);
+    }
+  }
   for (auto* out : output_tensors) {
     ggml_build_forward_expand(graph, out);
   }
