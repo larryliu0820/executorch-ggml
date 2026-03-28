@@ -31,7 +31,11 @@ def _concrete_int(s) -> int:
         return 2**62
     # torch.SymInt — read the hint (concrete value used during tracing)
     # without creating a guard that narrows var_to_range.
-    return s.node.hint
+    if s is None:
+        return None
+    if hasattr(s, 'node') and s.node is not None:
+        return s.node.hint
+    return None
 
 
 def _resolve_shape(fake_val) -> List[int]:

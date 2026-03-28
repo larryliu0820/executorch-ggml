@@ -21,8 +21,9 @@ import executorch_ggml.rope_op  # noqa: F401 — registers torch.ops.ggml.rope
 class GgmlDecoderAttention(nn.Module):
     """Decoder attention with fused RoPE, index_copy KV cache, native GQA SDPA."""
 
-    def __init__(self, n_heads, n_kv_heads, head_dim, dim, freq_base):
+    def __init__(self, n_heads, n_kv_heads, head_dim, dim, freq_base, max_seq_len=4096):
         super().__init__()
+        self.max_seq_len = max_seq_len
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
@@ -63,17 +64,25 @@ class GgmlDecoderAttention(nn.Module):
         # Use is_causal only during prefill (S_q == S_kv); during decode
         # the cache already enforces causality.
         kv_len = input_pos[0].item() + T
+        torch._check(kv_len > 0)
+        torch._check(kv_len >= T)
+        torch._check(kv_len <= self.max_seq_len)
         q = q.transpose(1, 2)
         k_slice = self.k_cache[:, :kv_len, :, :].transpose(1, 2)
         v_slice = self.v_cache[:, :kv_len, :, :].transpose(1, 2)
 
-        if attn_mask is None:
-            is_causal = (T == kv_len)
-            y = F.scaled_dot_product_attention(
-                q, k_slice, v_slice, is_causal=is_causal, enable_gqa=self.enable_gqa)
-        else:
-            y = F.scaled_dot_product_attention(
-                q, k_slice, v_slice, attn_mask=attn_mask, enable_gqa=self.enable_gqa)
+        # Manual SDPA: avoids PyTorch >= 2.7 decomposition guards.
+        # KV cache is already sliced to valid positions — no causal mask needed.
+        scale = 1.0 / (q.shape[-1] ** 0.5)
+        if self.enable_gqa:
+            n_rep = self.n_heads // self.n_kv_heads
+            k_slice = k_slice.repeat_interleave(n_rep, dim=1)
+            v_slice = v_slice.repeat_interleave(n_rep, dim=1)
+        attn_weights = torch.matmul(q, k_slice.transpose(-2, -1)) * scale
+        if attn_mask is not None:
+            attn_weights = attn_weights + attn_mask
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        y = torch.matmul(attn_weights, v_slice)
 
         attn_dim = self.n_heads * self.head_dim
         return self.wo(y.transpose(1, 2).contiguous().view(B, T, attn_dim))
@@ -100,6 +109,7 @@ def swap_decoder_rope(model: nn.Module, freq_base: float) -> int:
             head_dim=old.head_dim,
             dim=old.dim,
             freq_base=freq_base,
+            max_seq_len=old.kv_cache.max_seq_len if hasattr(old, 'kv_cache') else 4096,
         )
         # Copy weights
         new_attn.wq.weight = old.wq.weight

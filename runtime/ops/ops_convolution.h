@@ -81,7 +81,7 @@ static inline struct ggml_tensor* build_op_conv_2d(BuildContext& bc, bool is_dw)
               (long long) gt->ne[0], (long long) gt->ne[1], (long long) gt->ne[2], (long long) gt->ne[3]);
       return nullptr;
     }
-    if (bias4->type == GGML_TYPE_F16) {
+    if (bias4->type == GGML_TYPE_F16 || bias4->type == GGML_TYPE_BF16) {
       bias4 = safe_ggml_cast(bc.ctx, bias4, GGML_TYPE_F32, &bc.host_acc);
     }
     gt = ggml_add(bc.ctx, gt, bias4);
@@ -150,8 +150,7 @@ static inline struct ggml_tensor* build_op_conv_1d(BuildContext& bc, bool is_dw)
               (long long) gt->ne[0], (long long) gt->ne[1], (long long) gt->ne[2], (long long) gt->ne[3]);
       return nullptr;
     }
-    if (bias4->type == GGML_TYPE_F16 ||
-        (bc.metal_f32_binops && bias4->type == GGML_TYPE_BF16)) {
+    if (bias4->type == GGML_TYPE_F16 || bias4->type == GGML_TYPE_BF16) {
       bias4 = safe_ggml_cast(bc.ctx, bias4, GGML_TYPE_F32, &bc.host_acc);
     }
     gt = ggml_add(bc.ctx, gt, bias4);

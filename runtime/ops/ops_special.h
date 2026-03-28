@@ -27,6 +27,14 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
     memcpy(&ic, bc.ir_tensor->op_params()->data(), sizeof(int32_t));
     is_causal = (ic != 0);
   }
+  // For decoder SDPA with KV cache (T_q < T_kv): the KV cache is already
+  // sliced to valid positions [0, start_pos+seq_len), so causality is enforced
+  // by construction. Disable causal masking to avoid numerical divergence
+  // between PyTorch's is_causal=True GQA SDPA and ggml_flash_attn_ext.
+  // Keep causal masking for encoder self-attention (T_q == T_kv) where it's needed.
+  if (is_causal && q->ne[1] < k->ne[1]) {
+    is_causal = false;
+  }
 
   // Optional attention mask.
   struct ggml_tensor* mask = nullptr;

@@ -42,12 +42,13 @@ class StandardSDPA(nn.Module):
     (ggml's flash_attn_ext supports GQA via gqa_ratio).
     """
 
-    def __init__(self, n_heads: int, n_kv_heads: int, head_dim: int):
+    def __init__(self, n_heads: int, n_kv_heads: int, head_dim: int, max_seq_len: int = 4096):
         super().__init__()
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.dim = n_heads * head_dim
         self.enable_gqa = n_kv_heads != n_heads
+        self.max_seq_len = max_seq_len
 
     def forward(
         self,
@@ -68,17 +69,28 @@ class StandardSDPA(nn.Module):
         # contains past positions). Using is_causal=True would wrongly
         # mask Q[i] from attending to K[j>i] within the valid slice.
         kv_len = input_pos[0].item() + seqlen
+        torch._check(kv_len > 0)
+        torch._check(kv_len >= seqlen)
+        torch._check(kv_len <= self.max_seq_len)
         k = k[:, :kv_len, :, :].transpose(1, 2)
         v = v[:, :kv_len, :, :].transpose(1, 2)
 
-        if mask is None:
-            # Causal during prefill (S_q == S_kv), not during decode
-            is_causal = (seqlen == kv_len)
-            y = F.scaled_dot_product_attention(
-                q, k, v, is_causal=is_causal, enable_gqa=self.enable_gqa)
-        else:
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, enable_gqa=self.enable_gqa)
+        # Manual SDPA: avoids PyTorch >= 2.7 SDPA decomposition guards and
+        # the is_causal=True GQA numerical divergence vs llama.custom_sdpa.
+        # KV cache is already sliced to valid positions, so no causal mask needed.
+        scale = 1.0 / (q.shape[-1] ** 0.5)
+
+        # GQA: repeat KV heads to match Q heads
+        if self.enable_gqa:
+            n_rep = self.n_heads // self.n_kv_heads
+            k = k.repeat_interleave(n_rep, dim=1)
+            v = v.repeat_interleave(n_rep, dim=1)
+
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+        if mask is not None:
+            attn_weights = attn_weights + mask
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        y = torch.matmul(attn_weights, v)
 
         return y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
@@ -114,4 +126,5 @@ def swap_voxtral_attention(model: nn.Module) -> None:
         if isinstance(attn.sdpa, SDPA):
             attn.sdpa = StandardSDPA(
                 attn.n_heads, attn.n_kv_heads, attn.head_dim,
+                max_seq_len=old_kv.max_seq_len if hasattr(attn, 'kv_cache') and hasattr(attn.kv_cache, 'max_seq_len') else 4096,
             )

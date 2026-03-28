@@ -423,7 +423,7 @@ def main():
         print("[Eager PyTorch]")
         print("=" * 60)
         from executorch.examples.models.voxtral_realtime.model import load_model
-        eager_model = load_model(args.model_path, backend="cuda")
+        eager_model = load_model(args.model_path)
         eager_model.eval()
 
         with torch.no_grad():

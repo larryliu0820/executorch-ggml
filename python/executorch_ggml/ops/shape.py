@@ -184,7 +184,7 @@ def handle_slice(ctx, node, target_str):
     # C++ runtime to resolve via centering or sym_dim_exprs.
     if end_i == 2**62 and start_i != 2**62 and shape:
         d = dim if dim >= 0 else ndim + dim
-        if d < len(shape):
+        if d < len(shape) and shape[d] is not None:
             end_i = start_i + shape[d] * step
 
     _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
@@ -292,11 +292,8 @@ def handle_view(ctx, node, target_str):
     shape = _resolve_shape(fake_val)
     # Use concrete output shape from FakeTensor meta rather than
     # node.args[1] which may contain SymInt from dynamic export.
-    new_shape = (
-        [_concrete_int(d) for d in shape]
-        if shape
-        else [_concrete_int(d) for d in node.args[1]]
-    )
+    raw_shape = shape if shape else list(node.args[1])
+    new_shape = [_concrete_int(d) if _concrete_int(d) is not None else d for d in raw_shape]
 
     # Pack the shape in ggml ne order (reversed from PyTorch)
     # since the C++ runtime passes these directly to ggml_reshape_4d.
