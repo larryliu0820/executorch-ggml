@@ -103,10 +103,19 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
 
   // Auto-slice K/V to valid positions when using KV cache.
   // The Python model slices cache to [0, start_pos+seq_len), but this slice
-  // is data-dependent and lost during export. Detect the case where K has
-  // many more positions than Q (indicating a full cache) and find the valid
-  // length from the input_derived position tensor.
-  if (k->ne[1] > q->ne[1] * 2) {
+  // is data-dependent and lost during export. Detect decoder-style SDPA:
+  // K lives in mutable_buf (KV cache) and has many more positions than Q.
+  // Don't trigger for encoder self-attention (K from const_buf or graph ops).
+  bool k_is_mutable = (k->buffer && bc.handle->mutable_buf && k->buffer == bc.handle->mutable_buf);
+  // Also check through views: unwrap VIEW/PERMUTE to find the buffer
+  if (!k_is_mutable) {
+    auto* kb = k;
+    while (kb && (kb->op == GGML_OP_VIEW || kb->op == GGML_OP_PERMUTE || kb->op == GGML_OP_RESHAPE || kb->op == GGML_OP_TRANSPOSE))
+      kb = kb->src[0];
+    if (kb && kb->buffer && bc.handle->mutable_buf && kb->buffer == bc.handle->mutable_buf)
+      k_is_mutable = true;
+  }
+  if (k_is_mutable && k->ne[1] > q->ne[1] * 2) {
     // K has much more positions than Q — this is a KV cache read.
     // Find kv_valid_len from the input pairs (cache_position input).
     int64_t kv_valid_len = q->ne[1];  // default: same as Q
@@ -130,8 +139,8 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
       v = ggml_view_4d(bc.ctx, v, v->ne[0], kv_valid_len, v->ne[2], v->ne[3],
                         v->nb[1], v->nb[2], v->nb[3], 0);
       if (mask && mask->ne[0] > kv_valid_len) {
-        mask = ggml_view_4d(bc.ctx, mask, kv_valid_len, mask->ne[1], mask->ne[2], mask->ne[3],
-                            mask->nb[1], mask->nb[2], mask->nb[3], 0);
+        mask = ggml_cont(bc.ctx, ggml_view_4d(bc.ctx, mask, kv_valid_len, mask->ne[1], mask->ne[2], mask->ne[3],
+                            mask->nb[1], mask->nb[2], mask->nb[3], 0));
       }
     }
   }

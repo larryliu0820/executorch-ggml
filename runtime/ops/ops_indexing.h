@@ -146,6 +146,19 @@ static inline struct ggml_tensor* build_op_index_put(BuildContext& bc) {
 
   struct ggml_tensor* gt = nullptr;
   if (is_mutable_dst) {
+    // The cpy path reads start_pos from idx at build time and bakes the
+    // offset into the view. When idx is input-derived (cache_position),
+    // the graph must be rebuilt each call. Create a small eager constant
+    // from the idx value to trigger has_input_derived_eager.
+    if (bc.input_derived.count(idx)) {
+      ggml_set_no_alloc(bc.ctx, false);
+      auto* pos_marker = ggml_new_tensor_1d(bc.ctx, GGML_TYPE_I32, 1);
+      ggml_set_no_alloc(bc.ctx, true);
+      pos_marker->op = GGML_OP_NONE;
+      if (idx->data) memcpy(pos_marker->data, bc.host_acc.get(idx), sizeof(int32_t));
+      bc.input_derived.insert(pos_marker);
+    }
+
     if (val->type != GGML_TYPE_F32) {
       val = safe_ggml_cast(bc.ctx, val, GGML_TYPE_F32, &bc.host_acc);
     }
@@ -155,8 +168,9 @@ static inline struct ggml_tensor* build_op_index_put(BuildContext& bc) {
     if (ggml_scatter_axis == 1) {
       gt = ggml_set_rows(bc.ctx, dst, val, idx);
     } else {
-      fprintf(stderr, "[KV_CACHE_DEBUG] idx tensor: type=%s, ne=[%ld,%ld,%ld,%ld], nbytes=%zu\n",
-              ggml_type_name(idx->type), idx->ne[0], idx->ne[1], idx->ne[2], idx->ne[3], ggml_nbytes(idx));
+      fprintf(stderr, "[KV_CACHE_DEBUG] idx tensor: type=%s, ne=[%ld,%ld,%ld,%ld], nbytes=%zu, data=%p, op=%d, buffer=%p\n",
+              ggml_type_name(idx->type), idx->ne[0], idx->ne[1], idx->ne[2], idx->ne[3], ggml_nbytes(idx),
+              idx->data, idx->op, (void*)idx->buffer);
 
       int64_t start_pos;
       if (idx->type == GGML_TYPE_I64) {
