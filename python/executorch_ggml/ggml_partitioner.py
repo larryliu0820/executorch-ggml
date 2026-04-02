@@ -308,6 +308,8 @@ class GgmlPartitioner(Partitioner):
         self,
         max_sdpa_ops: int | None = None,
         quant_config: "GgmlQuantConfig | None" = None,
+        gguf_weight_map: dict[str, str] | None = None,
+        skip_weight_data: bool = False,
     ):
         super().__init__()
         compile_specs: list[CompileSpec] = []
@@ -326,6 +328,21 @@ class GgmlPartitioner(Partitioner):
                         value=",".join(quant_config.skip_patterns).encode(),
                     )
                 )
+        if gguf_weight_map is not None:
+            import json
+            compile_specs.append(
+                CompileSpec(
+                    key="gguf_weight_map",
+                    value=json.dumps(gguf_weight_map).encode(),
+                )
+            )
+        if skip_weight_data:
+            compile_specs.append(
+                CompileSpec(
+                    key="gguf_skip_weight_data",
+                    value=b"true",
+                )
+            )
         self.delegation_spec = DelegationSpec(BACKEND_ID, compile_specs)
         self.max_sdpa_ops = max_sdpa_ops
 

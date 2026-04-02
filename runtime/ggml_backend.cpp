@@ -912,12 +912,17 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
 
     auto fb = ndm->get_data(key);
     if (!fb.ok()) {
-      cleanup_backends();
-      delete handle;
-      return fb.error();
+      // Not in PTE or GGUF — zero-init.
+      SavedConstant sc;
+      sc.ir_tensor_id = t->id();
+      sc.data.resize(nbytes, 0);
+      handle->constant_data.push_back(std::move(sc));
+      continue;
     }
     auto buf = std::move(fb.get());
     if (buf.size() < nbytes) {
+      fprintf(stderr, "[ggml_backend] ERROR: weight '%s' size mismatch: got %zu, need %zu\n",
+              key, buf.size(), nbytes);
       buf.Free();
       cleanup_backends();
       delete handle;

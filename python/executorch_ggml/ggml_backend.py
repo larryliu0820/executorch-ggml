@@ -66,8 +66,10 @@ class GgmlBackend(BackendDetails):
         # Named data store for weights/constants.
         data_store = NamedDataStore()
 
-        # Parse quantization config from compile_specs (set by GgmlPartitioner).
+        # Parse quantization config and GGUF options from compile_specs (set by GgmlPartitioner).
         quant_config = None
+        gguf_weight_map = None  # Optional: PyTorch FQN -> GGUF tensor name
+        skip_weight_data = False  # When True, don't store weight bytes in PTE
         for spec in compile_specs:
             if spec.key == "ggml_quant_type":
                 from executorch_ggml.quantize import GgmlQuantConfig, GgmlQuantType
@@ -75,6 +77,11 @@ class GgmlBackend(BackendDetails):
                 quant_config = GgmlQuantConfig(quant_type=GgmlQuantType(qtype_str))
             elif spec.key == "ggml_quant_skip" and quant_config is not None:
                 quant_config.skip_patterns = set(spec.value.decode().split(","))
+            elif spec.key == "gguf_weight_map":
+                import json
+                gguf_weight_map = json.loads(spec.value.decode())
+            elif spec.key == "gguf_skip_weight_data":
+                skip_weight_data = spec.value.decode() == "true"
 
         # Create the preprocessing context used by all operator handlers.
         ctx = PreprocessContext(edge_program, data_store, quant_config)
@@ -122,6 +129,10 @@ class GgmlBackend(BackendDetails):
                         sg_id = id(graph_module) & 0xFFFF
                         data_key = f"__ggml_sg{sg_id}_{fqn}"
 
+                    # If GGUF weight map is provided, remap data_key to GGUF tensor name
+                    if gguf_weight_map and fqn in gguf_weight_map:
+                        data_key = gguf_weight_map[fqn]
+
                     if tensor_from_state:
                         tensor = edge_program.state_dict[fqn]
                     elif fqn in ctx.ep_constants:
@@ -154,7 +165,8 @@ class GgmlBackend(BackendDetails):
                             quant_bytes = quantize_tensor(
                                 f32_data, quant_config.quant_type,
                             )
-                            data_store.add_named_data(data_key, quant_bytes, alignment=64)
+                            if not skip_weight_data:
+                                data_store.add_named_data(data_key, quant_bytes, alignment=64)
                             if quant_config.quant_type == GgmlQuantType.Q8_0:
                                 ir_type = TYPE_Q8_0
                             tid = alloc_id()
@@ -172,7 +184,8 @@ class GgmlBackend(BackendDetails):
                             node_to_id[node] = tid
                             continue
 
-                    data_store.add_named_data(data_key, t_cpu, alignment=64)
+                    if not skip_weight_data:
+                        data_store.add_named_data(data_key, t_cpu, alignment=64)
 
                     tid = alloc_id()
                     ir_tensors.append(

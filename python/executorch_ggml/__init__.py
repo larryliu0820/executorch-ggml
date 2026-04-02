@@ -91,6 +91,20 @@ from executorch_ggml.ggml_backend import GgmlBackend
 from executorch_ggml.ggml_partitioner import GgmlPartitioner
 from executorch_ggml.quantize import GgmlQuantConfig, GgmlQuantType
 
+# GGUF-to-PTE pipeline components
+try:
+    from executorch_ggml.gguf_analyzer import GGUFAnalyzer
+    from executorch_ggml.weight_mapping import WeightNameMapper
+    from executorch_ggml.export_gguf import export_gguf_to_pte, GGUFExportConfig
+    from executorch_ggml.gguf_module import GGUFModule
+
+    _gguf_available = True
+except ImportError as e:
+    # GGUF functionality may not be available if llama.cpp dependencies are missing
+    _gguf_available = False
+    import warnings
+    warnings.warn(f"GGUF functionality not available: {e}")
+
 __all__ = [
     "GgmlPartitioner",
     "GgmlBackend",
@@ -98,3 +112,13 @@ __all__ = [
     "GgmlQuantType",
     "to_edge_rewrite_and_lower",
 ]
+
+# Add GGUF exports if available
+if _gguf_available:
+    __all__.extend([
+        "GGUFAnalyzer",
+        "WeightNameMapper",
+        "export_gguf_to_pte",
+        "GGUFExportConfig",
+        "GGUFModule",
+    ])
