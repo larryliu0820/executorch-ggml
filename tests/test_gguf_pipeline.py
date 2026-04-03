@@ -20,8 +20,8 @@ pytest.importorskip("optimum")
 # Import our GGUF modules
 from executorch_ggml.gguf_analyzer import GGUFAnalyzer
 from executorch_ggml.weight_mapping import WeightNameMapper, MultiArchWeightMapper
-from executorch_ggml.export_gguf import export_gguf_to_pte, GGUFExportConfig, validate_gguf_pte_export
-from executorch_ggml.gguf_module import GGUFModule, load_gguf_module
+from executorch_ggml.export_gguf import export_gguf_to_pte, GGUFExportConfig
+from executorch_ggml.gguf_module import GGUFModule
 
 
 class TestGGUFAnalyzer:
@@ -284,23 +284,12 @@ class TestGGUFExportPipeline:
         except Exception as e:
             pytest.skip(f"Export failed (may require model dependencies): {e}")
 
-    def test_export_validation(self, sample_gguf_path, temp_output_dir):
-        """Test export validation functionality."""
-        if sample_gguf_path is None:
-            pytest.skip("No test GGUF file available")
-
-        output_pte = os.path.join(temp_output_dir, "test_validation.pte")
-
-        # Create a dummy PTE file for validation testing
-        with open(output_pte, "wb") as f:
-            f.write(b"dummy pte content")
-
-        validation = validate_gguf_pte_export(sample_gguf_path, output_pte)
-
-        assert isinstance(validation, dict)
-        assert "success" in validation
-        assert "pte_exists" in validation
-        assert validation["pte_exists"] is True
+    def test_export_config_defaults(self):
+        """Test GGUFExportConfig default values."""
+        config = GGUFExportConfig()
+        assert config.max_seq_len == 128
+        assert config.enable_quantization is False
+        assert config.skip_weight_data is True
 
 
 class TestGGUFModule:
