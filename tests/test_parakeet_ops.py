@@ -9,6 +9,8 @@ Usage:
     GGML_BACKEND_DEVICE=cpu pytest tests/test_parakeet_ops.py -v -s
 """
 
+import gc
+
 import pytest
 import torch
 import torch.nn as nn
@@ -55,6 +57,8 @@ def _run_ggml(model, inp, transform_passes=None):
     ggml_out = result[0]
     with torch.no_grad():
         eager_out = model(inp)
+    del pte, et, edge_mgr
+    gc.collect()
     return eager_out, ggml_out
 
 

@@ -11,12 +11,21 @@ Usage:
     pytest tests/test_sym_expr.py -v -s
 """
 
+import gc
 import struct
+
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.export import export, Dim
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_cuda():
+    """Free GGML/CUDA resources after each test to prevent accumulation."""
+    yield
+    gc.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +385,9 @@ def _export_load_and_run(model, trace_input, dynamic_shapes, test_inputs, atol=1
             f"Mismatch at input shape {list(test_input.shape)}: "
             f"max_abs_diff={abs_diff} > atol={atol}"
         )
+    import gc
+    del pte, et, edge_mgr, ep
+    gc.collect()
 
 
 class TestRuntimeCorrectness:

@@ -588,26 +588,10 @@ static Error build_graph(
   for (auto* out : output_tensors) {
     ggml_build_forward_expand(graph, out);
   }
-  // Strip RESHAPE nodes from the graph. RESHAPE is pure metadata (same
-  // data pointer, different ne[]) with no compute kernel. Stripping
-  // reduces per-node dispatch overhead and CUDA graph capture time.
-  // The gallocr handles stripped tensors via src[] chain traversal.
-  // Note: PERMUTE/TRANSPOSE/VIEW cannot be stripped — the gallocr
-  // needs them for stride-aware memory allocation.
-  // Safety: keep RESHAPE nodes that ARE graph outputs.
-  {
-    std::unordered_set<struct ggml_tensor*> output_set(
-        output_tensors.begin(), output_tensors.end());
-    int w = 0;
-    for (int r = 0; r < graph->n_nodes; r++) {
-      if (graph->nodes[r]->op == GGML_OP_RESHAPE &&
-          !output_set.count(graph->nodes[r])) {
-        continue;
-      }
-      graph->nodes[w++] = graph->nodes[r];
-    }
-    graph->n_nodes = w;
-  }
+  // Note: RESHAPE/VIEW/PERMUTE/TRANSPOSE are NOT stripped from the graph.
+  // On CUDA these are zero-copy view ops (no kernel launch, just metadata).
+  // Stripping breaks the gallocr hash table — stripped tensors referenced
+  // as src[] by downstream nodes become invisible to the allocator.
   auto t_bg_graph_end = std::chrono::high_resolution_clock::now();
   if (verbose) fprintf(stderr, "[ggml_backend] graph built: %d nodes, %d leafs (max %zu)\n",
           ggml_graph_n_nodes(graph), (int)0, est_graph_size);

@@ -8,6 +8,8 @@ Usage:
     LD_LIBRARY_PATH=... pytest tests/test_ops.py -v -s
 """
 
+import gc
+
 import pytest
 import torch
 import torch.nn as nn
@@ -49,6 +51,9 @@ def _run_ggml(model, inp, ep_passes=None, atol=1e-4, rtol=1e-4):
     ggml_out = result[0]
     with torch.no_grad():
         eager_out = model(inp)
+    # Free GGML/CUDA resources before they accumulate across tests.
+    del pte, et, edge_mgr, ep
+    gc.collect()
     return eager_out, ggml_out
 
 
