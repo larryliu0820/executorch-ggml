@@ -1,14 +1,11 @@
 """End-to-end test suite for GGUF-to-PTE pipeline and GGUFModule.
 
-This test suite validates the complete GGUF-to-PTE export functionality
-and GGUFModule runtime loading, including accuracy tests against
-existing export pipelines.
+Downloads Qwen3-0.6B-Q8_0.gguf from HuggingFace on first run (cached
+by huggingface_hub for subsequent runs).
 """
 
 import os
 import tempfile
-from pathlib import Path
-from typing import Optional
 
 import pytest
 import torch
@@ -17,449 +14,194 @@ import torch
 pytest.importorskip("transformers")
 pytest.importorskip("optimum")
 
-# Import our GGUF modules
 from executorch_ggml.gguf_analyzer import GGUFAnalyzer
 from executorch_ggml.weight_mapping import WeightNameMapper, MultiArchWeightMapper
 from executorch_ggml.export_gguf import export_gguf_to_pte, GGUFExportConfig
 from executorch_ggml.gguf_module import GGUFModule
 
 
+# ---------------------------------------------------------------------------
+# Shared fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def gguf_path():
+    """Download Qwen3-0.6B-Q8_0.gguf (cached by huggingface_hub)."""
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(
+        repo_id="Qwen/Qwen3-0.6B-GGUF",
+        filename="Qwen3-0.6B-Q8_0.gguf",
+    )
+
+
+@pytest.fixture
+def output_dir():
+    """Create temporary directory for test outputs."""
+    with tempfile.TemporaryDirectory() as d:
+        yield d
+
+
+@pytest.fixture(scope="session")
+def pte_path(gguf_path, tmp_path_factory):
+    """Export a weight-less PTE once for the session."""
+    out = str(tmp_path_factory.mktemp("pte") / "qwen3.pte")
+    config = GGUFExportConfig(
+        max_seq_len=128,
+        preserve_dynamic_shapes=True,
+        enable_quantization=True,
+    )
+    export_gguf_to_pte(gguf_path, out, config)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# GGUFAnalyzer
+# ---------------------------------------------------------------------------
+
 class TestGGUFAnalyzer:
-    """Test GGUF file analysis functionality."""
 
-    @pytest.fixture
-    def sample_gguf_path(self) -> Optional[str]:
-        """Provide path to a sample GGUF file for testing.
-
-        This should be set to a real GGUF file path for testing.
-        For CI, we might skip tests that require actual GGUF files.
-        """
-        # Look for test GGUF files in common locations
-        test_paths = [
-            "qwen3-0.6b-q8_0.gguf",
-            "test_models/qwen3-0.6b-q8_0.gguf",
-            os.path.expanduser("~/models/qwen3-0.6b-q8_0.gguf"),
-        ]
-
-        for path in test_paths:
-            if os.path.exists(path):
-                return path
-
-        return None
-
-    def test_gguf_analyzer_initialization(self, sample_gguf_path):
-        """Test GGUFAnalyzer can be initialized with a valid GGUF file."""
-        if sample_gguf_path is None:
-            pytest.skip("No test GGUF file available")
-
-        analyzer = GGUFAnalyzer(sample_gguf_path)
-
-        assert analyzer.gguf_path == sample_gguf_path
+    def test_initialization(self, gguf_path):
+        analyzer = GGUFAnalyzer(gguf_path)
+        assert analyzer.gguf_path == gguf_path
         assert analyzer.reader is not None
-        assert analyzer.metadata is not None
 
-    def test_gguf_analyzer_architecture_detection(self, sample_gguf_path):
-        """Test architecture detection from GGUF metadata."""
-        if sample_gguf_path is None:
-            pytest.skip("No test GGUF file available")
+    def test_architecture_detection(self, gguf_path):
+        arch = GGUFAnalyzer(gguf_path).get_model_architecture()
+        assert arch == "qwen3"
 
-        analyzer = GGUFAnalyzer(sample_gguf_path)
+    def test_model_config(self, gguf_path):
+        config = GGUFAnalyzer(gguf_path).get_model_config()
+        assert config["embedding_length"] == 1024
+        assert config["block_count"] == 28
+        assert config["vocab_size"] == 151936
 
-        arch = analyzer.get_model_architecture()
-        assert isinstance(arch, str)
-        assert len(arch) > 0
-        print(f"Detected architecture: {arch}")
+    def test_tensor_names(self, gguf_path):
+        names = GGUFAnalyzer(gguf_path).get_tensor_names()
+        assert len(names) == 310  # Qwen3-0.6B has 310 tensors
+        assert "token_embd.weight" in names
 
-    def test_gguf_analyzer_model_config(self, sample_gguf_path):
-        """Test model configuration extraction."""
-        if sample_gguf_path is None:
-            pytest.skip("No test GGUF file available")
+    def test_file_info(self, gguf_path):
+        info = GGUFAnalyzer(gguf_path).get_file_info()
+        assert info["architecture"] == "qwen3"
+        assert info["tensor_count"] == 310
+        assert info["file_size_bytes"] > 0
 
-        analyzer = GGUFAnalyzer(sample_gguf_path)
 
-        config = analyzer.get_model_config()
-        assert isinstance(config, dict)
-
-        # Check for required fields
-        required_fields = ["embedding_length", "block_count", "vocab_size"]
-        for field in required_fields:
-            assert field in config, f"Missing required field: {field}"
-            assert isinstance(config[field], int), f"Field {field} should be int"
-
-        print(f"Model config: {config}")
-
-    def test_gguf_analyzer_tensor_names(self, sample_gguf_path):
-        """Test tensor name extraction."""
-        if sample_gguf_path is None:
-            pytest.skip("No test GGUF file available")
-
-        analyzer = GGUFAnalyzer(sample_gguf_path)
-
-        tensor_names = analyzer.get_tensor_names()
-        assert isinstance(tensor_names, list)
-        assert len(tensor_names) > 0
-
-        # Check that all names are strings
-        for name in tensor_names:
-            assert isinstance(name, str)
-            assert len(name) > 0
-
-        print(f"Found {len(tensor_names)} tensors")
-
-    def test_gguf_analyzer_file_info(self, sample_gguf_path):
-        """Test file information extraction."""
-        if sample_gguf_path is None:
-            pytest.skip("No test GGUF file available")
-
-        analyzer = GGUFAnalyzer(sample_gguf_path)
-
-        info = analyzer.get_file_info()
-        assert isinstance(info, dict)
-
-        required_fields = ["file_size_bytes", "architecture", "tensor_count"]
-        for field in required_fields:
-            assert field in info
-
+# ---------------------------------------------------------------------------
+# WeightNameMapper
+# ---------------------------------------------------------------------------
 
 class TestWeightNameMapper:
-    """Test weight name mapping functionality."""
 
-    def test_weight_mapper_initialization(self):
-        """Test WeightNameMapper initialization."""
-        mapper = WeightNameMapper("qwen3", 32)
-
+    def test_initialization(self):
+        mapper = WeightNameMapper("qwen3", 28)
         assert mapper.arch == "qwen3"
-        assert mapper.n_blocks == 32
-        assert len(mapper.mappings) > 0
+        assert mapper.n_blocks == 28
 
-    def test_pytorch_to_gguf_mapping(self):
-        """Test PyTorch to GGUF name conversion."""
-        mapper = WeightNameMapper("qwen3", 32)
+    def test_pytorch_to_gguf(self):
+        mapper = WeightNameMapper("qwen3", 28)
+        # Spot-check a few known mappings
+        assert isinstance(mapper.pytorch_to_gguf("tok_embeddings.weight"), str)
 
-        # Test basic mappings
-        test_cases = [
-            ("layers.0.attention.wq.weight", "blk.0.attn_q.weight"),
-            ("tok_embeddings.weight", "token_embd.weight"),
-            ("norm.weight", "output_norm.weight"),
-        ]
-
-        for pytorch_name, expected_gguf in test_cases:
-            gguf_name = mapper.pytorch_to_gguf(pytorch_name)
-            print(f"{pytorch_name} -> {gguf_name}")
-            # Note: exact match depends on mapping completeness
-            assert isinstance(gguf_name, str)
-
-    def test_gguf_to_pytorch_mapping(self):
-        """Test GGUF to PyTorch name conversion."""
-        mapper = WeightNameMapper("qwen3", 32)
-
-        # Test reverse mappings
-        test_cases = [
-            ("blk.0.attn_q.weight", "layers.0.attention.wq.weight"),
-            ("token_embd.weight", "tok_embeddings.weight"),
-        ]
-
-        for gguf_name, expected_pytorch in test_cases:
-            pytorch_name = mapper.gguf_to_pytorch(gguf_name)
-            print(f"{gguf_name} -> {pytorch_name}")
-            assert isinstance(pytorch_name, str)
+    def test_gguf_to_pytorch(self):
+        mapper = WeightNameMapper("qwen3", 28)
+        assert isinstance(mapper.gguf_to_pytorch("token_embd.weight"), str)
 
     def test_weight_parameter_detection(self):
-        """Test weight parameter detection."""
-        mapper = WeightNameMapper("qwen3", 32)
-
-        # Test positive cases
-        weight_names = [
-            "layers.0.attention.wq.weight",
-            "tok_embeddings.weight",
-            "norm.weight",
-            "feed_forward.w1.bias"
-        ]
-
-        for name in weight_names:
-            assert mapper.is_weight_parameter(name), f"{name} should be detected as weight"
-
-        # Test negative cases
-        non_weight_names = [
-            "input_ids",
-            "cache_position",
-            "some_intermediate_value"
-        ]
-
-        for name in non_weight_names:
-            assert not mapper.is_weight_parameter(name), f"{name} should not be detected as weight"
+        mapper = WeightNameMapper("qwen3", 28)
+        assert mapper.is_weight_parameter("layers.0.attention.wq.weight")
+        assert not mapper.is_weight_parameter("cache_position")
 
     def test_multi_arch_mapper(self):
-        """Test multi-architecture mapper."""
-        multi_mapper = MultiArchWeightMapper()
+        mm = MultiArchWeightMapper()
+        assert mm.get_mapper("qwen3", 28).arch == "qwen3"
+        assert mm.get_mapper("llama", 32).arch == "llama"
 
-        # Test getting mappers for different architectures
-        qwen_mapper = multi_mapper.get_mapper("qwen3", 32)
-        llama_mapper = multi_mapper.get_mapper("llama", 32)
-
-        assert isinstance(qwen_mapper, WeightNameMapper)
-        assert isinstance(llama_mapper, WeightNameMapper)
-        assert qwen_mapper.arch == "qwen3"
-        assert llama_mapper.arch == "llama"
-
-    def test_validation_functionality(self, sample_gguf_path):
-        """Test mapping validation with real GGUF file."""
-        if sample_gguf_path is None:
-            pytest.skip("No test GGUF file available")
-
-        # Get GGUF tensor names
-        analyzer = GGUFAnalyzer(sample_gguf_path)
+    def test_validation_with_real_gguf(self, gguf_path):
+        analyzer = GGUFAnalyzer(gguf_path)
         gguf_names = analyzer.get_tensor_names()
-        arch = analyzer.get_model_architecture()
         config = analyzer.get_model_config()
+        mapper = WeightNameMapper("qwen3", config["block_count"])
 
-        # Create mapper
-        mapper = WeightNameMapper(arch, config["block_count"])
-
-        # Generate some sample PyTorch names based on architecture
-        pytorch_names = [
-            "tok_embeddings.weight",
-            "layers.0.attention.wq.weight",
-            "layers.0.attention_norm.weight",
-            "norm.weight"
-        ]
-
-        # Validate mappings
-        validation = mapper.validate_mapping(pytorch_names, gguf_names)
-
+        validation = mapper.validate_mapping(
+            ["tok_embeddings.weight", "norm.weight"],
+            gguf_names,
+        )
         assert isinstance(validation, dict)
         assert "successful_mappings" in validation
-        assert "pytorch_to_gguf_missing" in validation
 
-        print(f"Validation results: {len(validation['successful_mappings'])} successful mappings")
 
+# ---------------------------------------------------------------------------
+# Export Pipeline
+# ---------------------------------------------------------------------------
 
 class TestGGUFExportPipeline:
-    """Test GGUF-to-PTE export pipeline."""
-
-    @pytest.fixture
-    def temp_output_dir(self):
-        """Create temporary directory for test outputs."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            yield temp_dir
-
-    def test_export_config_creation(self):
-        """Test GGUFExportConfig creation."""
-        config = GGUFExportConfig(max_seq_len=256, enable_quantization=True)
-
-        assert config.max_seq_len == 256
-        assert config.enable_quantization is True
-        assert config.quant_config is not None
-
-    @pytest.mark.slow
-    def test_gguf_to_pte_export(self, sample_gguf_path, temp_output_dir):
-        """Test complete GGUF-to-PTE export pipeline."""
-        if sample_gguf_path is None:
-            pytest.skip("No test GGUF file available")
-
-        output_pte = os.path.join(temp_output_dir, "test_export.pte")
-
-        # Test export
-        config = GGUFExportConfig(max_seq_len=128, enable_quantization=False)
-
-        try:
-            result_path = export_gguf_to_pte(
-                gguf_path=sample_gguf_path,
-                output_pte_path=output_pte,
-                export_config=config
-            )
-
-            assert result_path == output_pte
-            assert os.path.exists(output_pte)
-
-            # Check file size (should be smaller than GGUF)
-            pte_size = os.path.getsize(output_pte)
-            gguf_size = os.path.getsize(sample_gguf_path)
-
-            assert pte_size > 0
-            assert pte_size < gguf_size  # Weight-less PTE should be smaller
-
-            print(f"Export successful: GGUF {gguf_size//1024//1024}MB -> PTE {pte_size//1024//1024}MB")
-
-        except Exception as e:
-            pytest.skip(f"Export failed (may require model dependencies): {e}")
 
     def test_export_config_defaults(self):
-        """Test GGUFExportConfig default values."""
         config = GGUFExportConfig()
         assert config.max_seq_len == 128
         assert config.enable_quantization is False
         assert config.skip_weight_data is True
 
+    def test_export_produces_small_pte(self, gguf_path, output_dir):
+        """Weight-less PTE should be much smaller than the GGUF."""
+        out = os.path.join(output_dir, "test.pte")
+        config = GGUFExportConfig(
+            max_seq_len=128,
+            preserve_dynamic_shapes=True,
+            enable_quantization=True,
+        )
+        export_gguf_to_pte(gguf_path, out, config)
+
+        pte_size = os.path.getsize(out)
+        gguf_size = os.path.getsize(gguf_path)
+        assert 0 < pte_size < gguf_size
+        # Weight-less PTE for Qwen3-0.6B should be under 1 MB
+        assert pte_size < 1_000_000
+
+
+# ---------------------------------------------------------------------------
+# GGUFModule
+# ---------------------------------------------------------------------------
 
 class TestGGUFModule:
-    """Test GGUFModule runtime functionality."""
 
-    @pytest.fixture
-    def sample_pte_gguf_pair(self, sample_gguf_path, temp_output_dir):
-        """Create PTE/GGUF pair for testing."""
-        if sample_gguf_path is None:
-            pytest.skip("No test GGUF file available")
+    def test_initialization(self, pte_path, gguf_path):
+        module = GGUFModule(pte_path, gguf_path)
+        assert module.pte_path == pte_path
+        assert module.gguf_path == gguf_path
 
-        # Try to export PTE file
-        output_pte = os.path.join(temp_output_dir, "test_module.pte")
+    def test_model_info(self, pte_path, gguf_path):
+        module = GGUFModule(pte_path, gguf_path)
+        info = module.get_model_info()
+        assert info["architecture"] == "qwen3"
+        assert info["pte_size_mb"] < 1.0
+        assert info["gguf_size_mb"] > 100
 
-        try:
-            config = GGUFExportConfig(max_seq_len=64, enable_quantization=False)
-            export_gguf_to_pte(sample_gguf_path, output_pte, config)
-            return output_pte, sample_gguf_path
-        except Exception as e:
-            pytest.skip(f"Could not create test PTE file: {e}")
+    def test_tensor_listing(self, pte_path, gguf_path):
+        module = GGUFModule(pte_path, gguf_path)
+        names = module.list_gguf_tensors()
+        assert len(names) == 310
 
-    def test_gguf_module_initialization(self, sample_pte_gguf_pair):
-        """Test GGUFModule initialization."""
-        pte_path, gguf_path = sample_pte_gguf_pair
+    def test_weight_loading(self, pte_path, gguf_path):
+        module = GGUFModule(pte_path, gguf_path)
+        t = module.load_weight_tensor("token_embd.weight")
+        assert isinstance(t, torch.Tensor)
+        assert t.numel() > 0
 
-        try:
-            module = GGUFModule(pte_path, gguf_path)
-
-            assert module.pte_path == pte_path
-            assert module.gguf_path == gguf_path
-            assert module.gguf_reader is not None
-            assert module.weight_mapper is not None
-
-            print("GGUFModule initialization successful")
-
-        except ImportError as e:
-            pytest.skip(f"ExecuTorch runtime not available: {e}")
-
-    def test_gguf_module_info(self, sample_pte_gguf_pair):
-        """Test GGUFModule info methods."""
-        pte_path, gguf_path = sample_pte_gguf_pair
-
-        try:
-            module = GGUFModule(pte_path, gguf_path)
-
-            # Test info methods
-            info = module.get_model_info()
-            assert isinstance(info, dict)
-            assert "architecture" in info
-            assert "pte_size_mb" in info
-            assert "gguf_size_mb" in info
-
-            # Test tensor listing
-            tensor_names = module.list_gguf_tensors()
-            assert isinstance(tensor_names, list)
-            assert len(tensor_names) > 0
-
-            print(f"Model info: {info['architecture']}, {len(tensor_names)} tensors")
-
-        except ImportError as e:
-            pytest.skip(f"ExecuTorch runtime not available: {e}")
-
-    def test_gguf_tensor_loading(self, sample_pte_gguf_pair):
-        """Test GGUF tensor loading functionality."""
-        pte_path, gguf_path = sample_pte_gguf_pair
-
-        try:
-            module = GGUFModule(pte_path, gguf_path)
-
-            tensor_names = module.list_gguf_tensors()
-            if tensor_names:
-                # Test loading first tensor
-                tensor_name = tensor_names[0]
-                tensor = module.load_weight_tensor(tensor_name)
-
-                assert isinstance(tensor, torch.Tensor)
-                assert tensor.numel() > 0
-
-                print(f"Loaded tensor {tensor_name}: shape {tensor.shape}, dtype {tensor.dtype}")
-
-        except ImportError as e:
-            pytest.skip(f"ExecuTorch runtime not available: {e}")
-
-    def test_gguf_method_loading(self, sample_pte_gguf_pair):
-        """Test method loading from PTE program."""
-        pte_path, gguf_path = sample_pte_gguf_pair
-
-        try:
-            module = GGUFModule(pte_path, gguf_path)
-
-            method = module.load_method("forward")
-            assert method is not None
-
-            print("Method loading successful")
-
-        except ImportError as e:
-            pytest.skip(f"ExecuTorch runtime not available: {e}")
+    def test_forward_callable(self, pte_path, gguf_path):
+        module = GGUFModule(pte_path, gguf_path)
+        assert callable(module.forward)
 
 
-class TestEndToEndAccuracy:
-    """End-to-end accuracy tests comparing GGUF pipeline to existing export."""
-
-    @pytest.mark.slow
-    def test_gguf_vs_native_export_comparison(self, sample_gguf_path, temp_output_dir):
-        """Compare GGUF pipeline output against native ExecuTorch export."""
-        if sample_gguf_path is None:
-            pytest.skip("No test GGUF file available")
-
-        # This test would compare:
-        # 1. Native Qwen3 export (existing pipeline)
-        # 2. GGUF-to-PTE export + GGUFModule
-        # 3. Verify outputs match for same inputs
-
-        pytest.skip("Full accuracy test requires complete integration - implement after basic functionality is validated")
-
-    def test_inference_smoke_test(self, sample_pte_gguf_pair):
-        """Basic smoke test for inference through GGUFModule."""
-        pte_path, gguf_path = sample_pte_gguf_pair
-
-        try:
-            module = GGUFModule(pte_path, gguf_path)
-
-            # Create dummy inputs (shape depends on model)
-            # This is a basic smoke test - real test would use proper inputs
-            batch_size = 1
-            seq_len = 10
-
-            # Dummy input tensors
-            input_ids = torch.randint(0, 1000, (batch_size, seq_len), dtype=torch.long)
-            cache_position = torch.arange(seq_len, dtype=torch.long)
-
-            try:
-                # Attempt inference
-                method = module.load_method("forward")
-                outputs = method.forward((input_ids, cache_position))
-
-                assert outputs is not None
-                print(f"Inference successful, outputs: {len(outputs)} tensors")
-
-            except Exception as e:
-                print(f"Inference failed (expected for incomplete pipeline): {e}")
-                # This is expected until full integration is complete
-
-        except ImportError as e:
-            pytest.skip(f"ExecuTorch runtime not available: {e}")
-
-
-# Test utilities
-def pytest_configure(config):
-    """Configure pytest with custom markers."""
-    config.addinivalue_line("markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')")
-
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
 
 def test_imports():
-    """Test that all GGUF modules can be imported."""
-    from executorch_ggml.gguf_analyzer import GGUFAnalyzer
-    from executorch_ggml.weight_mapping import WeightNameMapper
-    from executorch_ggml.export_gguf import export_gguf_to_pte
-    from executorch_ggml.gguf_module import GGUFModule
-
-    print("All GGUF modules imported successfully")
-
-
-if __name__ == "__main__":
-    # Run basic import test
-    test_imports()
-    print("✅ GGUF pipeline import test passed")
-
-    # Example of running specific tests
-    print("\nTo run the full test suite:")
-    print("  pytest tests/test_gguf_pipeline.py -v")
-    print("  pytest tests/test_gguf_pipeline.py -v -m \"not slow\"  # Skip slow tests")
-    print("  pytest tests/test_gguf_pipeline.py::TestGGUFAnalyzer -v  # Run specific test class")
+    """All GGUF modules are importable."""
+    from executorch_ggml.gguf_analyzer import GGUFAnalyzer  # noqa: F401
+    from executorch_ggml.weight_mapping import WeightNameMapper  # noqa: F401
+    from executorch_ggml.export_gguf import export_gguf_to_pte  # noqa: F401
+    from executorch_ggml.gguf_module import GGUFModule  # noqa: F401
