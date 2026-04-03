@@ -592,6 +592,8 @@ static Error build_graph(
   // data pointer, different ne[]) with no compute kernel. Stripping
   // reduces per-node dispatch overhead and CUDA graph capture time.
   // The gallocr handles stripped tensors via src[] chain traversal.
+  // Note: PERMUTE/TRANSPOSE/VIEW cannot be stripped — the gallocr
+  // needs them for stride-aware memory allocation.
   // Safety: keep RESHAPE nodes that ARE graph outputs.
   {
     std::unordered_set<struct ggml_tensor*> output_set(

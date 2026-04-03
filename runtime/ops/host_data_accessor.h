@@ -152,23 +152,28 @@ static struct ggml_tensor* safe_ggml_cast(
     // I32->I64 as a graph op.  The output copy in execute() handles I32->Long.
     return i32;
   }
-  // Eager I32->F32 cast (avoids CUDA buffer aliasing in CPY).
-  // Input-derived tensors are also cast eagerly — has_input_derived_eager
-  // forces graph rebuilding so the values stay fresh across calls.
+  // I32->F32 cast: use eager for non-input-derived (avoids CUDA aliasing),
+  // use graph op (ggml_cast) for input-derived (enables graph caching —
+  // position-dependent mask/RoPE computations resolve at compute time
+  // instead of build time, eliminating input-derived eager constants).
   if (src->type == GGML_TYPE_I32 && target == GGML_TYPE_F32 && src->data) {
-    const void* src_data = acc ? acc->get(src) : src->data;
-    if (src_data) {
-      int64_t n = ggml_nelements(src);
-      ggml_set_no_alloc(ctx, false);
-      struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne);
-      ggml_set_no_alloc(ctx, true);
-      dst->op = GGML_OP_NONE;
-      if (acc) acc->propagate_derived(dst, src);
-      const int32_t* sd = static_cast<const int32_t*>(src_data);
-      float* dd = static_cast<float*>(dst->data);
-      for (int64_t i = 0; i < n; i++) dd[i] = static_cast<float>(sd[i]);
-      return dst;
+    bool is_derived = acc && acc->is_input_derived(src);
+    if (!is_derived) {
+      const void* src_data = acc ? acc->get(src) : src->data;
+      if (src_data) {
+        int64_t n = ggml_nelements(src);
+        ggml_set_no_alloc(ctx, false);
+        struct ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne);
+        ggml_set_no_alloc(ctx, true);
+        dst->op = GGML_OP_NONE;
+        if (acc) acc->propagate_derived(dst, src);
+        const int32_t* sd = static_cast<const int32_t*>(src_data);
+        float* dd = static_cast<float*>(dst->data);
+        for (int64_t i = 0; i < n; i++) dd[i] = static_cast<float>(sd[i]);
+        return dst;
+      }
     }
+    // Input-derived: fall through to ggml_cast graph op
   }
   // Everything else (F16/BF16/F32 inter-conversions) is natively supported
   return ggml_cast(ctx, src, target);

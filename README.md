@@ -60,7 +60,7 @@ GgmlBackendInterface       # C++ runtime: deserializes IR, builds ggml_cgraph,
 | Model | Type | Formats | Notes |
 |-------|------|---------|-------|
 | [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) | ASR | FP32, BF16, Q8_0 | 101 tok/s Q8_0 on A100; fused RoPE, RMS norm fold, SwiGLU fusion |
-| [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | LLM | FP32, Q8_0 | Text generation with KV cache, fused SDPA |
+| [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | LLM | FP32, Q8_0 | 410 tok/s Q8_0 on A100; GGUF pipeline support |
 | [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | ASR | FP32, Q8_0 | FastConformer encoder + TDT decoder |
 | MobileNetV2 | Vision | FP32 | Requires `BatchNormFoldingRewritePass` for Conv+BN |
 | Custom CNNs | Vision | FP32 | Conv2d, depthwise conv, pooling, activations |
@@ -200,6 +200,35 @@ Requires `optimum-executorch` for the export wrapper:
 ```bash
 pip install optimum[executorch]
 ```
+
+### GGUF Integration
+
+Run any GGUF model through the GGML backend: export a lightweight PTE (graph only, ~200 KB), load weights from the original GGUF at runtime. Zero overhead vs embedded weights.
+
+**Python:**
+```python
+from executorch_ggml import export_gguf_to_pte, GGUFExportConfig, GGUFModule
+
+# Export: GGUF -> weight-less PTE
+config = GGUFExportConfig(max_seq_len=128, preserve_dynamic_shapes=True, enable_quantization=True)
+export_gguf_to_pte("model.gguf", "model.pte", config)
+
+# Run: PTE (graph) + GGUF (weights)
+module = GGUFModule("model.pte", "model.gguf")
+out = module.forward(input_ids, cache_position)
+```
+
+**C++ benchmark:**
+```bash
+./build/benchmark/benchmark_llm model.pte --gguf model.gguf --n-decode 100
+```
+
+| Path | PTE Size | Decode tok/s | Notes |
+|------|----------|-------------|-------|
+| Weights in PTE | 762 MB | 410 | Single file |
+| GGUF (weights external) | 213 KB | 410 | Reuse existing GGUF files |
+
+Currently supports Qwen3 and Llama architectures. See [docs/gguf-integration.md](docs/gguf-integration.md) for the full API reference and how to add new architectures.
 
 ### Parakeet TDT 0.6B (Speech Recognition)
 

@@ -146,90 +146,15 @@ static inline struct ggml_tensor* build_op_index_put(BuildContext& bc) {
 
   struct ggml_tensor* gt = nullptr;
   if (is_mutable_dst) {
-    // The cpy path reads start_pos from idx at build time and bakes the
-    // offset into the view. When idx is input-derived (cache_position),
-    // the graph must be rebuilt each call. Create a small eager constant
-    // from the idx value to trigger has_input_derived_eager.
-    if (bc.input_derived.count(idx)) {
-      ggml_set_no_alloc(bc.ctx, false);
-      auto* pos_marker = ggml_new_tensor_1d(bc.ctx, GGML_TYPE_I32, 1);
-      ggml_set_no_alloc(bc.ctx, true);
-      pos_marker->op = GGML_OP_NONE;
-      if (idx->data) memcpy(pos_marker->data, bc.host_acc.get(idx), sizeof(int32_t));
-      bc.input_derived.insert(pos_marker);
-    }
-
+    // Use ggml_set_rows for all mutable-dst INDEX_PUT operations.
+    // This avoids baking position offsets into views at build time,
+    // which previously created input-derived eager constants and
+    // forced graph rebuilds on every decode step.
+    // ggml_set_rows handles dynamic indices at compute time.
     if (val->type != GGML_TYPE_F32) {
       val = safe_ggml_cast(bc.ctx, val, GGML_TYPE_F32, &bc.host_acc);
     }
-
-    int ndim = 4;
-    int ggml_scatter_axis = (ndim - 1) - idx_pos;
-    if (ggml_scatter_axis == 1) {
-      gt = ggml_set_rows(bc.ctx, dst, val, idx);
-    } else {
-      fprintf(stderr, "[KV_CACHE_DEBUG] idx tensor: type=%s, ne=[%ld,%ld,%ld,%ld], nbytes=%zu, data=%p, op=%d, buffer=%p\n",
-              ggml_type_name(idx->type), idx->ne[0], idx->ne[1], idx->ne[2], idx->ne[3], ggml_nbytes(idx),
-              idx->data, idx->op, (void*)idx->buffer);
-
-      int64_t start_pos;
-      if (idx->type == GGML_TYPE_I64) {
-        start_pos = bc.host_acc.read_i64(idx);
-        fprintf(stderr, "[KV_CACHE_DEBUG] read as I64: start_pos=%ld\n", start_pos);
-      } else if (idx->type == GGML_TYPE_I32) {
-        int32_t start_pos_i32 = bc.host_acc.read_i32(idx);
-        start_pos = static_cast<int64_t>(start_pos_i32);
-        fprintf(stderr, "[KV_CACHE_DEBUG] read as I32: start_pos_i32=%d -> start_pos=%ld\n", start_pos_i32, start_pos);
-      } else {
-        fprintf(stderr, "[KV_CACHE_DEBUG] ERROR: Unsupported index tensor type: %s\n", ggml_type_name(idx->type));
-        start_pos = 0;
-      }
-
-      const void* idx_data = bc.host_acc.get(idx);
-      if (idx_data && ggml_nbytes(idx) >= 4) {
-        const uint8_t* bytes = static_cast<const uint8_t*>(idx_data);
-        fprintf(stderr, "[KV_CACHE_DEBUG] idx raw bytes: %02x %02x %02x %02x\n",
-                bytes[0], bytes[1], bytes[2], bytes[3]);
-      }
-
-      int64_t seq_len_new = val->ne[ggml_scatter_axis];
-
-      fprintf(stderr, "[KV_CACHE_DEBUG] start_pos=%ld, seq_len_new=%ld, scatter_axis=%d\n",
-              start_pos, seq_len_new, ggml_scatter_axis);
-      fprintf(stderr, "[KV_CACHE_DEBUG] dst->nb[%d]=%zu, dst->ne[%d]=%ld\n",
-              ggml_scatter_axis, dst->nb[ggml_scatter_axis], ggml_scatter_axis, dst->ne[ggml_scatter_axis]);
-
-      if (start_pos < 0 || start_pos >= dst->ne[ggml_scatter_axis]) {
-        fprintf(stderr, "[KV_CACHE_ERROR] Invalid start_pos=%ld (must be in range [0, %ld))\n",
-                start_pos, dst->ne[ggml_scatter_axis]);
-        fprintf(stderr, "[KV_CACHE_ERROR] This suggests corrupted index tensor data\n");
-        return nullptr;
-      }
-
-      size_t offset_bytes = start_pos * dst->nb[ggml_scatter_axis];
-
-      fprintf(stderr, "[KV_CACHE_DEBUG] offset_bytes=%zu (0x%lx)\n", offset_bytes, offset_bytes);
-      int64_t view_ne[4];
-      for (int d = 0; d < 4; d++) view_ne[d] = dst->ne[d];
-      view_ne[ggml_scatter_axis] = seq_len_new;
-
-      auto* cache_slice = safe_ggml_view_4d(bc.ctx, dst,
-          view_ne[0], view_ne[1], view_ne[2], view_ne[3],
-          dst->nb[1], dst->nb[2], dst->nb[3], offset_bytes);
-      if (!cache_slice) {
-        fprintf(stderr, "KV cache scatter: view creation failed\n");
-        return nullptr;
-      }
-
-      auto* val_c = ensure_cont(bc.ctx, val);
-      auto* cpy = ggml_cpy(bc.ctx, val_c, cache_slice);
-      // cpy writes to cache_slice (a view of dst). Mark as output so
-      // ggml_build_forward_expand adds it to the graph. Without this,
-      // dst (a leaf) has no dependency on cpy, and the scheduler may
-      // read stale cache values before the write executes.
-      ggml_set_output(cpy);
-      gt = dst;
-    }
+    gt = ggml_set_rows(bc.ctx, dst, val, idx);
     ggml_set_output(gt);
   } else {
     struct ggml_tensor* args[3] = {dst, idx, val};

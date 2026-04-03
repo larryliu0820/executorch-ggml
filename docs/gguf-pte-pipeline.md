@@ -42,10 +42,11 @@ Runtime (C++):
 
 | Path | PTE Size | Decode tok/s | ms/tok |
 |------|----------|-------------|--------|
-| Baseline (weights in PTE) | 762 MB | 143.6 | 7.0 |
-| GGUF (weights external) | 213 KB | 142.3 | 7.0 |
+| Weights in PTE | 762 MB | 410 | 2.4 |
+| GGUF (weights external) | 213 KB | 410 | 2.4 |
 
-Zero overhead from GGUF weight loading.
+Zero overhead from GGUF weight loading. Graph caching enabled by INDEX_PUT
+and I32-to-F32 cast fixes that eliminated input-derived eager constants.
 
 ## Components
 
@@ -61,19 +62,7 @@ Zero overhead from GGUF weight loading.
 
 ## Next Steps
 
-### 1. Graph cache for dynamic shapes
-
-Both GGUF and baseline paths show `build=1.5ms` per decode step because
-`has_input_derived_eager=true` forces graph rebuild every call. With graph
-cache hitting, this drops to 0ms → estimated 280+ tok/s.
-
-**Root cause**: Some eager constants are transitively marked as input-derived
-during Phase B propagation. Need to identify which constants trigger this
-and either:
-- Make them non-input-derived (compute from model config, not input data)
-- Move them from eager constants to graph ops
-
-### 2. Expand architecture support
+### 1. Expand architecture support
 
 Currently Qwen3 only. To add a new architecture:
 1. Add mapping rules in `WeightNameMapper._ARCH_MAPPINGS`
