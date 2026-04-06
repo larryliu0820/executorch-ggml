@@ -150,6 +150,13 @@ class GgmlBackend(BackendDetails):
                     is_mutable = (fqn in ctx.mutated_buffer_fqns)
 
                     ir_type = _torch_dtype_to_ir_type(t_cpu.dtype)
+                    # skip_weight_data: only skip constants that the GGUF data
+                    # map can provide (actual model weights with a GGUF name).
+                    # Small scalars, lifted constants, and KV caches must
+                    # always be embedded — they don't exist in the GGUF file.
+                    has_gguf_source = (gguf_weight_map is not None and fqn in gguf_weight_map)
+                    skip_this = skip_weight_data and has_gguf_source
+
                     if quant_config is not None:
                         from executorch_ggml.quantize import (
                             should_quantize,
@@ -165,7 +172,7 @@ class GgmlBackend(BackendDetails):
                             quant_bytes = quantize_tensor(
                                 f32_data, quant_config.quant_type,
                             )
-                            if not skip_weight_data:
+                            if not skip_this:
                                 data_store.add_named_data(data_key, quant_bytes, alignment=64)
                             if quant_config.quant_type == GgmlQuantType.Q8_0:
                                 ir_type = TYPE_Q8_0
@@ -184,7 +191,7 @@ class GgmlBackend(BackendDetails):
                             node_to_id[node] = tid
                             continue
 
-                    if not skip_weight_data:
+                    if not skip_this:
                         data_store.add_named_data(data_key, t_cpu, alignment=64)
 
                     tid = alloc_id()

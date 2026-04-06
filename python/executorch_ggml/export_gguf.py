@@ -145,11 +145,14 @@ def _create_llama_model_from_config(config_dict: Dict[str, Any], max_seq_len: in
     return model
 
 
-def _apply_model_optimizations(model: torch.nn.Module) -> int:
+def _apply_model_optimizations(model: torch.nn.Module, skip_weight_data: bool = True) -> int:
     """Apply ExecuTorch-specific optimizations to the model.
 
     Args:
         model: PyTorch model to optimize
+        skip_weight_data: If True (GGUF external weights path), skip
+            fold_rms_norm_weights since the GGUF provides original weights
+            that haven't been folded.
 
     Returns:
         Number of optimizations applied
@@ -159,14 +162,19 @@ def _apply_model_optimizations(model: torch.nn.Module) -> int:
     # Import optimization passes
     try:
         from executorch_ggml.modules.rms_norm import swap_rms_norm
-        from executorch_ggml.passes.fold_rms_norm_weights import fold_rms_norm_weights
 
-        # Apply RMS norm optimizations
+        # Fuse decomposed RMSNorm into single op (graph-only, no weight change)
         n_rms = swap_rms_norm(model)
         optimizations_count += n_rms
 
-        n_fold = fold_rms_norm_weights(model)
-        optimizations_count += n_fold
+        # fold_rms_norm_weights modifies linear weight values (W *= norm_weight).
+        # Only safe when weights are embedded in the PTE. When using external
+        # GGUF weights, the GGUF provides the original unfolded weights, so
+        # folding the graph would create a mismatch.
+        if not skip_weight_data:
+            from executorch_ggml.passes.fold_rms_norm_weights import fold_rms_norm_weights
+            n_fold = fold_rms_norm_weights(model)
+            optimizations_count += n_fold
 
     except ImportError:
         pass
@@ -257,7 +265,7 @@ def export_gguf_to_pte(
     model = _create_pytorch_model_from_gguf_metadata(analyzer, export_config.max_seq_len)
 
     # Apply model optimizations
-    _apply_model_optimizations(model)
+    _apply_model_optimizations(model, skip_weight_data=True)
 
     # Export model to ExportedProgram
     exportable = CausalLMExportableModule(

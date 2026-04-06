@@ -898,7 +898,11 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
 
     auto fb = ndm->get_data(key);
     if (!fb.ok()) {
-      // Not in PTE or GGUF — zero-init.
+      // Not in PTE or GGUF — zero-init (e.g. KV cache init).
+      fprintf(stderr, "[ggml_backend] WARNING: key '%s' not found, zero-init %zu bytes "
+              "(type=%d ne=[%lld,%lld,%lld,%lld])\n",
+              key, nbytes, (int)t->type(),
+              (long long)ne[0], (long long)ne[1], (long long)ne[2], (long long)ne[3]);
       SavedConstant sc;
       sc.ir_tensor_id = t->id();
       sc.data.resize(nbytes, 0);
