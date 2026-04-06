@@ -48,10 +48,19 @@ def export_qwen3_q8(max_seq_len: int = 128):
     from executorch_ggml.modules.rms_norm import swap_rms_norm
     from executorch_ggml.passes.fold_rms_norm_weights import fold_rms_norm_weights
 
+    from executorch_ggml.passes.fuse_projections import (
+        fuse_qkv_projections,
+        fuse_gate_up_projections,
+    )
+
     n_rms = swap_rms_norm(eager_model)
     print(f"  swap_rms_norm: {n_rms} modules")
     n_fold = fold_rms_norm_weights(eager_model)
     print(f"  fold_rms_norm_weights: {n_fold} norms folded")
+    n_qkv = fuse_qkv_projections(eager_model)
+    print(f"  fuse_qkv_projections: {n_qkv} attention modules")
+    n_mlp = fuse_gate_up_projections(eager_model)
+    print(f"  fuse_gate_up_projections: {n_mlp} MLP modules")
 
     print("Exporting with torch.export...")
     exportable = CausalLMExportableModule(
@@ -73,6 +82,10 @@ def export_qwen3_q8(max_seq_len: int = 128):
     print(f"  fuse_rope: {n_rope} instances")
     n_gqa = strip_gqa_expand(ep.graph_module)
     print(f"  strip_gqa_expand: {n_gqa} expansions removed")
+
+    from executorch_ggml.passes.cse_pass import eliminate_common_subexpressions
+    n_cse = eliminate_common_subexpressions(ep.graph_module)
+    print(f"  CSE: {n_cse} duplicate nodes eliminated")
 
     print("Lowering with Q8_0 quantization...")
     t0 = time.time()

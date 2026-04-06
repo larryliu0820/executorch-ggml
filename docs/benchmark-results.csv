@@ -14,3 +14,5 @@ baseline (no optimizations),2844,,66,python,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
 + skip output copy + skip sync,602,1012,377,c++ (GGML_SKIP_OUTPUT_COPY=1),Qwen3-0.6B,A100-SXM4-40GB,Q8_0
 + graph cache fix (INDEX_PUT + I32→F32),597,1522,410,c++ (GGML_SKIP_OUTPUT_COPY=1),Qwen3-0.6B,A100-SXM4-40GB,Q8_0
 llama.cpp (reference),~700,1518,380,c++,Qwen3-0.6B,A100-SXM4-40GB,Q8_0
++ QKV + gate/up projection fusion,824,776,331,c++,Qwen3-0.6B,M4-Max,Q8_0
+llama.cpp (reference),~700,744,309,c++,Qwen3-0.6B,M4-Max,Q8_0

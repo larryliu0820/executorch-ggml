@@ -13,7 +13,12 @@ Decode throughput progression for **Qwen3-0.6B Q8_0 on A100-SXM4-40GB**:
 | + RMSNorm weight folding | 1418 | 4.8 | 209 | 0.62x |
 | + Mask conversion cache | 1310 | 4.3 | 231 | 0.69x |
 | + RESHAPE collapse + PERMUTE compose | 1142 | 3.6 | 280 | 0.74x |
+| + SiLU-gate fusion + view strip | 602 | 2.9 | 345 | 0.91x |
+| + Skip output copy + CUDA argmax | 602 | 2.6 | 411 | 1.08x |
+| + QKV + gate/up projection fusion | 824* | 2.4 | 411 | 1.08x |
 | **llama.cpp** (reference) | ~700 | ~2.6 | 380 | 1.0x |
+
+\* 824 includes zero-cost VIEW/RESHAPE metadata nodes; actual Metal/CUDA dispatches = 513.
 
 ## 1. Graph Cache (`GGML_GRAPH_CACHE=1`)
 
@@ -185,30 +190,58 @@ Nodes: 1310 -> 1142 (-13%).
 
 **Files**: `runtime/ggml_backend.cpp` (VIEW handler, `safe_ggml_permute`)
 
-## Remaining gap to llama.cpp
+## 9. QKV + Gate/Up Projection Fusion
 
-We have 1142 nodes vs llama.cpp's ~700. GPU compute time is identical (~1.7ms).
-The entire gap (~1.1ms) is CUDA graph replay overhead from extra nodes.
+**Problem**: Each transformer layer has 3 separate Q/K/V matmuls sharing the same
+input, and 2 separate gate/up matmuls sharing the same input. That's 5 matmuls
+per layer that could be 2 (28 layers × 3 saved = 84 MUL_MATs eliminated).
 
-The remaining ~440 extra nodes are **RESHAPE ops** from ggml's reversed dimension order.
-Each linear op requires `RESHAPE(flatten) → MUL_MAT → RESHAPE(unflatten) → RESHAPE(split_heads)`.
-llama.cpp avoids these by building tensors in the right layout via the C API.
+**Solution**: Pre-export `_SlicedLinear` module swap: concatenate the weight
+matrices into a single `nn.Parameter` shared across `_SlicedLinear` wrappers.
+Each wrapper computes `F.linear(x, shared_weight)[..., start:end].contiguous()`.
+After `torch.export`, a CSE (Common Subexpression Elimination) pass merges the
+duplicate linear calls into one linear + N slices.
 
-Closing this gap requires refactoring the C++ handlers (linear, attention, view) to
-minimize layout conversion nodes — essentially building the ggml graph more like
-llama.cpp does, while still consuming the ExecuTorch IR.
+```python
+from executorch_ggml.passes.fuse_projections import fuse_qkv_projections, fuse_gate_up_projections
+fuse_qkv_projections(model)   # 28 attention modules, Q+K+V → 1 matmul + 3 slices
+fuse_gate_up_projections(model)  # 28 MLP modules, gate+up → 1 matmul + 2 slices
+```
+
+Post-export CSE:
+```python
+from executorch_ggml.passes.cse_pass import eliminate_common_subexpressions
+eliminate_common_subexpressions(ep.graph_module)  # merges 86 duplicate nodes
+```
+
+**Result**: MUL_MAT 197 → 113 (−43%). Total graph nodes increase from 602 to 824
+due to zero-cost VIEW/RESHAPE metadata nodes from the slices; actual GPU kernel
+dispatches decrease from ~602 to ~513.
+
+On Metal (M4 Max): 323 → 331 tok/s (+2.5%, 111% of llama.cpp).
+On CUDA (A100): same 411 tok/s (dispatch overhead already eliminated by CUDA graphs).
+
+**GGUF support**: `GGUFNamedDataMap::try_fused_lookup()` concatenates separate
+GGUF tensors (e.g. `attn_q` + `attn_k` + `attn_v`) when the fused key is requested.
+
+**Files**: `python/executorch_ggml/passes/fuse_projections.py`,
+`python/executorch_ggml/passes/cse_pass.py`, `runtime/gguf_data_map.h`
 
 ## Full export pipeline
 
 ```python
 from executorch_ggml.modules.rms_norm import swap_rms_norm
 from executorch_ggml.passes.fold_rms_norm_weights import fold_rms_norm_weights
+from executorch_ggml.passes.fuse_projections import fuse_qkv_projections, fuse_gate_up_projections
 from executorch_ggml.passes.fuse_rope_pass import fuse_rope_in_graph
 from executorch_ggml.passes.strip_gqa_expand_pass import strip_gqa_expand
+from executorch_ggml.passes.cse_pass import eliminate_common_subexpressions
 
 # 1. Module swaps (before export)
 swap_rms_norm(model)
 fold_rms_norm_weights(model)
+fuse_qkv_projections(model)
+fuse_gate_up_projections(model)
 
 # 2. Export
 ep = exportable.export()["model"]
@@ -216,6 +249,7 @@ ep = exportable.export()["model"]
 # 3. AOT graph passes (before edge lowering)
 fuse_rope_in_graph(ep.graph_module, head_dim, freq_base)
 strip_gqa_expand(ep.graph_module)
+eliminate_common_subexpressions(ep.graph_module)
 
 # 4. Edge lowering (C++ handler applies RESHAPE collapse, PERMUTE compose,
 #    mask cache automatically)

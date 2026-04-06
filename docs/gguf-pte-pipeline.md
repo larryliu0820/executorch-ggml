@@ -38,15 +38,16 @@ Runtime (C++):
                   → inv_freq computed from GGUF metadata, KV caches zero-init'd
 ```
 
-## Performance (Qwen3-0.6B Q8_0, A100)
+## Performance (Qwen3-0.6B Q8_0)
 
-| Path | PTE Size | Decode tok/s | ms/tok |
-|------|----------|-------------|--------|
-| Weights in PTE | 762 MB | 410 | 2.4 |
-| GGUF (weights external) | 213 KB | 410 | 2.4 |
+| Path | PTE Size | A100 tok/s | M4 Max tok/s |
+|------|----------|----------:|-------------:|
+| Weights in PTE | 762 MB | 411 | 328 |
+| GGUF (weights external) | 213 KB | 411 | 331 |
+| llama.cpp | N/A | 380 | 299 |
 
-Zero overhead from GGUF weight loading. Graph caching enabled by INDEX_PUT
-and I32-to-F32 cast fixes that eliminated input-derived eager constants.
+Zero overhead from GGUF weight loading. QKV + gate/up projection fusion
+reduces MUL_MAT from 197 → 113. Graph caching eliminates rebuild overhead.
 
 ## Components
 

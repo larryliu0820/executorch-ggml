@@ -171,6 +171,20 @@ def _apply_model_optimizations(model: torch.nn.Module) -> int:
     except ImportError:
         pass
 
+    # Fuse parallel projections (after fold so folded weights get fused)
+    try:
+        from executorch_ggml.passes.fuse_projections import (
+            fuse_gate_up_projections,
+            fuse_qkv_projections,
+        )
+
+        n_qkv = fuse_qkv_projections(model)
+        n_mlp = fuse_gate_up_projections(model)
+        optimizations_count += n_qkv + n_mlp
+
+    except ImportError:
+        pass
+
     return optimizations_count
 
 
@@ -189,6 +203,14 @@ def _apply_graph_passes(ep, config_dict: Dict[str, Any]) -> None:
         # GQA optimization
         strip_gqa_expand(ep.graph_module)
 
+    except ImportError:
+        pass
+
+    # CSE: merge duplicate linears from fused projections
+    try:
+        from executorch_ggml.passes.cse_pass import eliminate_common_subexpressions
+
+        eliminate_common_subexpressions(ep.graph_module)
     except ImportError:
         pass
 
