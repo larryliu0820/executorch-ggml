@@ -185,6 +185,15 @@ with open("mobilenet_v2.pte", "wb") as f:
 
 ### Qwen3-0.6B (Text Generation)
 
+Qwen3-0.6B Q8_0 decode throughput:
+
+| Platform | executorch-ggml | llama.cpp | vs llama.cpp |
+|----------|----------------:|----------:|:-------------|
+| NVIDIA A100 | **411 tok/s** | 380 tok/s | **108%** |
+| Apple M4 Max | **323 tok/s** | 309 tok/s | **104%** |
+
+Pre-exported model: [larryliu0820/Qwen3-0.6B-Q8_0-ExecuTorch-GGML](https://huggingface.co/larryliu0820/Qwen3-0.6B-Q8_0-ExecuTorch-GGML)
+
 **Export:**
 ```bash
 # Q8_0 quantized
@@ -220,13 +229,13 @@ out = module.forward(input_ids, cache_position)
 
 **C++ benchmark:**
 ```bash
-./build/benchmark/benchmark_llm model.pte --gguf model.gguf --n-decode 100
+./build/benchmark/benchmark_llm model.pte --gguf model.gguf --n-decode 128
 ```
 
-| Path | PTE Size | Decode tok/s | Notes |
-|------|----------|-------------|-------|
-| Weights in PTE | 762 MB | 410 | Single file |
-| GGUF (weights external) | 213 KB | 410 | Reuse existing GGUF files |
+| Path | PTE Size | Decode tok/s (A100) | Decode tok/s (M4 Max) |
+|------|----------|--------------------:|----------------------:|
+| Weights in PTE | 762 MB | 411 | 323 |
+| GGUF (weights external) | 213 KB | 411 | 323 |
 
 Currently supports Qwen3 and Llama architectures. See [docs/gguf-integration.md](docs/gguf-integration.md) for the full API reference and how to add new architectures.
 
