@@ -1479,12 +1479,14 @@ Error GgmlBackendInterface::execute(
     ggml_backend_tensor_set(dst_i32, dst_buf.data(), 0, nelem * sizeof(int32_t));
   }
 
-  // --- Update SDPA dynamic masks ---
-  // On graph cache HIT, rewrite mask values for the current decode position.
-  // Cost: O(T_kv * T_q) F16 writes (~256 bytes for decode) — trivial
-  // compared to the 1.6ms graph rebuild it replaces.
+  // --- Update patchable KV views / masks ---
+  // Two modes: auto-slice (GGML_KV_SLICE=1) patches K/V ne[1];
+  // dynamic mask (default) rewrites mask values.  Detected by tensor type.
   if (!active->kv_views.empty()) {
+    bool is_auto_slice = (active->kv_views[0].tensor->type != GGML_TYPE_F16);
+    // Read cache_position from I32 inputs.
     std::vector<int32_t> positions;
+    int64_t kv_valid_len = 0;
     for (size_t i = 0; i < active->inputs.size(); i++) {
       auto* inp = active->inputs[i];
       if (inp->type != GGML_TYPE_I32) continue;
@@ -1494,11 +1496,19 @@ Error GgmlBackendInterface::execute(
       int32_t mx = 0;
       for (auto val : buf) mx = std::max(mx, val);
       if (mx < active->kv_views[0].max_ne1) {
+        kv_valid_len = mx + 1;
         positions = std::move(buf);
         break;
       }
     }
-    if (!positions.empty()) {
+    if (is_auto_slice) {
+      // Patch K/V view ne[1] to kv_valid_len (zero overhead).
+      if (kv_valid_len > 0) {
+        for (auto& kv : active->kv_views)
+          kv.tensor->ne[1] = kv_valid_len;
+      }
+    } else if (!positions.empty()) {
+      // Rewrite mask values (~256 bytes for decode).
       const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
       const ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-65504.0f);
       for (auto& dm : active->kv_views) {
