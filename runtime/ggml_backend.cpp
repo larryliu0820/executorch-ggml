@@ -1459,22 +1459,8 @@ Error GgmlBackendInterface::execute(
     std::vector<int64_t> src_buf(nelem);
     ggml_backend_tensor_get(src_i64, src_buf.data(), 0, nelem * sizeof(int64_t));
     std::vector<int32_t> dst_buf(nelem);
-
-    // Debug: Log I64→I32 conversion details
-    fprintf(stderr, "[I64_TO_I32_DEBUG] Converting %zu elements\n", nelem);
     for (size_t j = 0; j < nelem; ++j) {
-      int64_t src_val = src_buf[j];
-      int32_t dst_val = static_cast<int32_t>(src_val);
-      dst_buf[j] = dst_val;
-
-      // Log suspicious conversions
-      if (src_val != (int64_t)dst_val || src_val < INT32_MIN || src_val > INT32_MAX) {
-        fprintf(stderr, "[I64_TO_I32_DEBUG] SUSPICIOUS: src_i64=%ld -> dst_i32=%d (element %zu)\n",
-                src_val, dst_val, j);
-      } else if (j < 4) {  // Log first few for normal cases
-        fprintf(stderr, "[I64_TO_I32_DEBUG] Normal: src_i64=%ld -> dst_i32=%d (element %zu)\n",
-                src_val, dst_val, j);
-      }
+      dst_buf[j] = static_cast<int32_t>(src_buf[j]);
     }
     ggml_backend_tensor_set(dst_i32, dst_buf.data(), 0, nelem * sizeof(int32_t));
   }
