@@ -1453,16 +1453,44 @@ Error GgmlBackendInterface::execute(
   auto t_input_copy = std::chrono::high_resolution_clock::now();
 
   // --- Deferred I64→I32 casts ---
-  for (const auto& [src_i64, dst_i32] : active->deferred_i64_to_i32) {
-    if (src_i64->buffer == nullptr || dst_i32->buffer == nullptr) continue;
-    const size_t nelem = ggml_nelements(src_i64);
-    std::vector<int64_t> src_buf(nelem);
-    ggml_backend_tensor_get(src_i64, src_buf.data(), 0, nelem * sizeof(int64_t));
-    std::vector<int32_t> dst_buf(nelem);
-    for (size_t j = 0; j < nelem; ++j) {
-      dst_buf[j] = static_cast<int32_t>(src_buf[j]);
+  // Populate I32 shadow tensors from the ExecuTorch Long inputs directly
+  // (CPU→GPU only, no GPU→CPU sync).  The input copy above already set
+  // the I64 source tensor, but we can read the original Long data from
+  // the ExecuTorch args to avoid the GPU round-trip.
+  if (!active->deferred_i64_to_i32.empty()) {
+    // Build a map from I64 source tensor → ExecuTorch arg index.
+    std::unordered_map<struct ggml_tensor*, size_t> i64_to_arg;
+    {
+      size_t ggml_idx = 0;
+      for (size_t a = 0; a < n_non_output_args && ggml_idx < n_inputs; ++a) {
+        if (!args[a]->isTensor()) continue;
+        struct ggml_tensor* gt = active->inputs[ggml_idx++];
+        if (gt->type == GGML_TYPE_I64) {
+          i64_to_arg[gt] = a;
+        }
+      }
     }
-    ggml_backend_tensor_set(dst_i32, dst_buf.data(), 0, nelem * sizeof(int32_t));
+    for (const auto& [src_i64, dst_i32] : active->deferred_i64_to_i32) {
+      if (dst_i32->buffer == nullptr) continue;
+      auto it = i64_to_arg.find(src_i64);
+      if (it != i64_to_arg.end()) {
+        // Fast path: read from ExecuTorch CPU tensor (no GPU sync).
+        const auto& et_tensor = args[it->second]->toTensor();
+        const int64_t* src = static_cast<const int64_t*>(et_tensor.const_data_ptr());
+        const size_t nelem = ggml_nelements(dst_i32);
+        std::vector<int32_t> dst_buf(nelem);
+        for (size_t j = 0; j < nelem; ++j) dst_buf[j] = static_cast<int32_t>(src[j]);
+        ggml_backend_tensor_set(dst_i32, dst_buf.data(), 0, nelem * sizeof(int32_t));
+      } else if (src_i64->buffer) {
+        // Fallback: GPU round-trip (shouldn't happen for inputs).
+        const size_t nelem = ggml_nelements(src_i64);
+        std::vector<int64_t> src_buf(nelem);
+        ggml_backend_tensor_get(src_i64, src_buf.data(), 0, nelem * sizeof(int64_t));
+        std::vector<int32_t> dst_buf(nelem);
+        for (size_t j = 0; j < nelem; ++j) dst_buf[j] = static_cast<int32_t>(src_buf[j]);
+        ggml_backend_tensor_set(dst_i32, dst_buf.data(), 0, nelem * sizeof(int32_t));
+      }
+    }
   }
 
   // --- Update patchable KV views / masks ---
