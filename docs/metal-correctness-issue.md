@@ -1,6 +1,6 @@
 # Metal Correctness Issue: PTE Output Diverges from Eager PyTorch
 
-## Status: Open
+## Status: Fixed
 
 The ggml backend produces incorrect logits on the very first forward call (prefill).
 This is a pre-existing issue affecting all backends (Metal, CUDA, CPU), not specific
@@ -38,18 +38,33 @@ fundamental compute error in one or more ops.
 5. **Static cache handling** — `TorchExportableModuleWithStaticCache` works correctly
    in eager PyTorch; the cache is properly registered as mutable buffers in the export
 
-## Likely root causes (to investigate)
+## Root cause
 
-The issue is somewhere in the ggml backend's op handlers. Candidates:
+Two bugs in the SDPA handler's KV cache auto-slice logic
+(`runtime/ops/ops_special.h`, `build_op_llama_attention`):
 
-1. **SDPA / Flash Attention** — the ggml `FLASH_ATTN_EXT` handler might interpret
-   the causal mask or KV layout differently from PyTorch's `F.scaled_dot_product_attention`
-2. **Embedding lookup** — the `GET_ROWS` handler might have a shape/stride mismatch
-3. **RMSNorm** — if epsilon or weight handling differs from PyTorch's `aten.rms_norm`
-4. **Linear / MUL_MAT** — weight transposition mismatch between PyTorch [out, in]
-   and ggml's reversed dimension order
-5. **View/Reshape** — the ggml reversed dimension order might cause incorrect
-   head splitting in the attention forward
+1. **Wrong input matched as cache_position.** The code found the first I32 input
+   with `nelements == seq_len` and treated it as the position tensor. But
+   `token_ids` (input 0) also matches that criteria. Token IDs have values like
+   128006, far exceeding the cache size (~2048), so `kv_valid_len` became huge,
+   the auto-slice condition `kv_valid_len < k->ne[1]` failed, and K/V remained
+   at full cache size. Since `T_q < T_kv`, causal masking was disabled. SDPA
+   then attended over ~2048 positions (mostly zeros) without a causal mask,
+   diluting the output to near-zero and producing uncorrelated logits.
+
+2. **Wrong `kv_valid_len` formula.** `max_pos + q->ne[1]` should be
+   `max_pos + 1`. For prefill with positions [0,1,2,3,4]: max_pos=4, correct
+   kv_valid_len=5, but the old formula gave 9.
+
+**Fix (ops_special.h + ops_indexing.h):**
+1. SDPA: detect KV cache via mutable_buf walk (VIEW/RESHAPE/REPEAT/CONT/CUSTOM ops)
+2. SDPA: build proper causal+position mask from cache_position input, replacing
+   model's broadcast mask that lacks per-query causality
+3. SDPA: filter position input candidates by `max_pos < cache_size` (skips token IDs)
+4. SDPA: expand broadcast masks for flash_attn_ext compatibility (ne[1] >= T_q)
+5. INDEX_PUT: use `ggml_custom_inplace` with scatter callback for mutable caches
+   (writes directly to mutable_buf, preserving prior positions; creates proper
+   graph dependency so SDPA waits for the write)
 
 ## How to debug
 
