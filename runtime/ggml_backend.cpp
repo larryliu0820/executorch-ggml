@@ -1481,7 +1481,8 @@ Error GgmlBackendInterface::execute(
 
   // --- Update SDPA dynamic masks ---
   // On graph cache HIT, rewrite mask values for the current decode position.
-  // The mask shape is fixed (T_kv, T_q) — only VALUES change per step.
+  // Cost: O(T_kv * T_q) F16 writes (~256 bytes for decode) — trivial
+  // compared to the 1.6ms graph rebuild it replaces.
   if (!active->kv_views.empty()) {
     std::vector<int32_t> positions;
     for (size_t i = 0; i < active->inputs.size(); i++) {

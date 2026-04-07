@@ -27,11 +27,10 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
     memcpy(&ic, bc.ir_tensor->op_params()->data(), sizeof(int32_t));
     is_causal = (ic != 0);
   }
-  // For decoder SDPA with KV cache (T_q < T_kv): the KV cache is already
-  // sliced to valid positions [0, start_pos+seq_len), so causality is enforced
-  // by construction. Disable causal masking to avoid numerical divergence
-  // between PyTorch's is_causal=True GQA SDPA and ggml_flash_attn_ext.
-  // Keep causal masking for encoder self-attention (T_q == T_kv) where it's needed.
+  const bool is_causal_orig = is_causal;
+  // For non-cache attention (encoder self-attn, cross-attn): disable causal
+  // when T_q < T_kv.  For KV-cache paths, is_causal is re-evaluated after
+  // auto-slice (below) so this early check only affects non-cache cases.
   if (is_causal && q->ne[1] < k->ne[1]) {
     is_causal = false;
   }
@@ -164,11 +163,18 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
       }
     }
     if (kv_valid_len > 0 && kv_valid_len < k->ne[1]) {
-      // Full-cache + dynamic mask approach: attend to ALL T_kv positions
-      // but mask out invalid ones.  We can't auto-slice K/V because
-      // ggml_set_rows has no graph edge to SDPA — the scheduler could
-      // reorder reads before writes.  The full-cache mask is updated
-      // per-call in execute() without graph rebuild.
+      // Auto-slice K/V to valid positions [0, kv_valid_len) — like llama.cpp.
+      // The IR has an explicit dependency from INDEX_PUT (ggml_set_rows) to
+      // SDPA through id_to_tensor, so the scheduler cannot reorder reads
+      // before writes.  K/V views reference mutable_buf (allocated for
+      // max_seq_len), so any ne[1] ≤ max is safe.  execute() patches ne[1]
+      // per-call without graph rebuild.
+      // Full-cache + dynamic mask: attend to all T_kv positions with a
+      // causal+position mask that blocks uninitialized entries.  The mask
+      // is updated per-call in execute() without graph rebuild.
+      // Auto-slice was ruled out because flash_attn_ext requires contiguous
+      // masks (nb[1]==ne[0]*elem_size) — a mask sized to kv_valid_len
+      // changes shape every step and can't be graph-cached.
       int64_t T_kv = k->ne[1];
       int64_t T_q  = q->ne[1];
       ggml_set_no_alloc(bc.ctx, false);
@@ -198,7 +204,7 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
       }
       mask = new_mask;
       is_causal = false;
-      bc.gi->kv_views.push_back({new_mask, T_kv});  // reuse kv_views for mask update
+      bc.gi->kv_views.push_back({new_mask, T_kv});
     }
   }
 
