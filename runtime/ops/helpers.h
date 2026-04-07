@@ -570,4 +570,34 @@ static void resolve_ir_shape(
   if (n_dims == 0) n_dims = 1;
 }
 
+// Resolve shape from cached IR tensor (no FlatBuffer access).
+static void resolve_cached_shape(
+    const CachedIRTensor& ct,
+    const int64_t* input_ne_overrides,
+    const std::unordered_map<int32_t, int64_t>& sym_dim_values,
+    int64_t ne[4],
+    int& n_dims) {
+  ne[0] = ct.ne[0]; ne[1] = ct.ne[1]; ne[2] = ct.ne[2]; ne[3] = ct.ne[3];
+  if (ct.has_sym_dims) {
+    for (int d = 0; d < 4; ++d) {
+      int32_t sid = ct.sym_dim_ids[d];
+      if (sid == -1) continue;
+      if (ct.is_input && input_ne_overrides && sid >= 0) {
+        ne[d] = input_ne_overrides[ct.input_index * 4 + d];
+      } else if (!ct.is_input && sid == -2 && !ct.sym_dim_exprs[d].bytecode.empty()) {
+        ne[d] = eval_sym_expr(ct.sym_dim_exprs[d].bytecode.data(),
+                              ct.sym_dim_exprs[d].bytecode.size(), sym_dim_values);
+      } else if (!ct.is_input && sid >= 0) {
+        auto it = sym_dim_values.find(sid);
+        if (it != sym_dim_values.end()) ne[d] = it->second;
+      }
+    }
+  }
+  n_dims = 4;
+  for (int d = 3; d >= 1; --d) {
+    if (ne[d] == 1) { n_dims = d; } else { break; }
+  }
+  if (n_dims == 0) n_dims = 1;
+}
+
 } // namespace executorch_ggml

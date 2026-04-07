@@ -76,6 +76,65 @@ using executorch::runtime::Span;
 
 namespace {
 
+// Parse FlatBuffer IR into CachedIRTensor vector (once, reused on every rebuild).
+static void populate_ir_cache(GgmlDelegateHandle* handle) {
+  const auto* fb_graph = ggml_ir::GetGgmlGraph(handle->ir_copy.data());
+  if (!fb_graph || !fb_graph->tensors()) return;
+  const auto* fb_tensors = fb_graph->tensors();
+  const int n = static_cast<int>(fb_tensors->size());
+  handle->ir_cache.resize(n);
+  for (int i = 0; i < n; ++i) {
+    const auto* t = fb_tensors->Get(i);
+    auto& ct = handle->ir_cache[i];
+    ct.id = t->id();
+    ct.op = static_cast<int>(t->op());
+    ct.ir_type = static_cast<int>(t->type());
+    ct.ne[0] = ct.ne[1] = ct.ne[2] = ct.ne[3] = 1;
+    if (t->ne()) {
+      for (size_t d = 0; d < t->ne()->size() && d < 4; ++d)
+        ct.ne[d] = t->ne()->Get(d);
+    }
+    ct.n_dims = 4;
+    for (int d = 3; d >= 1; --d) {
+      if (ct.ne[d] == 1) ct.n_dims = d; else break;
+    }
+    if (ct.n_dims == 0) ct.n_dims = 1;
+    ct.is_input = t->is_input();
+    ct.is_output = t->is_output();
+    ct.input_index = t->input_index();
+    ct.data_key = (t->data_key() && t->data_key()->c_str()) ? t->data_key()->c_str() : "";
+    ct.elem_size = t->elem_size();
+    if (t->op_params() && t->op_params()->size() > 0) {
+      ct.op_params.assign(t->op_params()->data(),
+                          t->op_params()->data() + t->op_params()->size());
+    }
+    if (t->src_ids()) {
+      ct.src_ids.resize(t->src_ids()->size());
+      for (size_t s = 0; s < t->src_ids()->size(); ++s)
+        ct.src_ids[s] = t->src_ids()->Get(s);
+    }
+    ct.has_sym_dims = false;
+    ct.sym_dim_ids[0] = ct.sym_dim_ids[1] = ct.sym_dim_ids[2] = ct.sym_dim_ids[3] = -1;
+    if (t->sym_dim_ids()) {
+      for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
+        ct.sym_dim_ids[d] = t->sym_dim_ids()->Get(d);
+        if (ct.sym_dim_ids[d] != -1) ct.has_sym_dims = true;
+      }
+      // Cache bytecode for expression dims (sym_dim_id == -2)
+      if (t->sym_dim_exprs()) {
+        for (size_t d = 0; d < 4; ++d) {
+          if (ct.sym_dim_ids[d] == -2) {
+            const uint8_t* code = nullptr; size_t code_len = 0;
+            if (get_dim_expr_bytecode(t->sym_dim_exprs(), d, code, code_len)) {
+              ct.sym_dim_exprs[d].bytecode.assign(code, code + code_len);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 // input_ne_overrides: nullptr on first call (use serialized shapes).
 //   In M2+ this will carry runtime shapes for dynamic dims.
 // n_overrides: number of int64_t values (n_inputs × 4).
@@ -118,38 +177,31 @@ static Error build_graph(
   gi->outputs.clear();
   gi->deferred_i64_to_i32.clear();
 
-  // --- Parse IR from the saved copy ---
+  // --- Parse IR (first call) or reuse cached parse ---
   auto t_bg_start = std::chrono::high_resolution_clock::now();
-  const auto* fb_graph = ggml_ir::GetGgmlGraph(handle->ir_copy.data());
-  if (!fb_graph || !fb_graph->tensors()) {
-    return Error::InvalidArgument;
+  if (handle->ir_cache.empty()) {
+    populate_ir_cache(handle);
+    if (handle->ir_cache.empty()) return Error::InvalidArgument;
   }
-  const auto* fb_tensors = fb_graph->tensors();
-  const int n_tensors = static_cast<int>(fb_tensors->size());
+  const auto& ir_cache = handle->ir_cache;
+  const int n_tensors = static_cast<int>(ir_cache.size());
 
   // === Phase A: calculate ctx size, create ggml context ===
-  // Context only needs tensor metadata + graph structure.
-  // Actual tensor data is allocated by gallocr (backend scheduler) or by
-  // a temporary CPU host buffer for leaf tensors (constants / inputs).
 
-  // Estimate graph size: 4× the IR tensors to account for compound ops.
   size_t est_graph_size = static_cast<size_t>(n_tensors) * 4;
   if (est_graph_size < GGML_DEFAULT_GRAPH_SIZE) {
     est_graph_size = GGML_DEFAULT_GRAPH_SIZE;
   }
 
-  // Build sym_dim_values early: needed for shape-aware eager size estimation.
-  // Maps symbolic variable ID → runtime concrete value from input tensors.
+  // Build sym_dim_values from cached IR (no FlatBuffer access).
   std::unordered_map<int32_t, int64_t> sym_dim_values;
   if (input_ne_overrides) {
-    for (int i = 0; i < n_tensors; ++i) {
-      const auto* ti = fb_tensors->Get(i);
-      if (!ti->is_input() || !ti->sym_dim_ids() || !ti->ne()) continue;
-      int input_idx = ti->input_index();
-      for (size_t d = 0; d < ti->sym_dim_ids()->size() && d < 4; ++d) {
-        int32_t sid = ti->sym_dim_ids()->Get(d);
+    for (const auto& ct : ir_cache) {
+      if (!ct.is_input || !ct.has_sym_dims) continue;
+      for (int d = 0; d < 4; ++d) {
+        int32_t sid = ct.sym_dim_ids[d];
         if (sid >= 0) {
-          sym_dim_values[sid] = input_ne_overrides[input_idx * 4 + d];
+          sym_dim_values[sid] = input_ne_overrides[ct.input_index * 4 + d];
         }
       }
     }
@@ -163,36 +215,27 @@ static Error build_graph(
   }
 
   // Eager ops create data-filled leaf tensors during op dispatch, allocated
-  // from the context pool. Use serialized elem_size metadata to compute
-  // accurate data sizes from resolved runtime shapes.
+  // from the context pool.  Uses cached IR (no FlatBuffer access).
   size_t eager_data_estimate = 0;
   std::unordered_set<uint64_t> seen_causal_masks;
   for (int i = 0; i < n_tensors; ++i) {
-    const auto* t = fb_tensors->Get(i);
-    uint8_t elem_size = t->elem_size();
-
-    if (elem_size > 0) {
-      // Resolve shape using tensor's own ne + sym_dim_ids
+    const auto& ct = ir_cache[i];
+    if (ct.elem_size > 0) {
       int64_t ne[4]; int nd;
-      resolve_ir_shape(t, input_ne_overrides, sym_dim_values, ne, nd);
-      eager_data_estimate += (size_t)ne[0] * ne[1] * ne[2] * ne[3] * elem_size;
+      resolve_cached_shape(ct, input_ne_overrides, sym_dim_values, ne, nd);
+      eager_data_estimate += (size_t)ne[0] * ne[1] * ne[2] * ne[3] * ct.elem_size;
       continue;
     }
-
-    // Runtime special case: LLAMA_ATTENTION causal mask [T_kv, T_q] × F16.
-    // Masks are cached per unique (T_kv, T_q) shape, so only count once.
-    if (static_cast<ggml_ir::OpCode>(t->op()) == ggml_ir::OpCode::LLAMA_ATTENTION) {
+    if (static_cast<ggml_ir::OpCode>(ct.op) == ggml_ir::OpCode::LLAMA_ATTENTION) {
       bool is_causal = false;
-      if (t->op_params() && t->op_params()->size() >= 4) {
-        int32_t ic; memcpy(&ic, t->op_params()->data(), sizeof(int32_t));
+      if (ct.op_params.size() >= 4) {
+        int32_t ic; memcpy(&ic, ct.op_params.data(), sizeof(int32_t));
         is_causal = (ic != 0);
       }
-      if (is_causal && t->src_ids() && t->src_ids()->size() >= 2) {
+      if (is_causal && ct.src_ids.size() >= 2) {
         int64_t q_ne[4], k_ne[4]; int qnd, knd;
-        resolve_ir_shape(fb_tensors->Get(t->src_ids()->Get(0)),
-                         input_ne_overrides, sym_dim_values, q_ne, qnd);
-        resolve_ir_shape(fb_tensors->Get(t->src_ids()->Get(1)),
-                         input_ne_overrides, sym_dim_values, k_ne, knd);
+        resolve_cached_shape(ir_cache[ct.src_ids[0]], input_ne_overrides, sym_dim_values, q_ne, qnd);
+        resolve_cached_shape(ir_cache[ct.src_ids[1]], input_ne_overrides, sym_dim_values, k_ne, knd);
         uint64_t mask_key = ((uint64_t)k_ne[1] << 32) | (uint64_t)q_ne[1];
         if (seen_causal_masks.insert(mask_key).second) {
           eager_data_estimate += (size_t)k_ne[1] * q_ne[1] * sizeof(ggml_fp16_t);
@@ -226,8 +269,8 @@ static Error build_graph(
   }
   auto t_bg_phaseA = std::chrono::high_resolution_clock::now();
 
-  // Clear dynamic masks from previous build (rebuild populates fresh ones).
-  gi->sdpa_masks.clear();
+  // Clear patchable KV views from previous build (rebuild populates fresh ones).
+  gi->kv_views.clear();
 
   // --- Create per-graph scheduler (first build only) ---
   // Preserved across rebuilds for gallocr buffer reuse. Only created once
@@ -280,18 +323,13 @@ static Error build_graph(
   std::unordered_set<struct ggml_tensor*> input_derived;
   // sym_dim_values already built above (Phase A, before ggml_init).
 
-  // --- Shape resolution helper (shared by leaf and op passes) ---
-  auto resolve_shape = [&](const ggml_ir::Tensor* t, int64_t ne[4], int& n_dims) {
-    resolve_ir_shape(t, input_ne_overrides, sym_dim_values, ne, n_dims);
-  };
-
   // --- IR type → ggml type helper ---
-  auto resolve_gtype = [](const ggml_ir::Tensor* t) -> ggml_type {
-    switch (t->type()) {
+  auto resolve_gtype_int = [](int ir_type) -> ggml_type {
+    switch (static_cast<ggml_ir::TensorType>(ir_type)) {
       case ggml_ir::TensorType::F16:  return GGML_TYPE_F16;
       case ggml_ir::TensorType::I64:  return GGML_TYPE_I64;
       case ggml_ir::TensorType::I32:  return GGML_TYPE_I32;
-      case ggml_ir::TensorType::BOOL: return GGML_TYPE_I32;  // stored as I32
+      case ggml_ir::TensorType::BOOL: return GGML_TYPE_I32;
       case ggml_ir::TensorType::BF16: return GGML_TYPE_BF16;
       case ggml_ir::TensorType::Q8_0: return GGML_TYPE_Q8_0;
       case ggml_ir::TensorType::Q6_K: return GGML_TYPE_Q6_K;
@@ -306,12 +344,12 @@ static Error build_graph(
     size_t total_leaf_data = 0;
     const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
     for (int i = 0; i < n_tensors; ++i) {
-      const auto* t = fb_tensors->Get(i);
-      if (static_cast<ggml_ir::OpCode>(t->op()) != ggml_ir::OpCode::NONE) continue;
-      if (handle->leaf_buf_map.count(t->id())) continue;  // shared buffer
-      int64_t leaf_ne[4] = {1,1,1,1}; int leaf_ndims;
-      resolve_shape(t, leaf_ne, leaf_ndims);
-      ggml_type gtype = resolve_gtype(t);
+      const auto& ct = ir_cache[i];
+      if (static_cast<ggml_ir::OpCode>(ct.op) != ggml_ir::OpCode::NONE) continue;
+      if (handle->leaf_buf_map.count(ct.id)) continue;
+      int64_t leaf_ne[4]; int leaf_ndims;
+      resolve_cached_shape(ct, input_ne_overrides, sym_dim_values, leaf_ne, leaf_ndims);
+      ggml_type gtype = resolve_gtype_int(ct.ir_type);
       size_t tensor_bytes = ggml_row_size(gtype, leaf_ne[0]) * leaf_ne[1] * leaf_ne[2] * leaf_ne[3];
       // Match ggml_tallocr_alloc: GGML_PAD(alloc_size, alignment)
       size_t padded = ((tensor_bytes + alignment - 1) / alignment) * alignment;
@@ -331,6 +369,12 @@ static Error build_graph(
     ggml_backend_buffer_clear(host_buf, 0);
   }
   struct ggml_tallocr tallocr = ggml_tallocr_new(host_buf);
+
+  // Keep FlatBuffer accessible for build_op dispatch (ir_tensor in BuildContext).
+  // All shape/type resolution uses ir_cache — FlatBuffer is only needed for
+  // bc.ir_tensor pointer in the op switch (accessed by build_op_* helpers).
+  const auto* fb_graph = ggml_ir::GetGgmlGraph(handle->ir_copy.data());
+  const auto* fb_tensors = fb_graph->tensors();
 
   // === Phase B: single-pass tensor creation loop ===
   if (verbose) { fprintf(stderr, "[ggml_backend] Phase B: creating tensors (single pass)...\n"); fflush(stderr); }
@@ -352,17 +396,18 @@ static Error build_graph(
   std::unordered_map<uint64_t, struct ggml_tensor*> causal_mask_cache;
   int last_processed = -1;
   for (int i = 0; i < n_tensors; ++i) {
-    const auto* t = fb_tensors->Get(i);
-    const int tid = t->id();
-    const auto op = static_cast<ggml_ir::OpCode>(t->op());
+    const auto& ct = ir_cache[i];
+    const int tid = ct.id;
+    const auto op = static_cast<ggml_ir::OpCode>(ct.op);
     s_last_processed = i;
-    // (debug removed)
-    int64_t ne[4] = {1,1,1,1}; int n_dims = 4;
-    resolve_shape(t, ne, n_dims);
+
+    // Resolve shape from cached IR (no FlatBuffer access).
+    int64_t ne[4]; int n_dims;
+    resolve_cached_shape(ct, input_ne_overrides, sym_dim_values, ne, n_dims);
 
     if (op == ggml_ir::OpCode::NONE) {
-      // --- Leaf tensor: create, allocate from host buffer, load data ---
-      ggml_type gtype = resolve_gtype(t);
+      // --- Leaf tensor ---
+      ggml_type gtype = resolve_gtype_int(ct.ir_type);
       struct ggml_tensor* gt = nullptr;
       switch (n_dims) {
         case 1:  gt = ggml_new_tensor_1d(ctx, gtype, ne[0]); break;
@@ -370,23 +415,16 @@ static Error build_graph(
         case 3:  gt = ggml_new_tensor_3d(ctx, gtype, ne[0], ne[1], ne[2]); break;
         default: gt = ggml_new_tensor_4d(ctx, gtype, ne[0], ne[1], ne[2], ne[3]); break;
       }
-      // Check if this leaf has a pre-allocated slot in const_buf or mutable_buf.
       auto it = handle->leaf_buf_map.find(tid);
       if (it != handle->leaf_buf_map.end()) {
         auto& slot = it->second;
-        // Both const and mutable leaves point directly at their shared buffer.
-        // mutable_buf is allocated on CPU, so custom inplace ops write directly
-        // into it without scheduler copy-buffer aliasing issues.
         gt->data = static_cast<char*>(ggml_backend_buffer_get_base(slot.buf)) + slot.offset;
         gt->buffer = slot.buf;
-        ggml_set_input(gt);  // tell scheduler to skip this tensor
+        ggml_set_input(gt);
         shared_leaves.push_back({gt, slot.buf, slot.offset});
       } else {
-        // Input tensors and any other leaves without data_key: allocate from host buffer.
         ggml_tallocr_alloc(&tallocr, gt);
-
-        // Load constant data from handle->constant_data (populated by init()).
-        if (t->data_key() && t->data_key()->c_str() && std::strlen(t->data_key()->c_str()) > 0) {
+        if (!ct.data_key.empty()) {
           const size_t nbytes = ggml_nbytes(gt);
           for (const auto& sc : handle->constant_data) {
             if (sc.ir_tensor_id == tid) {
@@ -396,57 +434,51 @@ static Error build_graph(
           }
         }
       }
-
-      // Pre-populate input tensor data so eager ops downstream
-      // (comparisons, bitwise, etc.) read correct values during build.
-      if (t->is_input() && input_data && t->input_index() >= 0 &&
-          static_cast<size_t>(t->input_index()) < input_data->size()) {
-        const auto& ido = (*input_data)[t->input_index()];
+      if (ct.is_input && input_data && ct.input_index >= 0 &&
+          static_cast<size_t>(ct.input_index) < input_data->size()) {
+        const auto& ido = (*input_data)[ct.input_index];
         if (ido.data) {
           const size_t nelem = ggml_nelements(gt);
-          if (gt->type == GGML_TYPE_I32 && ido.et_scalar_type == 4 /* Long */) {
+          if (gt->type == GGML_TYPE_I32 && ido.et_scalar_type == 4) {
             const int64_t* src = static_cast<const int64_t*>(ido.data);
-            int32_t* dst = static_cast<int32_t*>(gt->data);
-            for (size_t j = 0; j < nelem; ++j) dst[j] = static_cast<int32_t>(src[j]);
-          } else if (gt->type == GGML_TYPE_F32 && ido.et_scalar_type == 6 /* Float */) {
+            int32_t* dst_p = static_cast<int32_t*>(gt->data);
+            for (size_t j = 0; j < nelem; ++j) dst_p[j] = static_cast<int32_t>(src[j]);
+          } else if (gt->type == GGML_TYPE_F32 && ido.et_scalar_type == 6) {
             memcpy(gt->data, ido.data, std::min(ido.nbytes, ggml_nbytes(gt)));
-          } else if (gt->type == GGML_TYPE_I32 && ido.et_scalar_type == 11 /* Bool */) {
+          } else if (gt->type == GGML_TYPE_I32 && ido.et_scalar_type == 11) {
             const bool* src = static_cast<const bool*>(ido.data);
-            int32_t* dst = static_cast<int32_t*>(gt->data);
-            for (size_t j = 0; j < nelem; ++j) dst[j] = src[j] ? 1 : 0;
+            int32_t* dst_p = static_cast<int32_t*>(gt->data);
+            for (size_t j = 0; j < nelem; ++j) dst_p[j] = src[j] ? 1 : 0;
           } else {
             memcpy(gt->data, ido.data, std::min(ido.nbytes, ggml_nbytes(gt)));
           }
         }
       }
-
-      if (t->is_input()) {
-        ggml_set_input(gt);  // Mark as input early so try_eager_scalar_binop skips it
-        input_pairs.emplace_back(t->input_index(), gt);
+      if (ct.is_input) {
+        ggml_set_input(gt);
+        input_pairs.emplace_back(ct.input_index, gt);
         input_derived.insert(gt);
       }
-      if (t->is_output()) {
-        int out_idx = t->input_index();
-        output_pairs.emplace_back(out_idx >= 0 ? out_idx : (int)output_pairs.size(), gt);
+      if (ct.is_output) {
+        output_pairs.emplace_back(ct.input_index >= 0 ? ct.input_index : (int)output_pairs.size(), gt);
       }
       id_to_tensor[tid] = gt;
       continue;
     }
 
     // --- Op tensor: build the ggml operation ---
-    s_last_processed = -(i + 10000); // encode: op tensor entering dispatch
+    s_last_processed = -(i + 10000);
     struct ggml_tensor* gt = nullptr;
 
-    // Resolve sources
+    // Resolve sources from cached src_ids (no FlatBuffer access).
     std::vector<struct ggml_tensor*> srcs;
-    if (t->src_ids()) {
-      for (size_t s = 0; s < t->src_ids()->size(); ++s) {
-        int src_id = t->src_ids()->Get(s);
-        srcs.push_back(id_to_tensor[src_id]);
-      }
+    srcs.reserve(ct.src_ids.size());
+    for (int src_id : ct.src_ids) {
+      srcs.push_back(id_to_tensor[src_id]);
     }
 
-    // Construct BuildContext for this tensor
+    // BuildContext still needs fb ir_tensor for build_op_* helpers.
+    const auto* t = fb_tensors->Get(i);
     BuildContext bc{ctx, t, srcs, host_acc, input_derived, handle, gi,
                     cpu_pinned, id_to_tensor, sym_dim_values, causal_mask_cache,
                     deferred_i64_to_i32, input_pairs,
@@ -1448,13 +1480,9 @@ Error GgmlBackendInterface::execute(
   }
 
   // --- Update SDPA dynamic masks ---
-  // On graph cache HIT, the mask shape is unchanged but values must reflect
-  // the current decode position.  Read cache_position from I32 inputs,
-  // recompute mask[col,row] = 0 if col <= positions[row], -inf otherwise,
-  // and upload to the GPU buffer.  Cost: O(T_kv * T_q) F16 writes — trivial
-  // compared to graph rebuild.
-  if (!active->sdpa_masks.empty()) {
-    // Find the cache_position input: I32 tensor whose max value < T_kv.
+  // On graph cache HIT, rewrite mask values for the current decode position.
+  // The mask shape is fixed (T_kv, T_q) — only VALUES change per step.
+  if (!active->kv_views.empty()) {
     std::vector<int32_t> positions;
     for (size_t i = 0; i < active->inputs.size(); i++) {
       auto* inp = active->inputs[i];
@@ -1463,9 +1491,8 @@ Error GgmlBackendInterface::execute(
       std::vector<int32_t> buf(n);
       ggml_backend_tensor_get(inp, buf.data(), 0, n * sizeof(int32_t));
       int32_t mx = 0;
-      for (auto v : buf) mx = std::max(mx, v);
-      // Cache_position has small values (< cache size); token_ids are large.
-      if (!active->sdpa_masks.empty() && mx < active->sdpa_masks[0].T_kv) {
+      for (auto val : buf) mx = std::max(mx, val);
+      if (mx < active->kv_views[0].max_ne1) {
         positions = std::move(buf);
         break;
       }
@@ -1473,8 +1500,9 @@ Error GgmlBackendInterface::execute(
     if (!positions.empty()) {
       const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
       const ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-65504.0f);
-      for (auto& dm : active->sdpa_masks) {
-        int64_t T_kv = dm.T_kv, T_q = dm.T_q;
+      for (auto& dm : active->kv_views) {
+        int64_t T_kv = dm.max_ne1;
+        int64_t T_q = dm.tensor->ne[1];
         std::vector<ggml_fp16_t> mask_data(T_kv * T_q);
         for (int64_t row = 0; row < T_q; row++) {
           int32_t pos = (row < (int64_t)positions.size()) ? positions[row] : 0;
@@ -1482,7 +1510,7 @@ Error GgmlBackendInterface::execute(
             mask_data[row * T_kv + col] = (col <= pos) ? zero_f16 : neg_inf_f16;
           }
         }
-        ggml_backend_tensor_set(dm.mask, mask_data.data(), 0,
+        ggml_backend_tensor_set(dm.tensor, mask_data.data(), 0,
                                 T_kv * T_q * sizeof(ggml_fp16_t));
       }
     }

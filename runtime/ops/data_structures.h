@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -14,6 +15,29 @@ namespace executorch_ggml {
 struct SavedConstant {
   int ir_tensor_id;
   std::vector<uint8_t> data;
+};
+
+// Cached IR tensor — parsed once from FlatBuffer, reused on every rebuild.
+// Eliminates FlatBuffer random access from Phase B (~1.7ms → ~0.3ms).
+struct CachedIRTensor {
+  int id;
+  int op;            // ggml_ir::OpCode as int
+  int ir_type;       // ggml_ir::TensorType as int
+  int64_t ne[4];     // base shape from IR (before sym_dim override)
+  int n_dims;
+  std::vector<int> src_ids;
+  bool is_input;
+  bool is_output;
+  int input_index;
+  std::string data_key;
+  std::vector<uint8_t> op_params;
+  uint8_t elem_size;  // serialized element size for eager data estimate
+  // Symbolic dimension info for dynamic shapes
+  int32_t sym_dim_ids[4];    // -1 = static, -2 = expr, >=0 = sym_id
+  bool has_sym_dims;
+  // Per-dim bytecode for sym_dim_ids == -2 (expression)
+  struct DimExpr { std::vector<uint8_t> bytecode; };
+  DimExpr sym_dim_exprs[4];
 };
 
 // Per-graph instance -- owns context, graph, and tensor bookkeeping for one
@@ -46,13 +70,13 @@ static size_t hash_shape_key(const std::vector<int64_t>& ne) {
   return h;
 }
 
-// SDPA mask that needs per-call position updates without graph rebuild.
-// The mask shape is fixed (T_kv, T_q, 1, 1) so the graph structure is
-// graph-cache-friendly.  Only the mask VALUES change each decode step.
-struct SDPADynamicMask {
-  struct ggml_tensor* mask;  // F16 mask tensor (eager constant in ctx)
-  int64_t T_kv;              // full KV cache size (mask columns)
-  int64_t T_q;               // query count (mask rows)
+// K/V view tensors whose ne[1] (sequence length) is patched per-call
+// to kv_valid_len without rebuilding the graph.  The views reference
+// mutable_buf which is allocated for max_seq_len, so any ne[1] ≤ max
+// is safe.  This is the same auto-slice approach llama.cpp uses.
+struct PatchableKVView {
+  struct ggml_tensor* tensor;  // K or V view tensor
+  int64_t max_ne1;             // original ne[1] from build (for restore)
 };
 
 struct GraphInstance {
@@ -65,7 +89,7 @@ struct GraphInstance {
   std::vector<EagerConstant> eager_constants;
   std::vector<SharedLeaf> shared_leaves;  // leaf tensors in const_buf / mutable_buf
   std::vector<struct ggml_tensor*> cpu_pinned;  // tensors pinned to CPU backend
-  std::vector<SDPADynamicMask> sdpa_masks;  // masks updated per-call without graph rebuild
+  std::vector<PatchableKVView> kv_views;  // K/V views patched to kv_valid_len per-call
   ggml_backend_buffer_t eager_const_buf = nullptr;  // separate buffer for eager constants
   ggml_backend_buffer_t host_buf = nullptr;  // temporary CPU buffer for leaf data (kept alive for eager const ctx_data)
   bool is_allocated = false;  // true after first successful sched_alloc
@@ -130,6 +154,9 @@ struct GgmlDelegateHandle {
   std::unordered_map<size_t, std::unique_ptr<GraphInstance>> graph_cache;
   GraphInstance* active = nullptr;
   std::vector<int64_t> init_ne;     // input shapes from the initial (init-time) graph
+
+  // Cached IR: parsed once from FlatBuffer, reused on all subsequent builds.
+  std::vector<CachedIRTensor> ir_cache;
 };
 
 } // namespace executorch_ggml

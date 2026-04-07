@@ -164,12 +164,11 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
       }
     }
     if (kv_valid_len > 0 && kv_valid_len < k->ne[1]) {
-      // Build a combined causal + valid-position mask over the full cache.
-      // We cannot auto-slice K/V because INDEX_PUT returns the cache leaf
-      // (no graph edge from ggml_cpy to SDPA), so the scheduler may
-      // reorder reads before writes across layers. The full-cache mask
-      // approach works because CPY nodes are dispatched first in the graph
-      // and Metal executes sequentially within a command buffer.
+      // Full-cache + dynamic mask approach: attend to ALL T_kv positions
+      // but mask out invalid ones.  We can't auto-slice K/V because
+      // ggml_set_rows has no graph edge to SDPA — the scheduler could
+      // reorder reads before writes.  The full-cache mask is updated
+      // per-call in execute() without graph rebuild.
       int64_t T_kv = k->ne[1];
       int64_t T_q  = q->ne[1];
       ggml_set_no_alloc(bc.ctx, false);
@@ -178,7 +177,6 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
       const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
       const ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-65504.0f);
       ggml_fp16_t* md = (ggml_fp16_t*)new_mask->data;
-      // Find cache_position values for per-query masking.
       std::vector<int32_t> positions(T_q, 0);
       for (auto& [idx2, inp2] : bc.input_pairs) {
         if (inp2->type == GGML_TYPE_I32 && ggml_nelements(inp2) == T_q) {
@@ -193,7 +191,6 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
           }
         }
       }
-      // mask[col, row] = 0 if col <= positions[row], -inf otherwise
       for (int64_t row = 0; row < T_q; row++) {
         for (int64_t col = 0; col < T_kv; col++) {
           md[row * T_kv + col] = (col <= positions[row]) ? zero_f16 : neg_inf_f16;
@@ -201,10 +198,7 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
       }
       mask = new_mask;
       is_causal = false;
-      // Store mask as a dynamic SDPA mask — updated per-call in execute()
-      // without graph rebuild.  The mask shape is fixed (T_kv, T_q), only
-      // the values change each decode step.
-      bc.gi->sdpa_masks.push_back({new_mask, T_kv, T_q});
+      bc.gi->kv_views.push_back({new_mask, T_kv});  // reuse kv_views for mask update
     }
   }
 
