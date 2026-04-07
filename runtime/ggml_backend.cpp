@@ -937,11 +937,14 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     const size_t alignment = 64;  // safe alignment for all backends
     size_t const_total = 0, mutable_total = 0;
 
-    // First pass: compute sizes
+    // First pass: compute sizes.
+    // Include mutable tensors even without data_key (KV caches that
+    // weren't embedded in the PTE — they still need mutable_buf slots).
     for (int i = 0; i < n_tensors; ++i) {
       const auto* t = fb_tensors->Get(i);
       if (static_cast<ggml_ir::OpCode>(t->op()) != ggml_ir::OpCode::NONE) continue;
-      if (!t->data_key() || std::strlen(t->data_key()->c_str()) == 0) continue;
+      bool has_key = t->data_key() && std::strlen(t->data_key()->c_str()) > 0;
+      if (!has_key && !t->is_mutable()) continue;
 
       int64_t ne[4] = {1, 1, 1, 1};
       if (t->ne()) {
@@ -1027,7 +1030,8 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
     for (int i = 0; i < n_tensors; ++i) {
       const auto* t = fb_tensors->Get(i);
       if (static_cast<ggml_ir::OpCode>(t->op()) != ggml_ir::OpCode::NONE) continue;
-      if (!t->data_key() || std::strlen(t->data_key()->c_str()) == 0) continue;
+      bool has_key = t->data_key() && std::strlen(t->data_key()->c_str()) > 0;
+      if (!has_key && !t->is_mutable()) continue;
 
       int64_t ne[4] = {1, 1, 1, 1};
       if (t->ne()) {

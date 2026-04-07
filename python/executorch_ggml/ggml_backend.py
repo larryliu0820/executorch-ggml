@@ -150,12 +150,14 @@ class GgmlBackend(BackendDetails):
                     is_mutable = (fqn in ctx.mutated_buffer_fqns)
 
                     ir_type = _torch_dtype_to_ir_type(t_cpu.dtype)
-                    # skip_weight_data: only skip constants that the GGUF data
-                    # map can provide (actual model weights with a GGUF name).
-                    # Small scalars, lifted constants, and KV caches must
-                    # always be embedded — they don't exist in the GGUF file.
+                    # Skip embedding weight data when:
+                    # - GGUF external weights: skip constants that the GGUF
+                    #   provides (actual model weights with a GGUF name).
+                    # - Mutable buffers (KV caches): always skip. The C++
+                    #   runtime allocates mutable_buf and zero-inits it.
+                    #   Saves ~28 MB for Qwen3-0.6B (28 layers x 1 MB each).
                     has_gguf_source = (gguf_weight_map is not None and fqn in gguf_weight_map)
-                    skip_this = skip_weight_data and has_gguf_source
+                    skip_this = (skip_weight_data and has_gguf_source) or is_mutable
 
                     if quant_config is not None:
                         from executorch_ggml.quantize import (
@@ -201,7 +203,10 @@ class GgmlBackend(BackendDetails):
                             tensor_type=ir_type,
                             ne=_pytorch_shape_to_ggml_ne(shape),
                             op=OP_NONE,
-                            data_key=data_key,
+                            # Mutable buffers: no data_key since no data is
+                            # embedded. The C++ init skips keyless tensors
+                            # and mutable_buf provides the zero-init storage.
+                            data_key=None if is_mutable else data_key,
                             is_input=False,
                             is_mutable=is_mutable,
                         )
