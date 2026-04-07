@@ -189,7 +189,7 @@ Qwen3-0.6B Q8_0 decode throughput:
 
 | Platform | executorch-ggml | llama.cpp | vs llama.cpp |
 |----------|----------------:|----------:|:-------------|
-| NVIDIA A100 | **411 tok/s** | 380 tok/s | **108%** |
+| NVIDIA A100 | **411 tok/s** | 377 tok/s | **109%** |
 | Apple M4 Max | **331 tok/s** | 299 tok/s | **111%** |
 
 Pre-exported model: [larryliu0820/Qwen3-0.6B-Q8_0-ExecuTorch-GGML](https://huggingface.co/larryliu0820/Qwen3-0.6B-Q8_0-ExecuTorch-GGML)

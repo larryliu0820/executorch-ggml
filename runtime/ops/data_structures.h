@@ -46,6 +46,15 @@ static size_t hash_shape_key(const std::vector<int64_t>& ne) {
   return h;
 }
 
+// SDPA mask that needs per-call position updates without graph rebuild.
+// The mask shape is fixed (T_kv, T_q, 1, 1) so the graph structure is
+// graph-cache-friendly.  Only the mask VALUES change each decode step.
+struct SDPADynamicMask {
+  struct ggml_tensor* mask;  // F16 mask tensor (eager constant in ctx)
+  int64_t T_kv;              // full KV cache size (mask columns)
+  int64_t T_q;               // query count (mask rows)
+};
+
 struct GraphInstance {
   struct ggml_context* ctx = nullptr;
   struct ggml_cgraph* graph = nullptr;
@@ -56,6 +65,7 @@ struct GraphInstance {
   std::vector<EagerConstant> eager_constants;
   std::vector<SharedLeaf> shared_leaves;  // leaf tensors in const_buf / mutable_buf
   std::vector<struct ggml_tensor*> cpu_pinned;  // tensors pinned to CPU backend
+  std::vector<SDPADynamicMask> sdpa_masks;  // masks updated per-call without graph rebuild
   ggml_backend_buffer_t eager_const_buf = nullptr;  // separate buffer for eager constants
   ggml_backend_buffer_t host_buf = nullptr;  // temporary CPU buffer for leaf data (kept alive for eager const ctx_data)
   bool is_allocated = false;  // true after first successful sched_alloc

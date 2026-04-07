@@ -146,36 +146,16 @@ static inline struct ggml_tensor* build_op_index_put(BuildContext& bc) {
 
   struct ggml_tensor* gt = nullptr;
   if (is_mutable_dst) {
-    // Write new K/V values into the cache leaf via ggml_cpy into a view.
-    // Uses native ggml ops (no custom callbacks, no CPU pinning, no graph
-    // splits). The cache leaf (mutable_buf) preserves all prior positions.
-    if (val->type != dst->type) {
-      val = safe_ggml_cast(bc.ctx, val, dst->type, &bc.host_acc);
+    // Use ggml_set_rows for all mutable-dst INDEX_PUT operations.
+    // ggml_set_rows handles dynamic indices at compute time, which keeps
+    // the graph structure position-independent and allows graph caching.
+    // The mutable_buf preserves prior cache data between calls because
+    // ggml_set_rows only overwrites the scattered rows.
+    if (val->type != GGML_TYPE_F32) {
+      val = safe_ggml_cast(bc.ctx, val, GGML_TYPE_F32, &bc.host_acc);
     }
-    // Determine scatter axis and start position from the index tensor.
-    int ndim_pt = std::max(4, nidx + 1);
-    int scatter_axis = (ndim_pt - 1) - idx_pos;
-    if (scatter_axis < 0 || scatter_axis > 3) scatter_axis = 1;
-    int64_t start_pos = 0;
-    const void* idx_data = bc.host_acc.get(idx);
-    if (idx_data) {
-      if (idx->type == GGML_TYPE_I32)
-        start_pos = static_cast<const int32_t*>(idx_data)[0];
-      else if (idx->type == GGML_TYPE_I64)
-        start_pos = static_cast<const int64_t*>(idx_data)[0];
-    }
-    int64_t seq_len = val->ne[scatter_axis];
-    size_t offset_bytes = start_pos * dst->nb[scatter_axis];
-    int64_t view_ne[4] = {dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]};
-    view_ne[scatter_axis] = seq_len;
-    auto* cache_slice = safe_ggml_view_4d(bc.ctx, dst,
-        view_ne[0], view_ne[1], view_ne[2], view_ne[3],
-        dst->nb[1], dst->nb[2], dst->nb[3], offset_bytes);
-    if (!cache_slice) return nullptr;
-    auto* val_c = ensure_cont(bc.ctx, val);
-    auto* cpy = ggml_cpy(bc.ctx, val_c, cache_slice);
-    ggml_set_output(cpy);
-    gt = dst;  // Return cache leaf — full cache with all prior data.
+    gt = ggml_set_rows(bc.ctx, dst, val, idx);
+    ggml_set_output(gt);
   } else {
     struct ggml_tensor* args[3] = {dst, idx, val};
     gt = ggml_custom_4d(

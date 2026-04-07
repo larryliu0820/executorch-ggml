@@ -226,6 +226,9 @@ static Error build_graph(
   }
   auto t_bg_phaseA = std::chrono::high_resolution_clock::now();
 
+  // Clear dynamic masks from previous build (rebuild populates fresh ones).
+  gi->sdpa_masks.clear();
+
   // --- Create per-graph scheduler (first build only) ---
   // Preserved across rebuilds for gallocr buffer reuse. Only created once
   // per GraphInstance (first build for this shape key).
@@ -1442,6 +1445,47 @@ Error GgmlBackendInterface::execute(
       }
     }
     ggml_backend_tensor_set(dst_i32, dst_buf.data(), 0, nelem * sizeof(int32_t));
+  }
+
+  // --- Update SDPA dynamic masks ---
+  // On graph cache HIT, the mask shape is unchanged but values must reflect
+  // the current decode position.  Read cache_position from I32 inputs,
+  // recompute mask[col,row] = 0 if col <= positions[row], -inf otherwise,
+  // and upload to the GPU buffer.  Cost: O(T_kv * T_q) F16 writes — trivial
+  // compared to graph rebuild.
+  if (!active->sdpa_masks.empty()) {
+    // Find the cache_position input: I32 tensor whose max value < T_kv.
+    std::vector<int32_t> positions;
+    for (size_t i = 0; i < active->inputs.size(); i++) {
+      auto* inp = active->inputs[i];
+      if (inp->type != GGML_TYPE_I32) continue;
+      int64_t n = ggml_nelements(inp);
+      std::vector<int32_t> buf(n);
+      ggml_backend_tensor_get(inp, buf.data(), 0, n * sizeof(int32_t));
+      int32_t mx = 0;
+      for (auto v : buf) mx = std::max(mx, v);
+      // Cache_position has small values (< cache size); token_ids are large.
+      if (!active->sdpa_masks.empty() && mx < active->sdpa_masks[0].T_kv) {
+        positions = std::move(buf);
+        break;
+      }
+    }
+    if (!positions.empty()) {
+      const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+      const ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-65504.0f);
+      for (auto& dm : active->sdpa_masks) {
+        int64_t T_kv = dm.T_kv, T_q = dm.T_q;
+        std::vector<ggml_fp16_t> mask_data(T_kv * T_q);
+        for (int64_t row = 0; row < T_q; row++) {
+          int32_t pos = (row < (int64_t)positions.size()) ? positions[row] : 0;
+          for (int64_t col = 0; col < T_kv; col++) {
+            mask_data[row * T_kv + col] = (col <= pos) ? zero_f16 : neg_inf_f16;
+          }
+        }
+        ggml_backend_tensor_set(dm.mask, mask_data.data(), 0,
+                                T_kv * T_q * sizeof(ggml_fp16_t));
+      }
+    }
   }
 
   // Per-op profiling (GGML_PROFILE=1)

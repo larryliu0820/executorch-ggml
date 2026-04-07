@@ -201,9 +201,10 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
       }
       mask = new_mask;
       is_causal = false;
-      // Mark mask as input-derived so the graph gets rebuilt when
-      // positions change (each decode step has different valid positions).
-      bc.input_derived.insert(new_mask);
+      // Store mask as a dynamic SDPA mask — updated per-call in execute()
+      // without graph rebuild.  The mask shape is fixed (T_kv, T_q), only
+      // the values change each decode step.
+      bc.gi->sdpa_masks.push_back({new_mask, T_kv, T_q});
     }
   }
 
@@ -264,20 +265,34 @@ static inline struct ggml_tensor* build_op_update_cache(BuildContext& bc) {
 
   int64_t seq_len_new = value->ne[ggml_axis];
 
-  // Write new values into the cache leaf in-place via ggml_cpy.
-  // Using ggml_cpy (not ggml_set_rows) preserves all prior positions in
-  // mutable_buf so downstream SDPA reads the full cache history.
-  size_t offset_bytes = start_pos * cache->nb[ggml_axis];
-  int64_t view_ne[4];
-  for (int d = 0; d < 4; d++) view_ne[d] = cache->ne[d];
-  view_ne[ggml_axis] = seq_len_new;
-  auto* cache_slice = safe_ggml_view_4d(bc.ctx, cache,
-      view_ne[0], view_ne[1], view_ne[2], view_ne[3],
-      cache->nb[1], cache->nb[2], cache->nb[3], offset_bytes);
-  if (!cache_slice) return nullptr;
-  auto* cpy = ggml_cpy(bc.ctx, ensure_cont(bc.ctx, value), cache_slice);
-  ggml_set_output(cpy);
-  return cache;
+  // Use ggml_set_rows for compute-time index handling (graph-cache-friendly).
+  // Build index tensor [start_pos, start_pos+1, ...] for the scatter.
+  struct ggml_tensor* indices = ggml_arange(bc.ctx,
+      (float)start_pos, (float)(start_pos + seq_len_new), 1.0f);
+  indices = safe_ggml_cast(bc.ctx, indices, GGML_TYPE_I32, &bc.host_acc);
+
+  if (value->type != GGML_TYPE_F32) {
+    value = safe_ggml_cast(bc.ctx, value, GGML_TYPE_F32, &bc.host_acc);
+  }
+
+  struct ggml_tensor* gt = nullptr;
+  if (ggml_axis == 1) {
+    gt = ggml_set_rows(bc.ctx, cache, value, indices);
+  } else {
+    // For non-standard axes, transpose to axis-1, set_rows, transpose back.
+    size_t offset_bytes = start_pos * cache->nb[ggml_axis];
+    int64_t view_ne[4];
+    for (int d = 0; d < 4; d++) view_ne[d] = cache->ne[d];
+    view_ne[ggml_axis] = seq_len_new;
+    auto* cache_slice = safe_ggml_view_4d(bc.ctx, cache,
+        view_ne[0], view_ne[1], view_ne[2], view_ne[3],
+        cache->nb[1], cache->nb[2], cache->nb[3], offset_bytes);
+    if (!cache_slice) return nullptr;
+    auto* cpy = ggml_cpy(bc.ctx, ensure_cont(bc.ctx, value), cache_slice);
+    ggml_set_output(cpy);
+    gt = cache;
+  }
+  return gt;
 }
 
 // ---------------------------------------------------------------------------
