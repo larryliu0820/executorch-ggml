@@ -35,7 +35,12 @@ class GGUFExportConfig:
         use_custom_sdpa: bool = False,
         skip_weight_data: bool = True,
     ):
-        self.max_seq_len = max_seq_len
+        # Pad max_seq_len to FATTN_KQ_STRIDE (256) for CUDA flash attention
+        # optimization.  This enables the KV_max early-exit mechanism which
+        # skips entire 256-position blocks of uninitialized cache positions.
+        # llama.cpp does the same: GGML_PAD(n_ctx_seq, 256).
+        FATTN_KQ_STRIDE = 256
+        self.max_seq_len = ((max_seq_len + FATTN_KQ_STRIDE - 1) // FATTN_KQ_STRIDE) * FATTN_KQ_STRIDE
         self.enable_quantization = enable_quantization
         self.quant_config = quant_config or GgmlQuantConfig()
         self.preserve_dynamic_shapes = preserve_dynamic_shapes
