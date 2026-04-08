@@ -169,19 +169,55 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
         kv_slice_mode = (env && std::string(env) != "0") ? 1 : 0;
       }
       if (kv_slice_mode) {
-        // Auto-slice: K/V views sliced to kv_valid_len, no mask.
-        // Trades CUDA graph compatibility for less attention compute.
-        // Enable with GGML_KV_SLICE=1 (useful for large caches where
-        // attention compute dominates over CUDA graph replay savings).
+        // Auto-slice with 256-aligned padding (like llama.cpp).
+        // K/V views padded to nearest 256 boundary + dynamic mask for
+        // positions within the block.  CUDA graphs replay within each
+        // 256-step window; graph rebuilds only when crossing a boundary.
+        constexpr int64_t KV_PAD = 256;  // FATTN_KQ_STRIDE
         int64_t full_T_kv = k->ne[1];
-        k = ggml_view_4d(bc.ctx, k, k->ne[0], kv_valid_len, k->ne[2], k->ne[3],
+        int64_t padded_kv = std::min(((kv_valid_len + KV_PAD - 1) / KV_PAD) * KV_PAD, full_T_kv);
+        k = ggml_view_4d(bc.ctx, k, k->ne[0], padded_kv, k->ne[2], k->ne[3],
                           k->nb[1], k->nb[2], k->nb[3], 0);
-        v = ggml_view_4d(bc.ctx, v, v->ne[0], kv_valid_len, v->ne[2], v->ne[3],
+        v = ggml_view_4d(bc.ctx, v, v->ne[0], padded_kv, v->ne[2], v->ne[3],
                           v->nb[1], v->nb[2], v->nb[3], 0);
         bc.gi->kv_views.push_back({k, full_T_kv});
         bc.gi->kv_views.push_back({v, full_T_kv});
-        mask = nullptr;
-        is_causal = (q->ne[1] >= kv_valid_len) ? is_causal_orig : false;
+        // Dynamic mask within the padded block: blocks positions beyond
+        // kv_valid_len.  Mask shape is [padded_kv, T_q] — contiguous and
+        // CUDA-graph-friendly (shape fixed within each 256-step window).
+        int64_t T_q = q->ne[1];
+        ggml_set_no_alloc(bc.ctx, false);
+        struct ggml_tensor* slice_mask = ggml_new_tensor_4d(bc.ctx, GGML_TYPE_F16, padded_kv, T_q, 1, 1);
+        ggml_set_no_alloc(bc.ctx, true);
+        const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-65504.0f);
+        ggml_fp16_t* md = (ggml_fp16_t*)slice_mask->data;
+        std::vector<int32_t> positions(T_q, 0);
+        for (auto& [idx2, inp2] : bc.input_pairs) {
+          if (inp2->type == GGML_TYPE_I32 && ggml_nelements(inp2) == T_q) {
+            const int32_t* pd = static_cast<const int32_t*>(bc.host_acc.get(inp2));
+            if (pd) {
+              int32_t mx = 0;
+              for (int64_t i = 0; i < T_q; i++) mx = std::max(mx, pd[i]);
+              if (mx < (int32_t)full_T_kv) {
+                for (int64_t i = 0; i < T_q; i++) positions[i] = pd[i];
+                break;
+              }
+            }
+          }
+        }
+        for (int64_t row = 0; row < T_q; row++) {
+          for (int64_t col = 0; col < padded_kv; col++) {
+            md[row * padded_kv + col] = (col <= positions[row]) ? zero_f16 : neg_inf_f16;
+          }
+        }
+        mask = slice_mask;
+        is_causal = false;
+        // Register mask for per-call value updates (same as dynamic mask path).
+        // K/V views are NOT registered — their ne[1] stays at padded_kv
+        // until a boundary crossing triggers graph rebuild.
+        bc.gi->kv_views.push_back({slice_mask, padded_kv});
+        bc.gi->padded_kv = padded_kv;
       } else {
         // Full-cache + dynamic mask (default): CUDA-graph-friendly.
         // All tensor shapes are fixed every step, enabling CUDA graph

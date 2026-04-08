@@ -70,13 +70,11 @@ static size_t hash_shape_key(const std::vector<int64_t>& ne) {
   return h;
 }
 
-// K/V view tensors whose ne[1] (sequence length) is patched per-call
-// to kv_valid_len without rebuilding the graph.  The views reference
-// mutable_buf which is allocated for max_seq_len, so any ne[1] ≤ max
-// is safe.  This is the same auto-slice approach llama.cpp uses.
+// Patchable tensor for per-call updates without graph rebuild.
+// Used for both K/V views (auto-slice) and dynamic masks.
 struct PatchableKVView {
-  struct ggml_tensor* tensor;  // K or V view tensor
-  int64_t max_ne1;             // original ne[1] from build (for restore)
+  struct ggml_tensor* tensor;  // K/V view or F16 mask tensor
+  int64_t max_ne1;             // full cache size (for position filtering)
 };
 
 struct GraphInstance {
@@ -92,6 +90,7 @@ struct GraphInstance {
   std::vector<PatchableKVView> kv_views;  // K/V views patched to kv_valid_len per-call
   ggml_backend_buffer_t eager_const_buf = nullptr;  // separate buffer for eager constants
   ggml_backend_buffer_t host_buf = nullptr;  // temporary CPU buffer for leaf data (kept alive for eager const ctx_data)
+  int64_t padded_kv = 0;  // current 256-aligned KV slice size (0 = not auto-slice)
   bool is_allocated = false;  // true after first successful sched_alloc
   bool has_input_derived_eager = false;  // true if any eager constant depends on input data
 };

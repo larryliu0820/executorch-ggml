@@ -1268,6 +1268,25 @@ Error GgmlBackendInterface::execute(
   bool need_build = (active->ctx == nullptr) || no_cache
                     || active->has_input_derived_eager;
 
+  // For auto-slice mode: force rebuild when padded_kv crosses a 256 boundary.
+  // This happens every ~256 decode steps.  Between crossings, CUDA graphs replay.
+  if (!need_build && active->padded_kv > 0 && !input_data_vec.empty()) {
+    constexpr int64_t KV_PAD = 256;
+    // Find kv_valid_len from input data (CPU side, no GPU sync).
+    for (const auto& ido : input_data_vec) {
+      if (ido.et_scalar_type == 4 /* Long */ && ido.nbytes >= 8) {
+        const int64_t* p = static_cast<const int64_t*>(ido.data);
+        int64_t kv_len = p[0] + 1;
+        int64_t new_padded = std::min(((kv_len + KV_PAD - 1) / KV_PAD) * KV_PAD,
+                                      active->kv_views.empty() ? kv_len : active->kv_views[0].max_ne1);
+        if (new_padded != active->padded_kv) {
+          need_build = true;
+        }
+        break;
+      }
+    }
+  }
+
   if (need_build) {
     // First time for this shape: full IR parse + tensor creation.
     const int64_t* ne_ptr = handle->has_dynamic ? current_ne.data() : nullptr;
@@ -1493,14 +1512,13 @@ Error GgmlBackendInterface::execute(
     }
   }
 
-  // --- Update patchable KV views / masks ---
-  // Two modes: auto-slice (GGML_KV_SLICE=1) patches K/V ne[1];
-  // dynamic mask (default) rewrites mask values.  Detected by tensor type.
+  // --- Update dynamic SDPA masks ---
+  // Both modes (default full-cache and GGML_KV_SLICE=1 auto-slice) use
+  // a dynamic F16 mask whose values are rewritten per-call.  The only
+  // difference is the mask size: full T_kv (default) or padded_kv
+  // (auto-slice, 256-aligned).  CUDA graphs replay within each window.
   if (!active->kv_views.empty()) {
-    bool is_auto_slice = (active->kv_views[0].tensor->type != GGML_TYPE_F16);
-    // Read cache_position from I32 inputs.
     std::vector<int32_t> positions;
-    int64_t kv_valid_len = 0;
     for (size_t i = 0; i < active->inputs.size(); i++) {
       auto* inp = active->inputs[i];
       if (inp->type != GGML_TYPE_I32) continue;
@@ -1510,23 +1528,16 @@ Error GgmlBackendInterface::execute(
       int32_t mx = 0;
       for (auto val : buf) mx = std::max(mx, val);
       if (mx < active->kv_views[0].max_ne1) {
-        kv_valid_len = mx + 1;
         positions = std::move(buf);
         break;
       }
     }
-    if (is_auto_slice) {
-      // Patch K/V view ne[1] to kv_valid_len (zero overhead).
-      if (kv_valid_len > 0) {
-        for (auto& kv : active->kv_views)
-          kv.tensor->ne[1] = kv_valid_len;
-      }
-    } else if (!positions.empty()) {
-      // Rewrite mask values (~256 bytes for decode).
+    if (!positions.empty()) {
       const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
       const ggml_fp16_t neg_inf_f16 = ggml_fp32_to_fp16(-65504.0f);
       for (auto& dm : active->kv_views) {
-        int64_t T_kv = dm.max_ne1;
+        if (dm.tensor->type != GGML_TYPE_F16) continue;  // skip K/V views
+        int64_t T_kv = dm.tensor->ne[0];  // mask width (full or padded)
         int64_t T_q = dm.tensor->ne[1];
         std::vector<ggml_fp16_t> mask_data(T_kv * T_q);
         for (int64_t row = 0; row < T_q; row++) {
