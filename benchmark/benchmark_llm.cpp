@@ -333,5 +333,7 @@ int main(int argc, char** argv) {
   for (auto t : generated) fprintf(stderr, "%lld ", (long long)t);
   fprintf(stderr, "\n");
 
-  return 0;
+  // Skip destructors — CUDA backend cleanup deadlocks during graph/buffer
+  // teardown.  Benchmark doesn't need clean shutdown.
+  std::_Exit(0);
 }
