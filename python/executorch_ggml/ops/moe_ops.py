@@ -30,6 +30,13 @@ from executorch_ggml.serialize import (
     OP_MUL_MAT_ID,
     OP_LOG1P,
     OP_CAST,
+    OP_EXP,
+    OP_SUM,
+    OP_CLAMP,
+    OP_SLICE_SCATTER,
+    OP_FULL,
+    OP_NONE,
+    OP_VIEW,
     pack_cast_params,
 )
 
@@ -272,6 +279,157 @@ def handle_log1p(ctx, node, target_str):
             src_ids=[src_id],
             sym_dim_ids=_vsym,
             sym_dim_exprs=_vexprs,
+        )
+    )
+    ctx.node_to_id[node] = tid
+
+
+# ---------------------------------------------------------------------------
+# Additional ops needed by MoE models
+# ---------------------------------------------------------------------------
+
+@register_op("aten.exp.default")
+def handle_exp(ctx, node, target_str):
+    """exp(x) — unary exponential."""
+    src_id = ctx.node_to_id[node.args[0]]
+    fake_val = node.meta.get("val")
+    shape = _resolve_shape(fake_val)
+    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
+    tid = ctx.alloc_id()
+    ctx.ir_tensors.append(
+        IrTensor(
+            tensor_id=tid,
+            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+            ne=_pytorch_shape_to_ggml_ne(shape),
+            op=OP_EXP,
+            src_ids=[src_id],
+            sym_dim_ids=_vsym,
+            sym_dim_exprs=_vexprs,
+        )
+    )
+    ctx.node_to_id[node] = tid
+
+
+@register_op("aten.sum.dim_IntList")
+def handle_sum(ctx, node, target_str):
+    """sum(x, dim, keepdim) — reduction sum."""
+    src_id = ctx.node_to_id[node.args[0]]
+    dim = node.args[1] if len(node.args) > 1 else [-1]
+    keepdim = node.args[2] if len(node.args) > 2 else False
+    if isinstance(dim, (list, tuple)):
+        dim = dim[0] if len(dim) == 1 else dim[0]  # TODO: multi-dim
+    fake_val = node.meta.get("val")
+    shape = _resolve_shape(fake_val)
+    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
+    # Get input ndim for ggml axis mapping
+    src_fv = node.args[0].meta.get("val") if hasattr(node.args[0], "meta") else None
+    ndim = len(src_fv.shape) if src_fv is not None else 4
+    tid = ctx.alloc_id()
+    ctx.ir_tensors.append(
+        IrTensor(
+            tensor_id=tid,
+            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+            ne=_pytorch_shape_to_ggml_ne(shape),
+            op=OP_SUM,
+            src_ids=[src_id],
+            op_params=struct.pack("<ii", dim, ndim),
+            sym_dim_ids=_vsym,
+            sym_dim_exprs=_vexprs,
+        )
+    )
+    ctx.node_to_id[node] = tid
+
+
+@register_op("aten.clamp.default")
+def handle_clamp(ctx, node, target_str):
+    """clamp(x, min, max)."""
+    src_id = ctx.node_to_id[node.args[0]]
+    min_val = float(node.args[1]) if len(node.args) > 1 and node.args[1] is not None else -3.4e38
+    max_val = float(node.args[2]) if len(node.args) > 2 and node.args[2] is not None else 3.4e38
+    fake_val = node.meta.get("val")
+    shape = _resolve_shape(fake_val)
+    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
+    tid = ctx.alloc_id()
+    ctx.ir_tensors.append(
+        IrTensor(
+            tensor_id=tid,
+            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+            ne=_pytorch_shape_to_ggml_ne(shape),
+            op=OP_CLAMP,
+            src_ids=[src_id],
+            op_params=struct.pack("<ff", min_val, max_val),
+            sym_dim_ids=_vsym,
+            sym_dim_exprs=_vexprs,
+        )
+    )
+    ctx.node_to_id[node] = tid
+
+
+@register_op("aten.copy.default")
+def handle_copy(ctx, node, target_str):
+    """copy(dst, src) — just pass through src (ggml handles in-place via mutable buffers)."""
+    # In the functional graph, copy returns a new tensor with src's data.
+    # For our IR, just alias to the src tensor.
+    src_id = ctx.node_to_id[node.args[1]]  # args: (dst, src, non_blocking)
+    ctx.node_to_id[node] = src_id
+
+
+@register_op("aten.slice_scatter.default")
+def handle_slice_scatter(ctx, node, target_str):
+    """slice_scatter(dst, src, dim, start, end, step) — scatter src into dst slice."""
+    dst_id = ctx.node_to_id[node.args[0]]
+    src_id = ctx.node_to_id[node.args[1]]
+    dim = node.args[2] if len(node.args) > 2 else 0
+    start = node.args[3] if len(node.args) > 3 and node.args[3] is not None else 0
+    end = node.args[4] if len(node.args) > 4 and node.args[4] is not None else 2**31 - 1
+    step = node.args[5] if len(node.args) > 5 else 1
+    if hasattr(start, '__index__'):
+        start = start.__index__()
+    if hasattr(end, '__index__'):
+        end = end.__index__()
+    fake_val = node.meta.get("val")
+    shape = _resolve_shape(fake_val)
+    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
+    tid = ctx.alloc_id()
+    ctx.ir_tensors.append(
+        IrTensor(
+            tensor_id=tid,
+            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+            ne=_pytorch_shape_to_ggml_ne(shape),
+            op=OP_SLICE_SCATTER,
+            src_ids=[dst_id, src_id],
+            op_params=struct.pack("<iiii", dim, int(start), int(end), int(step)),
+            sym_dim_ids=_vsym,
+            sym_dim_exprs=_vexprs,
+        )
+    )
+    ctx.node_to_id[node] = tid
+
+
+@register_op("aten.full_like.default")
+def handle_full_like(ctx, node, target_str):
+    """full_like(x, fill_value) — create constant tensor with same shape as x."""
+    fill_value = float(node.args[1])
+    fake_val = node.meta.get("val")
+    shape = _resolve_shape(fake_val)
+    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
+    tid = ctx.alloc_id()
+    ctx.ir_tensors.append(
+        IrTensor(
+            tensor_id=tid,
+            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+            ne=_pytorch_shape_to_ggml_ne(shape),
+            op=OP_FULL,
+            src_ids=[],
+            op_params=struct.pack("<f", fill_value),
+            sym_dim_ids=_vsym,
+            sym_dim_exprs=_vexprs,
+            elem_size=4,  # F32 eager constant
         )
     )
     ctx.node_to_id[node] = tid

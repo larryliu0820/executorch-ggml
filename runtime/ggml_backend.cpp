@@ -577,6 +577,10 @@ static Error build_graph(
         case ggml_ir::OpCode::SORT_INDICES:  gt = build_op_sort_indices(bc); break;
         case ggml_ir::OpCode::MUL_MAT_ID:   gt = build_op_mul_mat_id(bc); break;
         case ggml_ir::OpCode::LOG1P:         gt = build_op_log1p(bc); break;
+        case ggml_ir::OpCode::EXP:           gt = build_op_exp(bc); break;
+        case ggml_ir::OpCode::SUM:           gt = build_op_sum(bc); break;
+        case ggml_ir::OpCode::CLAMP:         gt = build_op_clamp(bc); break;
+        case ggml_ir::OpCode::SLICE_SCATTER: gt = build_op_slice_scatter(bc); break;
 
         default:
           fprintf(stderr, "[executorch-ggml] Unsupported OpCode %d\n", (int) op);

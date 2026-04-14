@@ -92,11 +92,15 @@ enum class OpCode : int32_t {
   MUL_MAT_ID = 89,
   LOG1P = 90,
   SPLIT = 91,
+  EXP = 92,
+  SUM = 93,
+  CLAMP = 94,
+  SLICE_SCATTER = 95,
   MIN = NONE,
-  MAX = SPLIT
+  MAX = SLICE_SCATTER
 };
 
-inline const OpCode (&EnumValuesOpCode())[70] {
+inline const OpCode (&EnumValuesOpCode())[74] {
   static const OpCode values[] = {
     OpCode::NONE,
     OpCode::ADD,
@@ -167,13 +171,17 @@ inline const OpCode (&EnumValuesOpCode())[70] {
     OpCode::SORT_INDICES,
     OpCode::MUL_MAT_ID,
     OpCode::LOG1P,
-    OpCode::SPLIT
+    OpCode::SPLIT,
+    OpCode::EXP,
+    OpCode::SUM,
+    OpCode::CLAMP,
+    OpCode::SLICE_SCATTER
   };
   return values;
 }
 
 inline const char * const *EnumNamesOpCode() {
-  static const char * const names[93] = {
+  static const char * const names[97] = {
     "NONE",
     "ADD",
     "MUL_MAT",
@@ -266,13 +274,17 @@ inline const char * const *EnumNamesOpCode() {
     "MUL_MAT_ID",
     "LOG1P",
     "SPLIT",
+    "EXP",
+    "SUM",
+    "CLAMP",
+    "SLICE_SCATTER",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameOpCode(OpCode e) {
-  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::SPLIT)) return "";
+  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::SLICE_SCATTER)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesOpCode()[index];
 }

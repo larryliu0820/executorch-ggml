@@ -268,10 +268,15 @@ def _is_supported_node(node) -> bool:
             "aten.div",  # int64 division for ring buffer
             "aten.remainder",  # int64 modulo for ring buffer
             "aten.argmax",  # argmax produces int64
+            "aten.topk",   # topk indices are int64
+            "aten.sort",   # sort indices are int64
             # dtype cast / clone (identity-like for int64 tensors)
             "aten._to_copy",
             "aten.clone",
         }
+        # getitem on topk/sort results produces int64 indices
+        if "getitem" in target_str:
+            return True
         if not any(op in target_str for op in int64_safe_ops):
             return False
 

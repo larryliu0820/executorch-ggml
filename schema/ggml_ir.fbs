@@ -112,7 +112,11 @@ enum OpCode : int32 {
     SORT_INDICES = 88,   // src_ids: [x] op_params: int32 dim, int32 descending; returns indices
     MUL_MAT_ID = 89,     // src_ids: [input, weight, indices] expert-indexed matmul
     LOG1P = 90,          // src_ids: [x] log(1+x)
-    SPLIT = 91           // src_ids: [x] op_params: int32 n_splits, int32 dim, n_splits × int32 sizes
+    SPLIT = 91,          // src_ids: [x] op_params: int32 n_splits, int32 dim, n_splits × int32 sizes
+    EXP = 92,            // src_ids: [x]
+    SUM = 93,            // src_ids: [x] op_params: int32 dim, int32 keepdim
+    CLAMP = 94,          // src_ids: [x] op_params: float32 min, float32 max
+    SLICE_SCATTER = 95   // src_ids: [dst, src] op_params: int32 dim, int32 start, int32 end, int32 step
 }
 
 enum TensorType : int32 {
