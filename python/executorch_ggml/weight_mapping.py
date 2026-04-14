@@ -89,6 +89,54 @@ class WeightNameMapper:
             ("ffn_up", "mlp.up_proj"),
             ("ffn_down", "mlp.down_proj"),
         ],
+        "qwen35moe": [
+            # Global names (direct export — no model.model. prefix)
+            ("token_embd", "embed_tokens"),
+            # Note: output_norm -> norm is handled specially in pytorch_to_gguf
+            # to avoid matching attn.norm. Only matches the final "norm.weight".
+            ("output", "lm_head"),
+
+            # Block prefix: blk.N -> layers.N
+            ("blk.", "layers."),
+
+            # Attention norms
+            ("attn_norm", "ln_1"),
+            ("post_attention_norm", "ln_2"),
+
+            # SSM / linear attention (GatedDeltaNet layers)
+            ("ssm_a", "attn.A_log"),
+            ("ssm_dt.bias", "attn.dt_bias"),
+            ("ssm_conv1d", "attn.conv1d"),
+            ("ssm_norm", "attn.norm"),
+            ("ssm_out", "attn.out_proj"),
+            # Note: attn.in_proj is a fused projection that concatenates
+            # multiple GGUF tensors (ssm_alpha, ssm_beta, attn_qkv).
+            # The C++ runtime must concatenate them at load time.
+            # For now, map to ssm_alpha as primary data_key.
+            ("ssm_alpha", "attn.in_proj"),
+
+            # Full attention layers (every 4th layer)
+            ("attn_qkv", "attn.in_proj"),     # fused QKV + gate
+            ("attn_gate", "attn.gate_proj"),
+            ("attn_output", "attn.out_proj"),
+            ("attn_q_norm", "attn.q_norm"),
+            ("attn_k_norm", "attn.k_norm"),
+
+            # MoE expert weights (stacked 3D tensors)
+            # w1_weight = concat(gate, up) — mapped to gate_exps for data_key,
+            # runtime concatenates gate_exps + up_exps
+            ("ffn_gate_exps.weight", "mlp.experts.w1_weight"),
+            ("ffn_down_exps.weight", "mlp.experts.w2_weight"),
+
+            # MoE router
+            ("ffn_gate_inp", "mlp.gate"),
+
+            # Shared expert
+            ("ffn_gate_shexp", "mlp.shared_expert.gate_up_proj"),
+            ("ffn_up_shexp", "mlp.shared_expert.gate_up_proj"),
+            ("ffn_down_shexp", "mlp.shared_expert.down_proj"),
+            ("ffn_gate_inp_shexp", "mlp.shared_expert_gate"),
+        ],
     }
 
     def __init__(self, arch: str, n_blocks: int):
@@ -122,22 +170,61 @@ class WeightNameMapper:
             self.pytorch_to_gguf_map[pytorch_pattern] = gguf_pattern
 
     def pytorch_to_gguf(self, pytorch_name: str) -> str:
-        """Convert a PyTorch FQN to GGUF tensor name.
+        """Convert a PyTorch FQN to GGUF tensor name."""
+        # Use explicit regex mapping for qwen35moe (string replace is too fragile)
+        if self.arch in ("qwen35moe", "qwen3_5_moe"):
+            return self._qwen35moe_pytorch_to_gguf(pytorch_name)
 
-        Args:
-            pytorch_name: PyTorch parameter name (e.g., "model.layers.0.self_attn.q_proj.weight")
-
-        Returns:
-            GGUF tensor name (e.g., "blk.0.attn_q.weight")
-        """
         result = pytorch_name
-
-        # Apply PyTorch -> GGUF transformations
         for gguf_pattern, pytorch_pattern in self.mappings:
-            # Replace in reverse direction (PyTorch -> GGUF)
             result = result.replace(pytorch_pattern, gguf_pattern)
-
         return result
+
+    def _qwen35moe_pytorch_to_gguf(self, name: str) -> str:
+        """Explicit PyTorch→GGUF mapping for Qwen3.5 MoE."""
+        # Global tensors
+        if name == "embed_tokens.weight":
+            return "token_embd.weight"
+        if name == "norm.weight":
+            return "output_norm.weight"
+        if name == "lm_head.weight":
+            return "output.weight"
+
+        # Block tensors: layers.N.xxx -> blk.N.yyy
+        m = re.match(r"layers\.(\d+)\.(.*)", name)
+        if not m:
+            return name
+        blk = m.group(1)
+        rest = m.group(2)
+
+        # Norms
+        _map = {
+            "ln_1.weight": "attn_norm.weight",
+            "ln_2.weight": "post_attention_norm.weight",
+            # SSM / GatedDeltaNet
+            "attn.A_log": "ssm_a",
+            "attn.dt_bias": "ssm_dt.bias",
+            "attn.conv1d.weight": "ssm_conv1d.weight",
+            "attn.norm.weight": "ssm_norm.weight",
+            "attn.out_proj.weight": "ssm_out.weight",
+            "attn.in_proj.weight": "ssm_alpha.weight",  # fused; runtime concat
+            # Full attention (every 4th layer shares some names)
+            "attn.q_norm.weight": "attn_q_norm.weight",
+            "attn.k_norm.weight": "attn_k_norm.weight",
+            "attn.gate_proj.weight": "attn_gate.weight",
+            # MoE experts
+            "mlp.experts.w1_weight": "ffn_gate_exps.weight",  # fused gate+up; runtime concat
+            "mlp.experts.w2_weight": "ffn_down_exps.weight",
+            "mlp.gate.weight": "ffn_gate_inp.weight",
+            # Shared expert
+            "mlp.shared_expert.gate_up_proj.weight": "ffn_gate_shexp.weight",  # fused
+            "mlp.shared_expert.down_proj.weight": "ffn_down_shexp.weight",
+            "mlp.shared_expert_gate.weight": "ffn_gate_inp_shexp.weight",
+        }
+        gguf_rest = _map.get(rest)
+        if gguf_rest:
+            return f"blk.{blk}.{gguf_rest}"
+        return name  # unmapped (runtime state buffers etc.)
 
     def gguf_to_pytorch(self, gguf_name: str) -> str:
         """Convert a GGUF tensor name to PyTorch FQN.
