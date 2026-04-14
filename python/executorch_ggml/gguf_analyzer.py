@@ -130,6 +130,8 @@ class GGUFAnalyzer:
 
         if arch == "qwen3":
             return self._get_qwen3_config()
+        elif arch in ("qwen35moe", "qwen3_5_moe"):
+            return self._get_qwen35moe_config()
         elif arch == "llama":
             return self._get_llama_config()
         else:
@@ -172,6 +174,51 @@ class GGUFAnalyzer:
         else:
             # Fallback - try to infer from tensors
             config["vocab_size"] = self._infer_vocab_size()
+
+        return config
+
+    def _get_qwen35moe_config(self) -> Dict[str, Any]:
+        """Extract Qwen3.5 MoE configuration parameters."""
+        config = {}
+        arch = "qwen35moe"
+
+        required_params = {
+            "embedding_length": f"{arch}.embedding_length",
+            "block_count": f"{arch}.block_count",
+            "attention_head_count": f"{arch}.attention.head_count",
+            "attention_head_count_kv": f"{arch}.attention.head_count_kv",
+        }
+
+        for param_name, metadata_key in required_params.items():
+            value = self.metadata.get(metadata_key)
+            if value is None:
+                raise ValueError(f"Missing required qwen35moe parameter: {metadata_key}")
+            config[param_name] = value
+
+        # MoE parameters
+        config["expert_count"] = self.metadata.get(f"{arch}.expert_count", 256)
+        config["expert_used_count"] = self.metadata.get(f"{arch}.expert_used_count", 8)
+        config["expert_feed_forward_length"] = self.metadata.get(f"{arch}.expert_feed_forward_length", 512)
+        config["expert_shared_feed_forward_length"] = self.metadata.get(f"{arch}.expert_shared_feed_forward_length", 512)
+
+        # SSM parameters
+        config["ssm_conv_kernel"] = self.metadata.get(f"{arch}.ssm.conv_kernel", 4)
+        config["ssm_state_size"] = self.metadata.get(f"{arch}.ssm.state_size", 128)
+        config["ssm_group_count"] = self.metadata.get(f"{arch}.ssm.group_count", 16)
+        config["ssm_time_step_rank"] = self.metadata.get(f"{arch}.ssm.time_step_rank", 32)
+        config["ssm_inner_size"] = self.metadata.get(f"{arch}.ssm.inner_size", 4096)
+
+        # Attention parameters
+        config["attention_key_length"] = self.metadata.get(f"{arch}.attention.key_length", 256)
+        config["attention_layer_norm_rms_epsilon"] = self.metadata.get(
+            f"{arch}.attention.layer_norm_rms_epsilon", 1e-6)
+        config["full_attention_interval"] = self.metadata.get(f"{arch}.full_attention_interval", 4)
+        config["rope_freq_base"] = self.metadata.get(f"{arch}.rope.freq_base", 10000000.0)
+        config["rope_dimension_count"] = self.metadata.get(f"{arch}.rope.dimension_count", 64)
+
+        # Vocabulary
+        tokens = self.metadata.get("tokenizer.ggml.tokens")
+        config["vocab_size"] = len(tokens) if tokens is not None else self._infer_vocab_size()
 
         return config
 

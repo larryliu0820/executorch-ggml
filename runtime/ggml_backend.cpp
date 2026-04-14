@@ -60,6 +60,7 @@
 #include "ops/ops_creation.h"
 #include "ops/ops_comparison.h"
 #include "ops/ops_special.h"
+#include "ops/ops_moe.h"
 
 namespace executorch_ggml {
 
@@ -568,6 +569,14 @@ static Error build_graph(
         case ggml_ir::OpCode::UPDATE_CACHE:  gt = build_op_update_cache(bc); break;
         case ggml_ir::OpCode::ROPE:          gt = build_op_rope(bc); break;
         case ggml_ir::OpCode::REMAINDER:   gt = build_op_remainder(bc); break;
+
+        // --- MoE ops ---
+        case ggml_ir::OpCode::TOPK:          gt = build_op_topk(bc); break;
+        case ggml_ir::OpCode::TOPK_INDICES:  gt = build_op_topk_indices(bc); break;
+        case ggml_ir::OpCode::SORT:          gt = build_op_sort(bc); break;
+        case ggml_ir::OpCode::SORT_INDICES:  gt = build_op_sort_indices(bc); break;
+        case ggml_ir::OpCode::MUL_MAT_ID:   gt = build_op_mul_mat_id(bc); break;
+        case ggml_ir::OpCode::LOG1P:         gt = build_op_log1p(bc); break;
 
         default:
           fprintf(stderr, "[executorch-ggml] Unsupported OpCode %d\n", (int) op);

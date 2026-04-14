@@ -85,11 +85,18 @@ enum class OpCode : int32_t {
   PAD = 82,
   ROPE = 83,
   REMAINDER = 84,
+  TOPK = 85,
+  TOPK_INDICES = 86,
+  SORT = 87,
+  SORT_INDICES = 88,
+  MUL_MAT_ID = 89,
+  LOG1P = 90,
+  SPLIT = 91,
   MIN = NONE,
-  MAX = REMAINDER
+  MAX = SPLIT
 };
 
-inline const OpCode (&EnumValuesOpCode())[63] {
+inline const OpCode (&EnumValuesOpCode())[70] {
   static const OpCode values[] = {
     OpCode::NONE,
     OpCode::ADD,
@@ -153,13 +160,20 @@ inline const OpCode (&EnumValuesOpCode())[63] {
     OpCode::CONV_1D_DW,
     OpCode::PAD,
     OpCode::ROPE,
-    OpCode::REMAINDER
+    OpCode::REMAINDER,
+    OpCode::TOPK,
+    OpCode::TOPK_INDICES,
+    OpCode::SORT,
+    OpCode::SORT_INDICES,
+    OpCode::MUL_MAT_ID,
+    OpCode::LOG1P,
+    OpCode::SPLIT
   };
   return values;
 }
 
 inline const char * const *EnumNamesOpCode() {
-  static const char * const names[86] = {
+  static const char * const names[93] = {
     "NONE",
     "ADD",
     "MUL_MAT",
@@ -245,13 +259,20 @@ inline const char * const *EnumNamesOpCode() {
     "PAD",
     "ROPE",
     "REMAINDER",
+    "TOPK",
+    "TOPK_INDICES",
+    "SORT",
+    "SORT_INDICES",
+    "MUL_MAT_ID",
+    "LOG1P",
+    "SPLIT",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameOpCode(OpCode e) {
-  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::REMAINDER)) return "";
+  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::SPLIT)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesOpCode()[index];
 }

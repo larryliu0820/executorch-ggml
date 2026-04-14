@@ -45,6 +45,7 @@ from executorch_ggml.ops import (  # noqa: F401
     indexing,
     convolution,
     special,
+    moe_ops,
 )
 
 __all__ = [

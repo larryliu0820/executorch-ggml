@@ -70,6 +70,8 @@ def _create_pytorch_model_from_gguf_metadata(
 
     if arch == "qwen3":
         return _create_qwen3_model_from_config(config_dict, max_seq_len)
+    elif arch in ("qwen35moe", "qwen3_5_moe"):
+        return _create_qwen3_5_moe_model_from_config(config_dict, max_seq_len)
     elif arch == "llama":
         return _create_llama_model_from_config(config_dict, max_seq_len)
     else:
@@ -112,6 +114,38 @@ def _create_qwen3_model_from_config(config_dict: Dict[str, Any], max_seq_len: in
     )
 
     model.eval()
+    return model
+
+
+def _create_qwen3_5_moe_model_from_config(config_dict: Dict[str, Any], max_seq_len: int) -> torch.nn.Module:
+    """Create a Qwen3.5 MoE model from GGUF config using the export-friendly model definition."""
+    from executorch_ggml.models.qwen3_5_moe import Qwen35MoE, Qwen35MoEConfig
+
+    config = Qwen35MoEConfig(
+        vocab_size=config_dict.get("vocab_size", 248320),
+        hidden_size=config_dict["embedding_length"],
+        num_hidden_layers=config_dict["block_count"],
+        num_attention_heads=config_dict["attention_head_count"],
+        num_kv_heads=config_dict["attention_head_count_kv"],
+        head_dim=config_dict.get("attention_key_length", 256),
+        num_experts=config_dict.get("expert_count", 256),
+        num_experts_per_tok=config_dict.get("expert_used_count", 8),
+        moe_intermediate_size=config_dict.get("expert_feed_forward_length", 512),
+        shared_expert_intermediate_size=config_dict.get("expert_shared_feed_forward_length", 512),
+        full_attention_interval=config_dict.get("full_attention_interval", 4),
+        linear_conv_kernel_dim=config_dict.get("ssm_conv_kernel", 4),
+        linear_num_key_heads=config_dict["attention_head_count"],
+        linear_num_value_heads=config_dict.get("ssm_group_count", 16) * 2,
+        rms_norm_eps=config_dict.get("attention_layer_norm_rms_epsilon", 1e-6),
+        rope_theta=config_dict.get("rope_freq_base", 10000000.0),
+        max_seq_len=max_seq_len,
+    )
+
+    model = Qwen35MoE(config).eval()
+    # Mark as direct-export (bypasses CausalLMExportableModule wrapper
+    # which doesn't support hybrid SSM+attention architectures).
+    model._direct_export = True
+    model._max_seq_len = max_seq_len
     return model
 
 
@@ -273,14 +307,25 @@ def export_gguf_to_pte(
     _apply_model_optimizations(model, skip_weight_data=True)
 
     # Export model to ExportedProgram
-    exportable = CausalLMExportableModule(
-        model,
-        max_seq_len=export_config.max_seq_len,
-        use_custom_kv_cache=export_config.use_custom_kv_cache,
-        use_custom_sdpa=export_config.use_custom_sdpa,
-        disable_dynamic_shapes=not export_config.preserve_dynamic_shapes,
-    )
-    ep = exportable.export()["model"]
+    if getattr(model, '_direct_export', False):
+        # Direct export for hybrid architectures (SSM + attention)
+        # that don't work with CausalLMExportableModule's static cache wrapper.
+        import torch
+        from torch.export import export as torch_export
+        max_sl = getattr(model, '_max_seq_len', export_config.max_seq_len)
+        decode_tokens = torch.tensor([[0]], dtype=torch.long)
+        decode_pos = torch.tensor([0], dtype=torch.long)
+        with torch.no_grad():
+            ep = torch_export(model, (decode_tokens, decode_pos), strict=False)
+    else:
+        exportable = CausalLMExportableModule(
+            model,
+            max_seq_len=export_config.max_seq_len,
+            use_custom_kv_cache=export_config.use_custom_kv_cache,
+            use_custom_sdpa=export_config.use_custom_sdpa,
+            disable_dynamic_shapes=not export_config.preserve_dynamic_shapes,
+        )
+        ep = exportable.export()["model"]
 
     # Apply graph passes
     _apply_graph_passes(ep, config_dict)
@@ -323,7 +368,7 @@ def export_gguf_to_pte(
             _skip_dim_order=True,
         ),
         transform_passes=[ReplaceCopyOpsPass(), RemoveGraphAssertsPass()],
-        constant_methods=exportable.metadata,
+        constant_methods=exportable.metadata if not getattr(model, '_direct_export', False) else None,
     )
 
     # Convert to ExecuTorch

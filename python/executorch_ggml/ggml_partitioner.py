@@ -138,6 +138,15 @@ _SUPPORTED_OP_NAMES = {
     "aten.permute.default",
     "aten.permute_copy.default",
     "dim_order_ops._clone_dim_order.default",
+    # MoE ops
+    "aten.topk.default",
+    "aten.sort.default",
+    "aten.log1p.default",
+    "aten.full.default",
+    "aten.full_like.default",
+    "aten.alias_copy.default",
+    "aten.any.dim",
+    "transformers.grouped_mm_fallback.default",
 }
 
 

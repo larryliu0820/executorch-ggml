@@ -103,7 +103,16 @@ enum OpCode : int32 {
     GELU = 75,           // src_ids: [x]
 
     // Normalization (fused)
-    RMS_NORM = 76        // src_ids: [x, weight?] op_params: float32 eps, int32 has_weight
+    RMS_NORM = 76,       // src_ids: [x, weight?] op_params: float32 eps, int32 has_weight
+
+    // MoE ops
+    TOPK = 85,           // src_ids: [x] op_params: int32 k, int32 dim, int32 largest; returns values
+    TOPK_INDICES = 86,   // src_ids: [x] op_params: int32 k, int32 dim, int32 largest; returns indices
+    SORT = 87,           // src_ids: [x] op_params: int32 dim, int32 descending; returns sorted values
+    SORT_INDICES = 88,   // src_ids: [x] op_params: int32 dim, int32 descending; returns indices
+    MUL_MAT_ID = 89,     // src_ids: [input, weight, indices] expert-indexed matmul
+    LOG1P = 90,          // src_ids: [x] log(1+x)
+    SPLIT = 91           // src_ids: [x] op_params: int32 n_splits, int32 dim, n_splits × int32 sizes
 }
 
 enum TensorType : int32 {
