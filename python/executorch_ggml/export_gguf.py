@@ -141,6 +141,16 @@ def _create_qwen3_5_moe_model_from_config(config_dict: Dict[str, Any], max_seq_l
         max_seq_len=max_seq_len,
     )
 
+    # Full 256-expert model needs ~270GB RAM for torch.export (model + trace).
+    # If that's too much, reduce experts — the graph structure is the same
+    # regardless of expert count, only weight shapes change.
+    # The C++ runtime loads actual weights from GGUF at inference time.
+    import psutil
+    avail_gb = psutil.virtual_memory().available / 1e9
+    actual_experts = config.num_experts
+    if avail_gb < 300 and config.num_experts > 16:
+        config.num_experts = 16  # ~16GB instead of 133GB
+        print(f"  RAM available: {avail_gb:.0f}GB, reducing experts {actual_experts}→{config.num_experts} for export")
     model = Qwen35MoE(config).eval()
     # Mark as direct-export (bypasses CausalLMExportableModule wrapper
     # which doesn't support hybrid SSM+attention architectures).
