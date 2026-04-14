@@ -353,10 +353,12 @@ def export_gguf_to_pte(
     # Lower to ExecuTorch with GGUF weight names as data_keys
     # Configure partitioner with GGUF weight map
     quant_cfg = export_config.quant_config if export_config.enable_quantization else None
+    is_direct = getattr(model, '_direct_export', False)
     partitioner = GgmlPartitioner(
         quant_config=quant_cfg,
         gguf_weight_map=gguf_weight_map,
         skip_weight_data=export_config.skip_weight_data,
+        preserve_sdpa=not is_direct,  # Direct-export models decompose SDPA to bmm+softmax
     )
 
     # Lower to edge with GGML delegation
@@ -371,10 +373,42 @@ def export_gguf_to_pte(
         constant_methods=exportable.metadata if not getattr(model, '_direct_export', False) else None,
     )
 
+    # Patch ExecuTorch's dim_order_from_stride to handle zero strides
+    # (from expand/broadcast ops). Replace stride=0 with stride=1 for ordering.
+    import executorch.exir.tensor as _et_tensor
+    _orig_dim_order = _et_tensor.dim_order_from_stride
+    def _patched_dim_order(stride):
+        fixed = tuple(s if s != 0 else 1 for s in stride)
+        return _orig_dim_order(fixed)
+    _et_tensor.dim_order_from_stride = _patched_dim_order
+
+    # Replace non-_copy view ops with _copy variants in non-delegated subgraph.
+    # ExecuTorch requires _copy variants for all non-delegated ops.
+    if is_direct:
+        import torch
+        _view_to_copy = {
+            torch.ops.aten.view.default: torch.ops.aten.view_copy.default,
+            torch.ops.aten.slice.Tensor: torch.ops.aten.slice_copy.Tensor,
+            torch.ops.aten.select.int: torch.ops.aten.select_copy.int,
+            torch.ops.aten.unsqueeze.default: torch.ops.aten.unsqueeze_copy.default,
+            torch.ops.aten.squeeze.dims: torch.ops.aten.squeeze_copy.dims,
+            torch.ops.aten.squeeze.dim: torch.ops.aten.squeeze_copy.dims,
+            torch.ops.aten.permute.default: torch.ops.aten.permute_copy.default,
+            torch.ops.aten.expand.default: torch.ops.aten.expand_copy.default,
+        }
+        gm = edge_mgr.exported_program().graph_module
+        for node in gm.graph.nodes:
+            if node.op == "call_function" and node.target in _view_to_copy:
+                node.target = _view_to_copy[node.target]
+        gm.graph.lint()
+        gm.recompile()
+
     # Convert to ExecuTorch
+    from executorch.exir.passes import MemoryPlanningPass
     et_program = edge_mgr.to_executorch(
         config=ExecutorchBackendConfig(
             extract_delegate_segments=True,
+            memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False),
         )
     )
 

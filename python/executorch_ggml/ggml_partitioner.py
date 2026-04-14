@@ -147,6 +147,18 @@ _SUPPORTED_OP_NAMES = {
     "aten.alias_copy.default",
     "aten.any.dim",
     "transformers.grouped_mm_fallback.default",
+    # Additional ops for MoE models
+    "aten.slice_scatter.default",
+    "aten.exp.default",
+    "aten.copy.default",
+    "aten.sum.dim_IntList",
+    "aten.clamp.default",
+    "aten.argmax.default",
+    "aten.split_with_sizes.default",
+    "aten.squeeze.dim",
+    "aten.squeeze.default",
+    "aten.permute.default",
+    "aten.permute_copy.default",
 }
 
 
@@ -319,6 +331,7 @@ class GgmlPartitioner(Partitioner):
         quant_config: "GgmlQuantConfig | None" = None,
         gguf_weight_map: dict[str, str] | None = None,
         skip_weight_data: bool = False,
+        preserve_sdpa: bool = True,
     ):
         super().__init__()
         compile_specs: list[CompileSpec] = []
@@ -354,6 +367,7 @@ class GgmlPartitioner(Partitioner):
             )
         self.delegation_spec = DelegationSpec(BACKEND_ID, compile_specs)
         self.max_sdpa_ops = max_sdpa_ops
+        self.preserve_sdpa = preserve_sdpa
 
     def ops_to_not_decompose(
         self, ep: ExportedProgram
@@ -365,10 +379,10 @@ class GgmlPartitioner(Partitioner):
         in to_edge_transform_and_lower (avoids the EDGE_DO_NOT_DECOMP path
         which re-decomposes SDPA in a second pass).
         """
-        ops = [
-            torch.ops.aten.scaled_dot_product_attention.default,
-            torch.ops.aten.rms_norm.default,
-        ]
+        ops = []
+        if self.preserve_sdpa:
+            ops.append(torch.ops.aten.scaled_dot_product_attention.default)
+            ops.append(torch.ops.aten.rms_norm.default)
         try:
             ops.append(torch.ops.ggml.rope.default)
         except AttributeError:
