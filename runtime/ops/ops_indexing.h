@@ -28,6 +28,19 @@ static inline struct ggml_tensor* build_op_index(BuildContext& bc) {
   if (x->type == GGML_TYPE_I8) {
     x = safe_ggml_cast(bc.ctx, x, GGML_TYPE_I32, &bc.host_acc);
   }
+  // ggml_get_rows requires 2D source. For 3D expert stacks [D, N, E],
+  // reshape to [D*N, E], index, then reshape back to [D, N, n_selected].
+  if (x->ne[2] > 1 && x->ne[3] == 1) {
+    int64_t d0 = x->ne[0], d1 = x->ne[1], d2 = x->ne[2];
+    auto* x2d = ggml_reshape_2d(bc.ctx, x, d0 * d1, d2);
+    auto* rows = ggml_get_rows(bc.ctx, x2d, idx);
+    // rows: [d0*d1, n_selected] → reshape to [d0, d1, n_selected] or [d0, d1]
+    int64_t n_sel = rows->ne[1];
+    if (n_sel == 1) {
+      return ggml_reshape_2d(bc.ctx, rows, d0, d1);
+    }
+    return ggml_reshape_3d(bc.ctx, rows, d0, d1, n_sel);
+  }
   return ggml_get_rows(bc.ctx, x, idx);
 }
 

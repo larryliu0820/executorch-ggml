@@ -76,8 +76,9 @@ static inline struct ggml_tensor* build_op_softmax(BuildContext& bc) {
 
   struct ggml_tensor* x = bc.srcs[0];
   ggml_type orig_type = x->type;
-  if (x->type == GGML_TYPE_BF16 || x->type == GGML_TYPE_F16) {
-    x = ggml_cast(bc.ctx, x, GGML_TYPE_F32);
+  // CUDA softmax requires F32 input.
+  if (x->type != GGML_TYPE_F32) {
+    x = safe_ggml_cast(bc.ctx, x, GGML_TYPE_F32, &bc.host_acc);
   }
   struct ggml_tensor* gt;
   if (ggml_axis == 0) {
