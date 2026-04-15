@@ -23,3 +23,4 @@ python/executorch_ggml/*.so
 python/executorch_ggml/*.so.*
 python/executorch_ggml/*.dylib
 build_runner/
+qwen3/
