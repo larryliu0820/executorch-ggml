@@ -131,9 +131,9 @@ class WeightNameMapper:
             # MoE router
             ("ffn_gate_inp", "mlp.gate"),
 
-            # Shared expert
-            ("ffn_gate_shexp", "mlp.shared_expert.gate_up_proj"),
-            ("ffn_up_shexp", "mlp.shared_expert.gate_up_proj"),
+            # Shared expert (unfused gate/up)
+            ("ffn_gate_shexp", "mlp.shared_expert.gate_proj"),
+            ("ffn_up_shexp", "mlp.shared_expert.up_proj"),
             ("ffn_down_shexp", "mlp.shared_expert.down_proj"),
             ("ffn_gate_inp_shexp", "mlp.shared_expert_gate"),
         ],
@@ -201,23 +201,28 @@ class WeightNameMapper:
         _map = {
             "ln_1.weight": "attn_norm.weight",
             "ln_2.weight": "post_attention_norm.weight",
-            # SSM / GatedDeltaNet
+            # SSM / GatedDeltaNet (unfused projections)
             "attn.A_log": "ssm_a",
             "attn.dt_bias": "ssm_dt.bias",
             "attn.conv1d.weight": "ssm_conv1d.weight",
             "attn.norm.weight": "ssm_norm.weight",
             "attn.out_proj.weight": "ssm_out.weight",
-            "attn.in_proj.weight": "ssm_alpha.weight",  # fused; runtime concat
-            # Full attention (every 4th layer shares some names)
+            "attn._in_proj_qkv.weight": "attn_qkv.weight",
+            "attn._in_proj_z.weight": "attn_gate.weight",   # z/output gate
+            "attn._in_proj_b.weight": "ssm_beta.weight",    # beta projection
+            "attn._in_proj_a.weight": "ssm_alpha.weight",   # alpha/time-step projection
+            # Full attention (every 4th layer)
             "attn.q_norm.weight": "attn_q_norm.weight",
             "attn.k_norm.weight": "attn_k_norm.weight",
             "attn.gate_proj.weight": "attn_gate.weight",
-            # MoE experts
-            "mlp.experts.w1_weight": "ffn_gate_exps.weight",  # fused gate+up; runtime concat
-            "mlp.experts.w2_weight": "ffn_down_exps.weight",
+            # MoE experts (unfused gate/up)
+            "mlp.experts.gate_weight": "ffn_gate_exps.weight",
+            "mlp.experts.up_weight": "ffn_up_exps.weight",
+            "mlp.experts.down_weight": "ffn_down_exps.weight",
             "mlp.gate.weight": "ffn_gate_inp.weight",
-            # Shared expert
-            "mlp.shared_expert.gate_up_proj.weight": "ffn_gate_shexp.weight",  # fused
+            # Shared expert (unfused gate/up)
+            "mlp.shared_expert.gate_proj.weight": "ffn_gate_shexp.weight",
+            "mlp.shared_expert.up_proj.weight": "ffn_up_shexp.weight",
             "mlp.shared_expert.down_proj.weight": "ffn_down_shexp.weight",
             "mlp.shared_expert_gate.weight": "ffn_gate_inp_shexp.weight",
         }

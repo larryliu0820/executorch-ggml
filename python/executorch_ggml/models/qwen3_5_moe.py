@@ -320,9 +320,11 @@ class GatedDeltaNet(nn.Module):
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
 
-        # Fused input projection: qkv + z + b + a in one linear
-        self.in_proj_dim = self.conv_dim + self.value_dim + 2 * self.num_v_heads
-        self.in_proj = nn.Linear(config.hidden_size, self.in_proj_dim, bias=False)
+        # Input projections: unfused for GGUF weight mapping (each maps 1:1 to GGUF tensor)
+        self._in_proj_qkv = nn.Linear(config.hidden_size, self.conv_dim, bias=False)
+        self._in_proj_z = nn.Linear(config.hidden_size, self.value_dim, bias=False)
+        self._in_proj_b = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
+        self._in_proj_a = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
 
         self.conv1d = nn.Conv1d(
             self.conv_dim,
@@ -364,15 +366,11 @@ class GatedDeltaNet(nn.Module):
         self.conv_state[:B].mul_(keep)
         self.recurrent_state[:B].mul_(keep)
 
-        # Fused projection: split into qkv, z, b, a
-        proj = self.in_proj(x)
-        cd = self.conv_dim
-        vd = self.value_dim
-        nh = self.num_v_heads
-        mixed_qkv = proj[..., :cd]
-        z = proj[..., cd : cd + vd].reshape(B, T, self.num_v_heads, self.head_v_dim)
-        b = proj[..., cd + vd : cd + vd + nh]
-        a = proj[..., cd + vd + nh :]
+        # Unfused projections: each maps 1:1 to a GGUF tensor
+        mixed_qkv = self._in_proj_qkv(x)
+        z = self._in_proj_z(x).reshape(B, T, self.num_v_heads, self.head_v_dim)
+        b = self._in_proj_b(x)
+        a = self._in_proj_a(x)
 
         # Causal depthwise conv1d with state (manual, avoids conv1d→conv2d decomposition)
         qkv_t = mixed_qkv.transpose(1, 2)
@@ -481,58 +479,47 @@ class FusedMoEExperts(nn.Module):
         self.group_size = 32
         self.use_batched_moe = False
 
-        self.w1_weight = nn.Parameter(
-            torch.empty(
-                config.num_experts,
-                2 * config.moe_intermediate_size,
-                config.hidden_size,
-            )
-        )
-        self.w2_weight = nn.Parameter(
-            torch.empty(
-                config.num_experts,
-                config.hidden_size,
-                config.moe_intermediate_size,
-            )
-        )
+        # Unfused expert weights: separate gate and up for 1:1 GGUF mapping
+        self.gate_weight = nn.Parameter(
+            torch.empty(config.num_experts, config.moe_intermediate_size, config.hidden_size))
+        self.up_weight = nn.Parameter(
+            torch.empty(config.num_experts, config.moe_intermediate_size, config.hidden_size))
+        self.down_weight = nn.Parameter(
+            torch.empty(config.num_experts, config.hidden_size, config.moe_intermediate_size))
 
     def forward(self, x, expert_weights, expert_indices, top_k):
-        # Pure-PyTorch MoE: loop over selected experts.
+        # Pure-PyTorch MoE with unfused expert weights.
         # x: [T, D], expert_weights: [T, top_k], expert_indices: [T, top_k]
-        # w1_weight: [E, 2*N, D], w2_weight: [E, D, N]
         T, D = x.shape
-        N = self.w2_weight.shape[2]  # intermediate size
+        N = self.down_weight.shape[2]
         out = torch.zeros_like(x)
         for k_idx in range(top_k):
-            idx = expert_indices[:, k_idx]  # [T] expert indices
-            w = expert_weights[:, k_idx]    # [T] expert weights
-            # Gather expert weights for selected experts
-            w1 = self.w1_weight[idx]  # [T, 2*N, D]
-            w2 = self.w2_weight[idx]  # [T, D, N]
-            # gate_up = x @ w1^T  -> [T, 2*N]
-            gate_up = torch.bmm(w1, x.unsqueeze(2)).squeeze(2)  # [T, 2*N]
-            gate, up = gate_up.chunk(2, dim=-1)
-            # SwiGLU: silu(gate) * up
-            hidden = F.silu(gate) * up  # [T, N]
-            # down = hidden @ w2^T -> [T, D]
-            down = torch.bmm(w2, hidden.unsqueeze(2)).squeeze(2)  # [T, D]
+            idx = expert_indices[:, k_idx]
+            w = expert_weights[:, k_idx]
+            gate_w = self.gate_weight[idx]  # [T, N, D]
+            up_w = self.up_weight[idx]      # [T, N, D]
+            down_w = self.down_weight[idx]  # [T, D, N]
+            gate = torch.bmm(gate_w, x.unsqueeze(2)).squeeze(2)  # [T, N]
+            up = torch.bmm(up_w, x.unsqueeze(2)).squeeze(2)      # [T, N]
+            hidden = F.silu(gate) * up
+            down = torch.bmm(down_w, hidden.unsqueeze(2)).squeeze(2)  # [T, D]
             out = out + w.unsqueeze(1) * down
         return out
 
 
 class SwiGLU(nn.Module):
-    """SwiGLU MLP with fused gate+up projection."""
+    """SwiGLU MLP with unfused gate/up for GGUF weight mapping."""
 
     def __init__(self, hidden_size, intermediate_size):
         super().__init__()
-        self.gate_up_proj = nn.Linear(hidden_size, 2 * intermediate_size, bias=False)
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.intermediate_size = intermediate_size
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        gate = gate_up[..., : self.intermediate_size]
-        up = gate_up[..., self.intermediate_size :]
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
         return self.down_proj(F.silu(gate) * up)
 
 
