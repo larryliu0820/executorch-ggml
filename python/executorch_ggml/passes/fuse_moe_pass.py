@@ -24,8 +24,8 @@ import torch
 from torch.fx import Node
 
 
-# Register the ggml.moe_ffn custom op
-_LIB = torch.library.Library("ggml", "DEF")
+# Register the ggml.moe_ffn custom op using FRAGMENT to avoid conflict with rope_op.py
+_LIB = torch.library.Library("ggml", "FRAGMENT")
 _LIB.define(
     "moe_ffn(Tensor input, Tensor gate_inp, Tensor gate_exps, Tensor up_exps, "
     "Tensor down_exps, int n_expert, int top_k) -> Tensor"
@@ -35,11 +35,9 @@ _LIB.define(
 @torch.library.impl(_LIB, "moe_ffn", "CompositeExplicitAutograd")
 def _moe_ffn_impl(input, gate_inp, gate_exps, up_exps, down_exps, n_expert, top_k):
     """Fallback implementation for tracing (not used at runtime)."""
-    # Router
-    scores = input @ gate_inp.T  # [T, n_expert]
+    scores = input @ gate_inp.T
     expert_weights, expert_indices = torch.topk(scores, top_k, dim=-1)
     expert_weights = expert_weights.softmax(dim=-1)
-    # Simple per-expert dispatch
     T, D = input.shape
     out = torch.zeros_like(input)
     for k in range(top_k):
