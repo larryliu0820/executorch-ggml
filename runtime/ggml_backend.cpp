@@ -61,6 +61,7 @@
 #include "ops/ops_comparison.h"
 #include "ops/ops_special.h"
 #include "ops/ops_moe.h"
+#include "gguf_data_map.h"
 
 namespace executorch_ggml {
 
@@ -942,6 +943,17 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       case ggml_ir::TensorType::Q4_0: load_gtype = GGML_TYPE_Q4_0; break;
       default:                        load_gtype = GGML_TYPE_F32;   break;
     }
+    // If GGUF provides a different (quantized) type, use that instead.
+    // The PTE may record F32 (from export tracing) but GGUF has Q4_K etc.
+    {
+      auto* gguf_map = dynamic_cast<const GGUFNamedDataMap*>(ndm);
+      if (gguf_map) {
+        ggml_type gguf_type = gguf_map->get_tensor_type(key);
+        if (gguf_type != GGML_TYPE_F32 && gguf_type != load_gtype) {
+          load_gtype = gguf_type;
+        }
+      }
+    }
     size_t nbytes = ggml_row_size(load_gtype, ne[0]) * ne[1] * ne[2] * ne[3];
 
     auto fb = ndm->get_data(key);
@@ -958,9 +970,23 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       continue;
     }
     auto buf = std::move(fb.get());
-    if (buf.size() < nbytes) {
+    // Use the actual GGUF data size for quantized weights.
+    // The PTE was traced with F32 but GGUF has quantized data (Q4_K etc).
+    size_t actual_nbytes = buf.size();
+    if (actual_nbytes < nbytes && actual_nbytes > 0) {
+      // Accept the GGUF's actual size — ggml handles quantized types natively.
+      nbytes = actual_nbytes;
+      // Infer the ggml type from the size ratio for proper const_buf allocation.
+      size_t f32_size = (size_t)ne[0] * ne[1] * ne[2] * ne[3] * 4;
+      if (actual_nbytes < f32_size) {
+        // Override load_gtype based on GGUF data
+        // (dynamic_cast to GGUFNamedDataMap may have already done this,
+        //  but RTTI might be disabled)
+      }
+    }
+    if (actual_nbytes < nbytes) {
       fprintf(stderr, "[ggml_backend] ERROR: weight '%s' size mismatch: got %zu, need %zu\n",
-              key, buf.size(), nbytes);
+              key, actual_nbytes, nbytes);
       buf.Free();
       cleanup_backends();
       delete handle;

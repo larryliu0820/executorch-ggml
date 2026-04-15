@@ -53,9 +53,14 @@ class GGUFNamedDataMap : public executorch::runtime::NamedDataMap {
 
   executorch::runtime::Result<const executorch::runtime::TensorLayout>
   get_tensor_layout(executorch::aten::string_view key) const override {
-    // Not needed for GGML backend weight loading, but required by interface.
     (void)key;
     return executorch::runtime::Error::NotFound;
+  }
+
+  /// Get the ggml type of a GGUF tensor by name (for quantized weight loading).
+  ggml_type get_tensor_type(const char* name) const {
+    struct ggml_tensor* gt = ggml_get_tensor(tensor_ctx_, name);
+    return gt ? gt->type : GGML_TYPE_F32;
   }
 
   executorch::runtime::Result<executorch::runtime::FreeableBuffer>
