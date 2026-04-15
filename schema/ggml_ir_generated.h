@@ -96,11 +96,12 @@ enum class OpCode : int32_t {
   SUM = 93,
   CLAMP = 94,
   SLICE_SCATTER = 95,
+  MOE_FFN = 96,
   MIN = NONE,
-  MAX = SLICE_SCATTER
+  MAX = MOE_FFN
 };
 
-inline const OpCode (&EnumValuesOpCode())[74] {
+inline const OpCode (&EnumValuesOpCode())[75] {
   static const OpCode values[] = {
     OpCode::NONE,
     OpCode::ADD,
@@ -175,13 +176,14 @@ inline const OpCode (&EnumValuesOpCode())[74] {
     OpCode::EXP,
     OpCode::SUM,
     OpCode::CLAMP,
-    OpCode::SLICE_SCATTER
+    OpCode::SLICE_SCATTER,
+    OpCode::MOE_FFN
   };
   return values;
 }
 
 inline const char * const *EnumNamesOpCode() {
-  static const char * const names[97] = {
+  static const char * const names[98] = {
     "NONE",
     "ADD",
     "MUL_MAT",
@@ -278,13 +280,14 @@ inline const char * const *EnumNamesOpCode() {
     "SUM",
     "CLAMP",
     "SLICE_SCATTER",
+    "MOE_FFN",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameOpCode(OpCode e) {
-  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::SLICE_SCATTER)) return "";
+  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::MOE_FFN)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesOpCode()[index];
 }

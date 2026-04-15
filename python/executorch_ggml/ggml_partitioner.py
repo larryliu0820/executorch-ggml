@@ -159,6 +159,7 @@ _SUPPORTED_OP_NAMES = {
     "aten.squeeze.default",
     "aten.permute.default",
     "aten.permute_copy.default",
+    "ggml.moe_ffn.default",
 }
 
 

@@ -165,4 +165,77 @@ static inline struct ggml_tensor* build_op_slice_scatter(BuildContext& bc) {
   return bc.srcs[0];
 }
 
+// ---------------------------------------------------------------------------
+// MOE_FFN — fused Mixture-of-Experts FFN (matches llama.cpp's build_moe_ffn)
+// ---------------------------------------------------------------------------
+static inline struct ggml_tensor* build_op_moe_ffn(BuildContext& bc) {
+  // src_ids: [input, gate_inp, gate_exps, up_exps, down_exps]
+  // op_params: int32 n_expert, int32 top_k
+  struct ggml_tensor* input = bc.srcs[0];      // [n_embd, n_tokens]
+  struct ggml_tensor* gate_inp = bc.srcs[1];    // [n_expert, n_embd] (router weight)
+  struct ggml_tensor* gate_exps = bc.srcs[2];   // [n_ff, n_embd, n_expert]
+  struct ggml_tensor* up_exps = bc.srcs[3];     // [n_ff, n_embd, n_expert]
+  struct ggml_tensor* down_exps = bc.srcs[4];   // [n_embd, n_ff, n_expert]
+
+  int32_t n_expert = 0, top_k = 0;
+  if (bc.ir_tensor->op_params() && bc.ir_tensor->op_params()->size() >= 8) {
+    const uint8_t* p = bc.ir_tensor->op_params()->data();
+    memcpy(&n_expert, p, 4);
+    memcpy(&top_k, p + 4, 4);
+  }
+
+  int64_t n_embd = input->ne[0];
+  int64_t n_tokens = input->ne[1];
+
+  // 1. Router: logits = gate_inp @ input → [n_expert, n_tokens]
+  auto* logits = ggml_mul_mat(bc.ctx, gate_inp, input);
+
+  // 2. Softmax gating → [n_expert, n_tokens]
+  auto* probs = ggml_soft_max(bc.ctx, logits);
+
+  // 3. Top-K expert selection → [top_k, n_tokens] I32
+  auto* selected = ggml_argsort_top_k(bc.ctx, probs, top_k);
+
+  // 4. Gather selected expert weights → [1, top_k, n_tokens]
+  auto* probs_3d = ggml_reshape_3d(bc.ctx, probs, 1, n_expert, n_tokens);
+  auto* weights = ggml_get_rows(bc.ctx, probs_3d, selected);  // [1, top_k, n_tokens]
+
+  // 5. Normalize weights (softmax over selected experts)
+  auto* weights_2d = ggml_reshape_2d(bc.ctx, weights, top_k, n_tokens);
+  weights = ggml_soft_max(bc.ctx, weights_2d);
+  weights = ggml_reshape_3d(bc.ctx, weights, 1, top_k, n_tokens);
+
+  // 6. Expert computation via mul_mat_id
+  auto* cur = ggml_reshape_3d(bc.ctx, input, n_embd, 1, n_tokens);
+
+  // gate = gate_exps[selected] @ cur → [n_ff, top_k, n_tokens]
+  auto* gate = ggml_mul_mat_id(bc.ctx, gate_exps, cur, selected);
+  // up = up_exps[selected] @ cur → [n_ff, top_k, n_tokens]
+  auto* up = ggml_mul_mat_id(bc.ctx, up_exps, cur, selected);
+
+  // 7. SwiGLU activation: silu(gate) * up
+  auto* act = ggml_swiglu_split(bc.ctx, gate, up);
+
+  // 8. Down projection: down_exps[selected] @ act → [n_embd, top_k, n_tokens]
+  auto* experts = ggml_mul_mat_id(bc.ctx, down_exps, act, selected);
+
+  // 9. Weight and reduce: sum(experts * weights, dim=top_k)
+  experts = ggml_mul(bc.ctx, experts, weights);
+
+  // Sum over top_k dimension: reshape to [n_embd * top_k, n_tokens] is wrong.
+  // Instead: experts is [n_embd, top_k, n_tokens], sum over dim 1 (top_k).
+  // ggml doesn't have a general reduce-sum. Use view + sum_rows trick:
+  // Transpose to [top_k, n_embd, n_tokens], then sum_rows → [1, n_embd, n_tokens]
+  // Actually, in ggml convention ne[0] is the "row" dimension.
+  // experts: ne = [n_embd, top_k, n_tokens, 1]
+  // We want to sum over ne[1] (top_k). Use permute + sum_rows + reshape.
+  auto* exp_perm = ggml_cont(bc.ctx, ggml_permute(bc.ctx, experts, 1, 0, 2, 3));
+  // exp_perm: ne = [top_k, n_embd, n_tokens, 1]
+  auto* summed = ggml_sum_rows(bc.ctx, exp_perm);
+  // summed: ne = [1, n_embd, n_tokens, 1]
+  auto* result = ggml_reshape_2d(bc.ctx, summed, n_embd, n_tokens);
+
+  return result;
+}
+
 } // namespace executorch_ggml

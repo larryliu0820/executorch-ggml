@@ -116,7 +116,8 @@ enum OpCode : int32 {
     EXP = 92,            // src_ids: [x]
     SUM = 93,            // src_ids: [x] op_params: int32 dim, int32 keepdim
     CLAMP = 94,          // src_ids: [x] op_params: float32 min, float32 max
-    SLICE_SCATTER = 95   // src_ids: [dst, src] op_params: int32 dim, int32 start, int32 end, int32 step
+    SLICE_SCATTER = 95,  // src_ids: [dst, src] op_params: int32 dim, int32 start, int32 end, int32 step
+    MOE_FFN = 96         // src_ids: [input, gate_inp, gate_exps, up_exps, down_exps] op_params: int32 n_expert, int32 top_k
 }
 
 enum TensorType : int32 {

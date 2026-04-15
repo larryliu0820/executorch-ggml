@@ -436,3 +436,52 @@ def handle_full_like(ctx, node, target_str):
         )
     )
     ctx.node_to_id[node] = tid
+
+
+# ---------------------------------------------------------------------------
+# ggml.moe_ffn — fused MoE FFN (router + experts + weighted sum)
+# ---------------------------------------------------------------------------
+
+@register_op("ggml.moe_ffn.default")
+def handle_moe_ffn(ctx, node, target_str):
+    """ggml.moe_ffn(input, gate_inp, gate_exps, up_exps, down_exps, n_expert, top_k).
+
+    Emits a single OP_MOE_FFN IR tensor that the C++ runtime expands into
+    llama.cpp's ~11-op ggml sequence: argsort_top_k → softmax → mul_mat_id ×3
+    → swiglu → weighted sum.
+    """
+    from executorch_ggml.serialize import OP_MOE_FFN
+
+    input_node = node.args[0]
+    gate_inp_node = node.args[1]
+    gate_exps_node = node.args[2]
+    up_exps_node = node.args[3]
+    down_exps_node = node.args[4]
+    n_expert = int(node.args[5])
+    top_k = int(node.args[6])
+
+    input_id = ctx.node_to_id[input_node]
+    gate_inp_id = ctx.node_to_id[gate_inp_node]
+    gate_exps_id = ctx.node_to_id[gate_exps_node]
+    up_exps_id = ctx.node_to_id[up_exps_node]
+    down_exps_id = ctx.node_to_id[down_exps_node]
+
+    fake_val = node.meta.get("val")
+    shape = _resolve_shape(fake_val)
+    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
+
+    tid = ctx.alloc_id()
+    ctx.ir_tensors.append(
+        IrTensor(
+            tensor_id=tid,
+            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+            ne=_pytorch_shape_to_ggml_ne(shape),
+            op=OP_MOE_FFN,
+            src_ids=[input_id, gate_inp_id, gate_exps_id, up_exps_id, down_exps_id],
+            op_params=struct.pack("<ii", n_expert, top_k),
+            sym_dim_ids=_vsym,
+            sym_dim_exprs=_vexprs,
+        )
+    )
+    ctx.node_to_id[node] = tid

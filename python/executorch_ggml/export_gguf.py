@@ -266,6 +266,20 @@ def _apply_graph_passes(ep, config_dict: Dict[str, Any]) -> None:
     except ImportError:
         pass
 
+    # MoE fusion: replace per-expert loops with single ggml.moe_ffn ops
+    if config_dict.get("expert_count", 0) > 1:
+        try:
+            from executorch_ggml.passes.fuse_moe_pass import fuse_moe_in_graph
+            n_fused = fuse_moe_in_graph(
+                ep.graph_module,
+                num_experts=config_dict.get("expert_count", 256),
+                top_k=config_dict.get("expert_used_count", 8),
+            )
+            if n_fused > 0:
+                print(f"  fuse_moe: {n_fused} MoE instances fused")
+        except ImportError:
+            pass
+
     # CSE: merge duplicate linears from fused projections
     try:
         from executorch_ggml.passes.cse_pass import eliminate_common_subexpressions

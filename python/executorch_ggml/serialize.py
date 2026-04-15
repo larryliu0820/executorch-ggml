@@ -116,6 +116,7 @@ OP_EXP = 92
 OP_SUM = 93
 OP_CLAMP = 94
 OP_SLICE_SCATTER = 95
+OP_MOE_FFN = 96
 
 # Fused attention (llama.cpp/ggml)
 OP_LLAMA_ATTENTION = 60

@@ -609,6 +609,7 @@ static Error build_graph(
         case ggml_ir::OpCode::SUM:           gt = build_op_sum(bc); break;
         case ggml_ir::OpCode::CLAMP:         gt = build_op_clamp(bc); break;
         case ggml_ir::OpCode::SLICE_SCATTER: gt = build_op_slice_scatter(bc); break;
+        case ggml_ir::OpCode::MOE_FFN:      gt = build_op_moe_ffn(bc); break;
 
         default:
           fprintf(stderr, "[executorch-ggml] Unsupported OpCode %d\n", (int) op);
