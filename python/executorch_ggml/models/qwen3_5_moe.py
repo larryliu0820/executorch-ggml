@@ -542,6 +542,7 @@ class SparseMoE(nn.Module):
 
         scores = self.gate(x_flat)
         expert_weights, expert_indices = torch.topk(scores, self.top_k, dim=-1)
+        expert_indices = expert_indices.to(torch.int32)  # ggml has no I64 CUDA support
         expert_weights = expert_weights.softmax(dim=-1)
 
         routed_out = self.experts(

@@ -109,10 +109,12 @@ def handle_topk(ctx, node, target_str):
 
     _vsym_i, _vexprs_i = _sym_dim_info_ggml(idx_fv, ctx.sym_id_map)
     indices_tid = ctx.alloc_id()
+    # Force I32 for indices — ggml has no I64 support on CUDA.
+    # llama.cpp uses I32 for all argsort/topk indices.
     ctx.ir_tensors.append(
         IrTensor(
             tensor_id=indices_tid,
-            tensor_type=_torch_dtype_to_ir_type(idx_dtype),
+            tensor_type=TYPE_I32,
             ne=_pytorch_shape_to_ggml_ne(idx_shape),
             op=OP_TOPK_INDICES,
             src_ids=[input_id],
@@ -190,10 +192,11 @@ def handle_sort(ctx, node, target_str):
 
     _vsym_i, _vexprs_i = _sym_dim_info_ggml(idx_fv, ctx.sym_id_map)
     indices_tid = ctx.alloc_id()
+    # Force I32 — ggml has no I64 support on CUDA.
     ctx.ir_tensors.append(
         IrTensor(
             tensor_id=indices_tid,
-            tensor_type=_torch_dtype_to_ir_type(idx_dtype),
+            tensor_type=TYPE_I32,
             ne=_pytorch_shape_to_ggml_ne(idx_shape),
             op=OP_SORT_INDICES,
             src_ids=[input_id],
