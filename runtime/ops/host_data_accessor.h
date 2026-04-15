@@ -132,7 +132,11 @@ static struct ggml_tensor* safe_ggml_cast(
     }
   }
   if (src->type == GGML_TYPE_I64) {
-    // I64 -> I32 eager, then I32 -> target via native ggml_cast
+    // I64 -> I32 eager, then I32 -> target via native ggml_cast.
+    // Only works if host data is available. If not, return src unchanged
+    // and let the caller handle it (e.g., pin to CPU).
+    const void* i64_data = acc ? acc->get(src) : src->data;
+    if (!i64_data) return src;  // Caller must handle I64 without host data
     auto* i32 = eager_cast_i64_to_i32(ctx, src, acc);
     return (target == GGML_TYPE_F32) ? safe_ggml_cast(ctx, i32, GGML_TYPE_F32, acc)
                                      : safe_ggml_cast(ctx, safe_ggml_cast(ctx, i32, GGML_TYPE_F32, acc), target, acc);

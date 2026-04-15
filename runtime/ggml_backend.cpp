@@ -8,6 +8,7 @@
 #include "ggml_backend.h"
 
 #include <algorithm>
+#include <csignal>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -382,6 +383,14 @@ static Error build_graph(
   if (verbose) { fprintf(stderr, "[ggml_backend] Phase B: creating tensors (single pass)...\n"); fflush(stderr); }
   static int s_last_processed = -1;
   static int s_n_tensors = 0;
+  // Install crash handler to report which tensor caused the crash.
+  static auto crash_handler = [](int sig) {
+    fprintf(stderr, "\n[ggml_backend] CRASH (signal %d) at tensor %d/%d\n", sig, s_last_processed, s_n_tensors);
+    fflush(stderr);
+    std::_Exit(128 + sig);
+  };
+  std::signal(SIGSEGV, crash_handler);
+  std::signal(SIGABRT, crash_handler);
   s_last_processed = -1;
   s_n_tensors = n_tensors;
   // Always use native ggml decomposition for comparison/bitwise/logical ops.
@@ -475,8 +484,26 @@ static Error build_graph(
     // Resolve sources from cached src_ids (no FlatBuffer access).
     std::vector<struct ggml_tensor*> srcs;
     srcs.reserve(ct.src_ids.size());
+    bool has_null_src = false;
     for (int src_id : ct.src_ids) {
-      srcs.push_back(id_to_tensor[src_id]);
+      auto* s = id_to_tensor[src_id];
+      if (!s) has_null_src = true;
+      srcs.push_back(s);
+    }
+
+    // Log ops around crash point
+    if (i >= 1725 || (int)op > 84 || has_null_src) {
+      fprintf(stderr, "[ggml_backend] tensor %d/%d op=%d (%s) srcs=%zu ne=[%lld,%lld,%lld,%lld]",
+              i, n_tensors, (int)op, ggml_ir::EnumNameOpCode(op),
+              ct.src_ids.size(),
+              (long long)ne[0], (long long)ne[1], (long long)ne[2], (long long)ne[3]);
+      for (size_t si = 0; si < srcs.size() && si < 3; si++) {
+        auto* s = srcs[si];
+        if (s) fprintf(stderr, " src%zu=[%lld,%lld,%lld,%lld]t%d", si,
+            (long long)s->ne[0], (long long)s->ne[1], (long long)s->ne[2], (long long)s->ne[3], (int)s->type);
+        else fprintf(stderr, " src%zu=NULL(id=%d)", si, ct.src_ids[si]);
+      }
+      fprintf(stderr, "\n"); fflush(stderr);
     }
 
     // BuildContext still needs fb ir_tensor for build_op_* helpers.
@@ -943,14 +970,17 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
       case ggml_ir::TensorType::Q4_0: load_gtype = GGML_TYPE_Q4_0; break;
       default:                        load_gtype = GGML_TYPE_F32;   break;
     }
-    // If GGUF provides a different (quantized) type, use that instead.
-    // The PTE may record F32 (from export tracing) but GGUF has Q4_K etc.
+    // If GGUF provides a different (quantized) type for large weights, use that.
+    // Small constants (norms, biases) stay F32 even if GGUF stores them quantized.
     {
-      auto* gguf_map = dynamic_cast<const GGUFNamedDataMap*>(ndm);
-      if (gguf_map) {
-        ggml_type gguf_type = gguf_map->get_tensor_type(key);
-        if (gguf_type != GGML_TYPE_F32 && gguf_type != load_gtype) {
-          load_gtype = gguf_type;
+      size_t numel = (size_t)ne[0] * ne[1] * ne[2] * ne[3];
+      if (numel > 4096) {
+        auto* gguf_map = dynamic_cast<const GGUFNamedDataMap*>(ndm);
+        if (gguf_map) {
+          ggml_type gguf_type = gguf_map->get_tensor_type(key);
+          if (gguf_type != GGML_TYPE_F32 && gguf_type != load_gtype) {
+            load_gtype = gguf_type;
+          }
         }
       }
     }
@@ -1009,6 +1039,7 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
   // record per-tensor {buf, offset, nbytes} in leaf_buf_map.
   {
     const size_t alignment = 64;  // safe alignment for all backends
+    const auto* ndm = context.get_named_data_map();
     size_t const_total = 0, mutable_total = 0;
 
     // First pass: compute sizes.
@@ -1037,6 +1068,16 @@ Result<DelegateHandle*> GgmlBackendInterface::init(
         case ggml_ir::TensorType::Q6_K: gtype = GGML_TYPE_Q6_K; break;
         case ggml_ir::TensorType::Q4_0: gtype = GGML_TYPE_Q4_0; break;
         default:                        gtype = GGML_TYPE_F32;   break;
+      }
+      // If GGUF provides a quantized version for large weight tensors, use its actual size.
+      // Small constants (norms, biases, routing) stay F32.
+      size_t numel = (size_t)ne[0] * ne[1] * ne[2] * ne[3];
+      if (has_key && gtype == GGML_TYPE_F32 && numel > 4096) {
+        auto* gguf_map = dynamic_cast<const GGUFNamedDataMap*>(ndm);
+        if (gguf_map) {
+          ggml_type gt = gguf_map->get_tensor_type(t->data_key()->c_str());
+          if (gt != GGML_TYPE_F32) gtype = gt;
+        }
       }
       size_t nbytes = ggml_row_size(gtype, ne[0]) * ne[1] * ne[2] * ne[3];
       size_t padded = ((nbytes + alignment - 1) / alignment) * alignment;
