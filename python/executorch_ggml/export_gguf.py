@@ -141,17 +141,20 @@ def _create_qwen3_5_moe_model_from_config(config_dict: Dict[str, Any], max_seq_l
         max_seq_len=max_seq_len,
     )
 
-    # Full 256-expert model needs ~270GB RAM for torch.export (model + trace).
-    # If that's too much, reduce experts — the graph structure is the same
-    # regardless of expert count, only weight shapes change.
-    # The C++ runtime loads actual weights from GGUF at inference time.
-    import psutil
-    avail_gb = psutil.virtual_memory().available / 1e9
-    actual_experts = config.num_experts
-    if avail_gb < 300 and config.num_experts > 16:
-        config.num_experts = 16  # ~16GB instead of 133GB
-        print(f"  RAM available: {avail_gb:.0f}GB, reducing experts {actual_experts}→{config.num_experts} for export")
-    model = Qwen35MoE(config).eval()
+    # Create on meta device (zero RAM), then materialize to CPU with
+    # torch.empty (lazy page allocation).  Only 1.7GB RSS for 138GB
+    # of parameters — OS allocates physical pages only on access, and
+    # torch.export only reads shapes/dtypes, not values.
+    with torch.device("meta"):
+        model = Qwen35MoE(config)
+    def _materialize_cpu(module):
+        for name, param in list(module.named_parameters(recurse=False)):
+            setattr(module, name, torch.nn.Parameter(
+                torch.empty(param.shape, dtype=param.dtype), requires_grad=False))
+        for name, buf in list(module.named_buffers(recurse=False)):
+            module.register_buffer(name, torch.empty(buf.shape, dtype=buf.dtype))
+    model.apply(_materialize_cpu)
+    model.eval()
     # Mark as direct-export (bypasses CausalLMExportableModule wrapper
     # which doesn't support hybrid SSM+attention architectures).
     model._direct_export = True
