@@ -119,7 +119,12 @@ static inline struct ggml_tensor* build_op_le(BuildContext& bc) {
       // Do NOT mark as input_derived — this is a constant zero tensor.
       return f32;
     }
-    // I32, F16, BF16 etc: ggml_cast to F32 works natively
+    // I32→F32: use ggml_cast as graph node (avoid eager path that may crash
+    // during build_graph when tensors don't have buffers yet).
+    if (x->type == GGML_TYPE_I32) {
+      return ggml_cast(bc.ctx, x, GGML_TYPE_F32);
+    }
+    // F16, BF16 etc: ggml_cast to F32 works natively
     return safe_ggml_cast(bc.ctx, x, GGML_TYPE_F32, &bc.host_acc);
   };
   a = to_f32(a);
