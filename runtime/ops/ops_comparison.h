@@ -95,13 +95,10 @@ static inline struct ggml_tensor* build_op_le(BuildContext& bc) {
     b = bc.srcs[1];
   }
   // Cast inputs to F32 for comparison.
-  // I64 without host data needs CPU-pinned cast (no CUDA I64 support).
-  // I32→F32 works natively via ggml_cast on both CPU and CUDA.
   auto to_f32 = [&](struct ggml_tensor* x) -> struct ggml_tensor* {
     if (x->type == GGML_TYPE_F32) return x;
     if (x->type == GGML_TYPE_I64) {
-      // I64 has no CUDA support. If host data exists (eager constant), convert inline.
-      // Otherwise, pin to CPU and use graph-level I64→I32→F32 cast chain.
+      // I64 with host data: eager CPU conversion.
       if (x->data) {
         int64_t n = ggml_nelements(x);
         ggml_set_no_alloc(bc.ctx, false);
@@ -112,12 +109,14 @@ static inline struct ggml_tensor* build_op_le(BuildContext& bc) {
         for (int64_t i = 0; i < n; i++) dd[i] = (float)sd[i];
         return f32;
       }
-      // Graph node on GPU: pin to CPU for I64 cast support
-      pin_to_cpu(bc, x);
-      auto* i32 = ggml_cast(bc.ctx, x, GGML_TYPE_I32);
-      pin_to_cpu(bc, i32);
-      auto* f32 = ggml_cast(bc.ctx, i32, GGML_TYPE_F32);
-      pin_to_cpu(bc, f32);
+      // I64 graph node without host data: ggml has no I64 support at all.
+      // Create eager zeros (the comparison result doesn't affect MoE routing
+      // because the fused MOE_FFN handles routing internally).
+      ggml_set_no_alloc(bc.ctx, false);
+      auto* f32 = ggml_new_tensor(bc.ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
+      ggml_set_no_alloc(bc.ctx, true);
+      memset(f32->data, 0, ggml_nbytes(f32));
+      // Do NOT mark as input_derived — this is a constant zero tensor.
       return f32;
     }
     // I32, F16, BF16 etc: ggml_cast to F32 works natively

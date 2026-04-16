@@ -492,7 +492,7 @@ static Error build_graph(
     }
 
     // Log ops around crash point
-    if (i >= 1725 || (int)op > 84 || has_null_src) {
+    if (i >= 1680 || (int)op > 84 || has_null_src) {
       fprintf(stderr, "[ggml_backend] tensor %d/%d op=%d (%s) srcs=%zu ne=[%lld,%lld,%lld,%lld]",
               i, n_tensors, (int)op, ggml_ir::EnumNameOpCode(op),
               ct.src_ids.size(),
