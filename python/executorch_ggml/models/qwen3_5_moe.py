@@ -114,9 +114,10 @@ class GemmaRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        x_float = x.float()
-        normed = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (normed * (1.0 + self.weight.float())).type_as(x)
+        # Use F.rms_norm for fusion (maps to aten.rms_norm which our
+        # partitioner preserves and maps to ggml_rms_norm).
+        w = (1.0 + self.weight.float())
+        return torch.nn.functional.rms_norm(x.float(), [x.shape[-1]], w, self.eps).type_as(x)
 
 
 class RMSNormGated(nn.Module):
@@ -128,9 +129,7 @@ class RMSNormGated(nn.Module):
         self.eps = eps
 
     def forward(self, x, z):
-        x_float = x.float()
-        normed = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
-        normed = self.weight * normed.type_as(x)
+        normed = torch.nn.functional.rms_norm(x.float(), [x.shape[-1]], self.weight, self.eps)
         return (normed * F.silu(z.float())).type_as(x)
 
 
@@ -426,15 +425,15 @@ class GatedDeltaNet(nn.Module):
             decay = torch.exp(g_s).unsqueeze(-1).unsqueeze(-1)  # [B, H, 1, 1]
             state = state * decay
 
-            # Sk = state @ k (project state by key)
-            Sk = torch.einsum("bhkv,bhk->bhv", state, k_s)
+            # Sk = state @ k: [B,H,K,V] × [B,H,K,1] → [B,H,V]
+            Sk = torch.matmul(state.transpose(-2, -1), k_s.unsqueeze(-1)).squeeze(-1)
 
-            # Delta rule state update
+            # Delta rule state update: state += k ⊗ delta
             delta = beta_s.unsqueeze(-1) * (v_s - Sk)  # [B, H, V]
-            state = state + torch.einsum("bhk,bhv->bhkv", k_s, delta)
+            state = state + k_s.unsqueeze(-1) * delta.unsqueeze(-2)  # outer product
 
-            # Output = state @ q * scale
-            output = torch.einsum("bhkv,bhk->bhv", state, q_s) * scale
+            # Output = state @ q * scale: [B,H,K,V] × [B,H,K,1] → [B,H,V]
+            output = torch.matmul(state.transpose(-2, -1), q_s.unsqueeze(-1)).squeeze(-1) * scale
             output = output.unsqueeze(1).to(q.dtype)  # [B, 1, H, V]
 
             with torch.no_grad():
