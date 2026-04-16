@@ -79,7 +79,7 @@ def _torch_dtype_to_ir_type(dtype: torch.dtype) -> int:
     if dtype == torch.bfloat16:
         return TYPE_BF16
     if dtype == torch.int64:
-        return TYPE_I64
+        return TYPE_I32  # ggml has no I64 CUDA support; use I32 everywhere
     if dtype == torch.int32:
         return TYPE_I32
     if dtype == torch.bool:
