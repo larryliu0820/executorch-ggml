@@ -81,15 +81,7 @@ static inline struct ggml_tensor* build_op_ne(BuildContext& bc) {
 // ---------------------------------------------------------------------------
 static inline struct ggml_tensor* build_op_le(BuildContext& bc) {
   const auto* t = bc.ir_tensor;
-  if (bc.srcs.empty() || !bc.srcs[0]) {
-    fprintf(stderr, "[LE] src0 is NULL or missing!\n"); fflush(stderr);
-    return nullptr;
-  }
   struct ggml_tensor* a = bc.srcs[0];
-  fprintf(stderr, "[LE] a=%p type=%d ne=[%lld,%lld] op_params_size=%d srcs=%zu\n",
-    (void*)a, a->type, (long long)a->ne[0], (long long)a->ne[1],
-    t->op_params() ? (int)t->op_params()->size() : -1, bc.srcs.size());
-  fflush(stderr);
   struct ggml_tensor* b;
   double le_scalar = 0.0;
   int32_t le_is_scalar = 0;
@@ -97,33 +89,11 @@ static inline struct ggml_tensor* build_op_le(BuildContext& bc) {
     memcpy(&le_scalar, t->op_params()->data(), 8);
     memcpy(&le_is_scalar, t->op_params()->data() + 8, 4);
   }
-  fprintf(stderr, "[LE] is_scalar=%d scalar=%f\n", le_is_scalar, le_scalar); fflush(stderr);
   if (le_is_scalar) {
     b = make_f32_scalar(bc.ctx, (float)le_scalar);
   } else {
-    if (bc.srcs.size() < 2 || !bc.srcs[1]) {
-      fprintf(stderr, "[LE] src1 is NULL!\n"); fflush(stderr);
-      return nullptr;
-    }
     b = bc.srcs[1];
   }
-  fprintf(stderr, "[LE] b=%p type=%d ne=[%lld,%lld]\n", (void*)b, b->type, (long long)b->ne[0], (long long)b->ne[1]);
-  fflush(stderr);
-
-  // WORKAROUND: I64 comparison not supported in ggml.
-  // For MoE routing (arange ≤ threshold), create an eager F32 result.
-  if (a->type == GGML_TYPE_I64 || b->type == GGML_TYPE_I64) {
-    // Create a zeros result (all-false). Correctness TBD —
-    // this is a build-time workaround to get past the graph build.
-    int64_t out_ne[4] = {std::max(a->ne[0], b->ne[0]), std::max(a->ne[1], b->ne[1]),
-                         std::max(a->ne[2], b->ne[2]), std::max(a->ne[3], b->ne[3])};
-    ggml_set_no_alloc(bc.ctx, false);
-    auto* result = ggml_new_tensor_4d(bc.ctx, GGML_TYPE_F32, out_ne[0], out_ne[1], out_ne[2], out_ne[3]);
-    ggml_set_no_alloc(bc.ctx, true);
-    memset(result->data, 0, ggml_nbytes(result));
-    return result;
-  }
-
   // Cast inputs to F32 for comparison.
   // I64 without host data needs CPU-pinned cast (no CUDA I64 support).
   // I32→F32 works natively via ggml_cast on both CPU and CUDA.
