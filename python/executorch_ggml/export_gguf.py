@@ -280,6 +280,15 @@ def _apply_graph_passes(ep, config_dict: Dict[str, Any]) -> None:
         except ImportError:
             pass
 
+    # Strip identity casts (F32→F32, type_as with same dtype)
+    try:
+        from executorch_ggml.passes.strip_identity_ops_pass import strip_identity_ops
+        n_stripped = strip_identity_ops(ep.graph_module)
+        if n_stripped > 0:
+            print(f"  strip_identity_ops: {n_stripped} identity casts removed")
+    except ImportError:
+        pass
+
     # CSE: merge duplicate linears from fused projections
     try:
         from executorch_ggml.passes.cse_pass import eliminate_common_subexpressions
