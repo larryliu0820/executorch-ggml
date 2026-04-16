@@ -15,6 +15,8 @@ from executorch_ggml.ops._sym_expr import _sym_dim_info_ggml
 from executorch_ggml.serialize import (
     IrTensor,
     TYPE_F32,
+    TYPE_I64,
+    TYPE_I32,
     OP_NONE,
     OP_CAT,
     OP_REPEAT_INTERLEAVE,
@@ -254,6 +256,9 @@ def handle_arange_start_step(ctx, node, target_str):
 
     _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
     ir_type = _torch_dtype_to_ir_type(out_dtype)
+    # Force I32 for integer aranges — ggml has no I64 CUDA support.
+    if ir_type == TYPE_I64:
+        ir_type = TYPE_I32
     tid = ctx.alloc_id()
     ctx.ir_tensors.append(
         IrTensor(
@@ -287,6 +292,8 @@ def handle_arange_default(ctx, node, target_str):
 
     _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
     ir_type = _torch_dtype_to_ir_type(out_dtype)
+    if ir_type == TYPE_I64:
+        ir_type = TYPE_I32
     tid = ctx.alloc_id()
     ctx.ir_tensors.append(
         IrTensor(
