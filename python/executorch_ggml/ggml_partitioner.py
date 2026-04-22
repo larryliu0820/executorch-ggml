@@ -97,6 +97,10 @@ _SUPPORTED_OP_NAMES = {
     "aten.index_copy.default",
     # Fused RoPE
     "ggml.rope.default",
+    # Fused SSM conv (llama.cpp's ggml_ssm_conv)
+    "ggml.ssm_conv.default",
+    # Fused gated delta net (llama.cpp's ggml_gated_delta_net)
+    "ggml.gated_delta_net.default",
     # Additional ops for full model export
     "aten.arange.default",
     "aten.matmul.default",
@@ -122,6 +126,7 @@ _SUPPORTED_OP_NAMES = {
     "aten.relu.default",
     "aten.tanh.default",
     "aten.gelu.default",
+    "aten.softplus.default",
     "aten.native_layer_norm.default",
     "aten.rms_norm.default",
     "aten._native_batch_norm_legit_no_training.default",
@@ -385,7 +390,7 @@ class GgmlPartitioner(Partitioner):
         in to_edge_transform_and_lower (avoids the EDGE_DO_NOT_DECOMP path
         which re-decomposes SDPA in a second pass).
         """
-        ops = [torch.ops.aten.rms_norm.default]  # Always preserve rms_norm
+        ops = [torch.ops.aten.rms_norm.default, torch.ops.aten.softplus.default]
         if self.preserve_sdpa:
             ops.append(torch.ops.aten.scaled_dot_product_attention.default)
         try:

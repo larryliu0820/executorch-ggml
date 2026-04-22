@@ -117,7 +117,10 @@ enum OpCode : int32 {
     SUM = 93,            // src_ids: [x] op_params: int32 dim, int32 keepdim
     CLAMP = 94,          // src_ids: [x] op_params: float32 min, float32 max
     SLICE_SCATTER = 95,  // src_ids: [dst, src] op_params: int32 dim, int32 start, int32 end, int32 step
-    MOE_FFN = 96         // src_ids: [input, gate_inp, gate_exps, up_exps, down_exps] op_params: int32 n_expert, int32 top_k
+    MOE_FFN = 96,        // src_ids: [input, gate_inp, gate_exps, up_exps, down_exps] op_params: int32 n_expert, int32 top_k
+    SOFTPLUS = 97,       // src_ids: [x] log(1 + exp(x)) with numerically stable threshold at x > 20
+    SSM_CONV = 98,       // src_ids: [conv_input, weight] depthwise conv1d with state; maps to llama.cpp ggml_ssm_conv
+    GATED_DELTA_NET = 99 // src_ids: [q, k, v, g, beta, state] fused gated delta-rule step; maps to llama.cpp ggml_gated_delta_net. Emits TWO outputs (output, new_state) identified by output_index in op_params.
 }
 
 enum TensorType : int32 {

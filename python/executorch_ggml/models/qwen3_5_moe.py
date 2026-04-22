@@ -22,6 +22,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+import executorch_ggml.ssm_conv_op  # noqa: F401 — registers torch.ops.ggml.ssm_conv
+import executorch_ggml.rope_op  # noqa: F401 — registers torch.ops.ggml.rope
+import executorch_ggml.gated_delta_net_op  # noqa: F401 — registers torch.ops.ggml.gated_delta_net
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -138,42 +142,24 @@ class RMSNormGated(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
-    """Partial RoPE — only rotates first `rotary_dim` dimensions of each head."""
+    """Partial RoPE — only rotates first `rotary_dim` dimensions of each head.
+
+    Uses torch.ops.ggml.rope (mode=2, NeoX half-rotation) to fuse into a single
+    ggml_rope_ext kernel. Replaces the decomposed cos/sin/mul/cat chain that
+    produced 60+ CONTs and 60+ MULs per decode step (6 per full-attention layer).
+    """
 
     def __init__(self, head_dim, partial_rotary_factor, rope_theta):
         super().__init__()
         self.head_dim = head_dim
         self.rotary_dim = int(head_dim * partial_rotary_factor)
-        inv_freq = 1.0 / (
-            rope_theta
-            ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
-                / self.rotary_dim
-            )
-        )
-        self.register_buffer("inv_freq", inv_freq)
+        self.rope_theta = float(rope_theta)
 
     def forward(self, positions, q, k):
-        # q: (B, T, n_heads, head_dim), k: (B, T, n_kv_heads, head_dim)
-        freqs = torch.outer(positions.float(), self.inv_freq)
-        cos = freqs.cos().unsqueeze(1)  # (T, 1, rotary_dim/2)
-        sin = freqs.sin().unsqueeze(1)
-
-        q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
-        k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
-
-        q_rot = self._apply_rotary(q_rot, cos, sin)
-        k_rot = self._apply_rotary(k_rot, cos, sin)
-
-        q = torch.cat([q_rot, q_pass], dim=-1)
-        k = torch.cat([k_rot, k_pass], dim=-1)
-        return q, k
-
-    @staticmethod
-    def _apply_rotary(x, cos, sin):
-        half = x.shape[-1] // 2
-        x1, x2 = x[..., :half], x[..., half:]
-        return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+        pos_i32 = positions.to(torch.int32)
+        q_roped = torch.ops.ggml.rope(q, pos_i32, self.rotary_dim, self.rope_theta, 2)
+        k_roped = torch.ops.ggml.rope(k, pos_i32, self.rotary_dim, self.rope_theta, 2)
+        return q_roped, k_roped
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +274,10 @@ class FullAttention(nn.Module):
                 q, k, v, attn_mask=attn_mask, enable_gqa=True
             )
 
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        # When T=1 the transpose is a stride no-op. Using reshape skips the
+        # explicit .contiguous() that torch.export emits after transpose,
+        # which otherwise becomes a CONT node in the graph.
+        y = y.transpose(1, 2).reshape(B, T, -1)
 
         # Output gate
         gate = gate.reshape(B, T, -1)
@@ -342,12 +331,29 @@ class GatedDeltaNet(nn.Module):
         self.out_proj = nn.Linear(self.value_dim, config.hidden_size, bias=False)
 
         # State buffers
+        # conv_state stores the last K-1 timesteps (matches llama.cpp's mamba-base).
+        # Storing K would leave T_out=2 in ssm_conv and force us to slice off the
+        # stale leading timestep.
         self.register_buffer(
-            "conv_state", torch.zeros(1, self.conv_dim, config.linear_conv_kernel_dim)
+            "conv_state",
+            torch.zeros(1, self.conv_dim, config.linear_conv_kernel_dim - 1),
         )
+        # recurrent_state stored as [B, H, V, K] (V before K) so that the
+        # delta rule matmul is state @ k.unsqueeze(-1) without a transpose.
+        # Saves 2 TRANSPOSE+CONT ops per SSM layer per step.
         self.register_buffer(
             "recurrent_state",
-            torch.zeros(1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+            torch.zeros(1, self.num_v_heads, self.head_v_dim, self.head_k_dim),
+        )
+        # L2-norm scale folded into rms_norm weight (enables CUDA rms_norm+mul fusion).
+        # The fused gated_delta_net op applies the attn scale (1/sqrt(head_v_dim))
+        # internally, so we only need the L2-norm scale here.
+        inv_sqrt = self.head_k_dim ** -0.5
+        self.register_buffer(
+            "_l2_weight_q", torch.full((self.head_k_dim,), inv_sqrt)
+        )
+        self.register_buffer(
+            "_l2_weight_k", torch.full((self.head_k_dim,), inv_sqrt)
         )
 
     def forward(self, x, input_pos):
@@ -371,23 +377,20 @@ class GatedDeltaNet(nn.Module):
         b = self._in_proj_b(x)
         a = self._in_proj_a(x)
 
-        # Causal depthwise conv1d with state (manual, avoids conv1d→conv2d decomposition)
+        # Causal depthwise conv1d with state.
+        # Uses torch.ops.ggml.ssm_conv (maps to llama.cpp's native ggml_ssm_conv
+        # kernel). Avoids the manual kernel-unroll loop that decomposed into
+        # 4 × (SLICE+MUL+ADD) graph ops per layer.
         qkv_t = mixed_qkv.transpose(1, 2)
         conv_input = torch.cat([self.conv_state[:B], qkv_t], dim=-1)
         with torch.no_grad():
-            self.conv_state[:B].copy_(conv_input[:, :, -self.conv_kernel_size :])
+            # Save last K-1 timesteps (state size) for next step.
+            self.conv_state[:B].copy_(conv_input[:, :, -(self.conv_kernel_size - 1) :])
         w = self.conv1d.weight.squeeze(1).float()  # [C, 1, K] -> [C, K]
-        T_conv = conv_input.shape[-1] - self.conv_kernel_size + 1
-        acc = torch.zeros(
-            B,
-            conv_input.shape[1],
-            T_conv,
-            dtype=torch.float32,
-            device=conv_input.device,
-        )
-        for k in range(self.conv_kernel_size):
-            acc = acc + conv_input[:, :, k : k + T_conv].float() * w[:, k : k + 1]
-        qkv_conv = F.silu(acc[:, :, -T:]).to(conv_input.dtype).transpose(1, 2)
+        # ssm_conv returns [B, T_conv, C] natively (matches ggml_ssm_conv layout).
+        # With state size K-1 and new T tokens, T_conv = T exactly (no slice).
+        acc = torch.ops.ggml.ssm_conv(conv_input, w)  # [B, T, C]
+        qkv_conv = F.silu(acc).to(conv_input.dtype)
 
         # Split via slicing (torch.split produces split_copy which lacks AOTI fallback)
         kd = self.key_dim
@@ -395,49 +398,30 @@ class GatedDeltaNet(nn.Module):
         k = qkv_conv[..., kd : 2 * kd].reshape(B, T, self.num_k_heads, self.head_k_dim)
         v = qkv_conv[..., 2 * kd :].reshape(B, T, self.num_v_heads, self.head_v_dim)
 
-        # L2-normalize Q and K (the FLA kernel expects pre-normalized inputs;
-        # HF reference uses use_qk_l2norm_in_kernel=True which does this inside)
-        q = F.normalize(q, p=2, dim=-1)
-        k = F.normalize(k, p=2, dim=-1)
-
-        # head_repeat for k_heads != v_heads
-        if self.head_repeat > 1:
-            q = q.repeat_interleave(self.head_repeat, dim=2)
-            k = k.repeat_interleave(self.head_repeat, dim=2)
+        # L2-normalize Q and K. Equivalent to F.normalize(x, p=2, dim=-1):
+        # F.normalize(x) = x / sqrt(sum(x^2) + eps) = rms_norm(x, eps/N) / sqrt(N).
+        # Fold 1/sqrt(N) scalar into rms_norm's weight tensor so the whole op
+        # is RMS_NORM + MUL(weight), which CUDA fuses natively.
+        qn = q.shape[-1]
+        kn = k.shape[-1]
+        q = F.rms_norm(q, [qn], self._l2_weight_q, eps=1e-12 / qn)
+        k = F.rms_norm(k, [kn], self._l2_weight_k, eps=1e-12 / kn)
 
         # Mamba-style gating
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
         if T == 1:
-            # Native recurrent delta rule — AOTI fuses with surrounding ops
-            scale = self.head_k_dim**-0.5
-
-            q_s = q[:, 0].float()  # [B, H, K]
-            k_s = k[:, 0].float()  # [B, H, K]
-            v_s = v[:, 0].float()  # [B, H, V]
-            g_s = g[:, 0]  # [B, H]
-            beta_s = beta[:, 0]  # [B, H]
-
-            state = self.recurrent_state[:B].float()  # [B, H, K, V]
-
-            # Decay state by exp(g)
-            decay = torch.exp(g_s).unsqueeze(-1).unsqueeze(-1)  # [B, H, 1, 1]
-            state = state * decay
-
-            # Sk = state @ k: [B,H,K,V] × [B,H,K,1] → [B,H,V]
-            Sk = torch.matmul(state.transpose(-2, -1), k_s.unsqueeze(-1)).squeeze(-1)
-
-            # Delta rule state update: state += k ⊗ delta
-            delta = beta_s.unsqueeze(-1) * (v_s - Sk)  # [B, H, V]
-            state = state + k_s.unsqueeze(-1) * delta.unsqueeze(-2)  # outer product
-
-            # Output = state @ q * scale: [B,H,K,V] × [B,H,K,1] → [B,H,V]
-            output = torch.matmul(state.transpose(-2, -1), q_s.unsqueeze(-1)).squeeze(-1) * scale
-            output = output.unsqueeze(1).to(q.dtype)  # [B, 1, H, V]
-
+            # Fused gated delta net: single CUDA kernel replaces ~80 ops
+            # (state decay + Sk + delta update + output matmul). Handles
+            # head-repeat broadcast natively via q/k having H_k heads while
+            # v has H_v heads. attn_scale (= 1/sqrt(head_v_dim)) baked in.
+            output, new_state = torch.ops.ggml.gated_delta_net(
+                q, k, v, g, beta, self.recurrent_state[:B]
+            )
+            output = output.to(q.dtype)
             with torch.no_grad():
-                self.recurrent_state[:B].copy_(state.to(self.recurrent_state.dtype))
+                self.recurrent_state[:B].copy_(new_state.to(self.recurrent_state.dtype))
         else:
             # Chunked FLA triton_op for prefill
             output, new_state = torch.ops.triton.chunk_gated_delta_rule(

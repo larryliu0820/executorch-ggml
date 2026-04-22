@@ -442,6 +442,109 @@ def handle_full_like(ctx, node, target_str):
 # ggml.moe_ffn — fused MoE FFN (router + experts + weighted sum)
 # ---------------------------------------------------------------------------
 
+@register_op("ggml.gated_delta_net.default")
+def handle_gated_delta_net(ctx, node, target_str):
+    """ggml.gated_delta_net(q, k, v, g, beta, state) -> (output, new_state).
+
+    Maps to llama.cpp's ggml_gated_delta_net. Replaces the entire recurrent
+    delta-rule chain (~80 ops per GDN layer) with a single CUDA kernel.
+
+    Creates two IR tensors with the same sources but distinct output_index
+    in op_params, so the C++ handler builds ggml_gated_delta_net once and
+    returns the appropriate view (output or new_state).
+    """
+    from executorch_ggml.serialize import OP_GATED_DELTA_NET
+
+    q_id = ctx.node_to_id[node.args[0]]
+    k_id = ctx.node_to_id[node.args[1]]
+    v_id = ctx.node_to_id[node.args[2]]
+    g_id = ctx.node_to_id[node.args[3]]
+    beta_id = ctx.node_to_id[node.args[4]]
+    state_id = ctx.node_to_id[node.args[5]]
+    src_ids = [q_id, k_id, v_id, g_id, beta_id, state_id]
+
+    fake_vals = node.meta.get("val")
+    if not (isinstance(fake_vals, (list, tuple)) and len(fake_vals) == 2):
+        raise RuntimeError(
+            "ggml.gated_delta_net expected a 2-tuple fake val; got "
+            f"{type(fake_vals)}"
+        )
+    out_fv, state_fv = fake_vals
+
+    # Output tensor (index 0)
+    out_shape = _resolve_shape(out_fv)
+    out_dtype = getattr(out_fv, "dtype", torch.float32)
+    _vsym_o, _vexprs_o = _sym_dim_info_ggml(out_fv, ctx.sym_id_map)
+    output_tid = ctx.alloc_id()
+    ctx.ir_tensors.append(
+        IrTensor(
+            tensor_id=output_tid,
+            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+            ne=_pytorch_shape_to_ggml_ne(out_shape),
+            op=OP_GATED_DELTA_NET,
+            src_ids=src_ids,
+            op_params=struct.pack("<i", 0),  # output_index=0
+            sym_dim_ids=_vsym_o,
+            sym_dim_exprs=_vexprs_o,
+        )
+    )
+
+    # New state tensor (index 1)
+    state_shape = _resolve_shape(state_fv)
+    state_dtype = getattr(state_fv, "dtype", torch.float32)
+    _vsym_s, _vexprs_s = _sym_dim_info_ggml(state_fv, ctx.sym_id_map)
+    state_tid = ctx.alloc_id()
+    ctx.ir_tensors.append(
+        IrTensor(
+            tensor_id=state_tid,
+            tensor_type=_torch_dtype_to_ir_type(state_dtype),
+            ne=_pytorch_shape_to_ggml_ne(state_shape),
+            op=OP_GATED_DELTA_NET,
+            src_ids=src_ids,
+            op_params=struct.pack("<i", 1),  # output_index=1
+            sym_dim_ids=_vsym_s,
+            sym_dim_exprs=_vexprs_s,
+        )
+    )
+
+    # getitem resolution: [0]=output, [1]=new_state
+    ctx.node_to_id[node] = [output_tid, state_tid]
+
+
+@register_op("ggml.ssm_conv.default")
+def handle_ssm_conv(ctx, node, target_str):
+    """ggml.ssm_conv(conv_input, weight) - depthwise conv1d with state.
+
+    Maps to llama.cpp's ggml_ssm_conv. Replaces the manual kernel-unroll loop
+    in GatedDeltaNet with a single op: 4× (SLICE+MUL+ADD) → 1× SSM_CONV.
+    """
+    from executorch_ggml.serialize import OP_SSM_CONV
+
+    conv_input_node = node.args[0]
+    weight_node = node.args[1]
+    conv_input_id = ctx.node_to_id[conv_input_node]
+    weight_id = ctx.node_to_id[weight_node]
+
+    fake_val = node.meta.get("val")
+    shape = _resolve_shape(fake_val)
+    out_dtype = getattr(fake_val, "dtype", torch.float32) if fake_val is not None else torch.float32
+    _vsym, _vexprs = _sym_dim_info_ggml(fake_val, ctx.sym_id_map)
+
+    tid = ctx.alloc_id()
+    ctx.ir_tensors.append(
+        IrTensor(
+            tensor_id=tid,
+            tensor_type=_torch_dtype_to_ir_type(out_dtype),
+            ne=_pytorch_shape_to_ggml_ne(shape),
+            op=OP_SSM_CONV,
+            src_ids=[conv_input_id, weight_id],
+            sym_dim_ids=_vsym,
+            sym_dim_exprs=_vexprs,
+        )
+    )
+    ctx.node_to_id[node] = tid
+
+
 @register_op("ggml.moe_ffn.default")
 def handle_moe_ffn(ctx, node, target_str):
     """ggml.moe_ffn(input, gate_inp, gate_exps, up_exps, down_exps, n_expert, top_k).

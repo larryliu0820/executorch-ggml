@@ -97,11 +97,14 @@ enum class OpCode : int32_t {
   CLAMP = 94,
   SLICE_SCATTER = 95,
   MOE_FFN = 96,
+  SOFTPLUS = 97,
+  SSM_CONV = 98,
+  GATED_DELTA_NET = 99,
   MIN = NONE,
-  MAX = MOE_FFN
+  MAX = GATED_DELTA_NET
 };
 
-inline const OpCode (&EnumValuesOpCode())[75] {
+inline const OpCode (&EnumValuesOpCode())[78] {
   static const OpCode values[] = {
     OpCode::NONE,
     OpCode::ADD,
@@ -177,13 +180,16 @@ inline const OpCode (&EnumValuesOpCode())[75] {
     OpCode::SUM,
     OpCode::CLAMP,
     OpCode::SLICE_SCATTER,
-    OpCode::MOE_FFN
+    OpCode::MOE_FFN,
+    OpCode::SOFTPLUS,
+    OpCode::SSM_CONV,
+    OpCode::GATED_DELTA_NET
   };
   return values;
 }
 
 inline const char * const *EnumNamesOpCode() {
-  static const char * const names[98] = {
+  static const char * const names[101] = {
     "NONE",
     "ADD",
     "MUL_MAT",
@@ -281,13 +287,16 @@ inline const char * const *EnumNamesOpCode() {
     "CLAMP",
     "SLICE_SCATTER",
     "MOE_FFN",
+    "SOFTPLUS",
+    "SSM_CONV",
+    "GATED_DELTA_NET",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameOpCode(OpCode e) {
-  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::MOE_FFN)) return "";
+  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::GATED_DELTA_NET)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesOpCode()[index];
 }

@@ -24,6 +24,20 @@ static inline struct ggml_tensor* build_op_relu(BuildContext& bc) {
 }
 
 // ---------------------------------------------------------------------------
+// SOFTPLUS — log(1 + exp(x)) with numerically stable handling for large x.
+// Maps directly to ggml_softplus (native op — llama.cpp uses this for
+// Qwen3.5 MoE SSM dt bias + A_log gating).
+// ---------------------------------------------------------------------------
+static inline struct ggml_tensor* build_op_softplus(BuildContext& bc) {
+  struct ggml_tensor* x = bc.srcs[0];
+  ggml_type orig = x->type;
+  if (x->type == GGML_TYPE_BF16) x = ggml_cast(bc.ctx, x, GGML_TYPE_F32);
+  auto* gt = ggml_softplus(bc.ctx, x);
+  if (orig == GGML_TYPE_BF16 && !bc.skip_bf16_castback) gt = ggml_cast(bc.ctx, gt, GGML_TYPE_BF16);
+  return gt;
+}
+
+// ---------------------------------------------------------------------------
 // TANH
 // ---------------------------------------------------------------------------
 static inline struct ggml_tensor* build_op_tanh(BuildContext& bc) {

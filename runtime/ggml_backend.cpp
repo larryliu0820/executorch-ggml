@@ -405,6 +405,9 @@ static Error build_graph(
   host_acc.input_derived = &input_derived;
   // Cache causal attention masks so identical (T_kv, T_q) shapes reuse one allocation.
   std::unordered_map<uint64_t, struct ggml_tensor*> causal_mask_cache;
+  // Cache gated_delta_net result per (q,k,v,g,beta,state) tuple so the two
+  // IR tensors (output + new_state) share the same underlying op.
+  std::unordered_map<uint64_t, struct ggml_tensor*> gdn_cache;
   int last_processed = -1;
   for (int i = 0; i < n_tensors; ++i) {
     const auto& ct = ir_cache[i];
@@ -510,6 +513,7 @@ static Error build_graph(
     const auto* t = fb_tensors->Get(i);
     BuildContext bc{ctx, t, srcs, host_acc, input_derived, handle, gi,
                     cpu_pinned, id_to_tensor, sym_dim_values, causal_mask_cache,
+                    gdn_cache,
                     deferred_i64_to_i32, input_pairs,
                     {ne[0], ne[1], ne[2], ne[3]},
                     metal_f32_binops, cuda_bf16_cast, skip_bf16_castback,
@@ -535,6 +539,7 @@ static Error build_graph(
 
         // --- Activation ---
         case ggml_ir::OpCode::SILU:          gt = build_op_silu(bc); break;
+        case ggml_ir::OpCode::SOFTPLUS:      gt = build_op_softplus(bc); break;
         case ggml_ir::OpCode::RELU:          gt = build_op_relu(bc); break;
         case ggml_ir::OpCode::TANH:          gt = build_op_tanh(bc); break;
         case ggml_ir::OpCode::GELU:          gt = build_op_gelu(bc); break;
@@ -610,6 +615,8 @@ static Error build_graph(
         case ggml_ir::OpCode::CLAMP:         gt = build_op_clamp(bc); break;
         case ggml_ir::OpCode::SLICE_SCATTER: gt = build_op_slice_scatter(bc); break;
         case ggml_ir::OpCode::MOE_FFN:      gt = build_op_moe_ffn(bc); break;
+        case ggml_ir::OpCode::SSM_CONV:     gt = build_op_ssm_conv(bc); break;
+        case ggml_ir::OpCode::GATED_DELTA_NET: gt = build_op_gated_delta_net(bc); break;
 
         default:
           fprintf(stderr, "[executorch-ggml] Unsupported OpCode %d\n", (int) op);

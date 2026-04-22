@@ -23,6 +23,7 @@ from executorch_ggml.serialize import (
     OP_HARDTANH,
     OP_SIN,
     OP_COS,
+    OP_SOFTPLUS,
     pack_float,
     pack_hardtanh_params,
     pack_softmax_params,
@@ -94,6 +95,11 @@ def handle_cos(ctx, node, target_str):
 @register_op("aten.sin.default")
 def handle_sin(ctx, node, target_str):
     _handle_simple_unary(ctx, node, OP_SIN)
+
+
+@register_op("aten.softplus.default")
+def handle_softplus(ctx, node, target_str):
+    _handle_simple_unary(ctx, node, OP_SOFTPLUS)
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,7 @@ struct BuildContext {
   std::vector<struct ggml_tensor*>& id_to_tensor;
   std::unordered_map<int32_t, int64_t>& sym_dim_values;
   std::unordered_map<uint64_t, struct ggml_tensor*>& causal_mask_cache;
+  std::unordered_map<uint64_t, struct ggml_tensor*>& gdn_cache;
   std::vector<std::pair<struct ggml_tensor*, struct ggml_tensor*>>& deferred_i64_to_i32;
   std::vector<std::pair<int, struct ggml_tensor*>>& input_pairs;
   int64_t ne[4];       // resolved output shape from IR (ggml order)

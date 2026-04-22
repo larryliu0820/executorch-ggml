@@ -234,14 +234,18 @@ static inline struct ggml_tensor* build_op_mul(BuildContext& bc) {
   if (auto* eager = try_eager_f32_binop(bc.ctx, a, b, '*', bc.host_acc)) {
     return eager;
   }
-  // ggml_scale for non-input-derived scalars
+  // ggml_scale for non-input-derived scalars.
+  // ggml_scale only requires is_padded_1d (row-contiguous); avoid CONT
+  // when input is already row-contiguous to keep graph ops small.
   if (ggml_nelements(b) == 1 && b->data && b->type == GGML_TYPE_F32
       && !bc.input_derived.count(b)) {
-    return ggml_scale(bc.ctx, ggml_cont(bc.ctx, a), bc.host_acc.read_f32(b));
+    auto* src = ggml_is_contiguous(a) ? a : ggml_cont(bc.ctx, a);
+    return ggml_scale(bc.ctx, src, bc.host_acc.read_f32(b));
   }
   if (ggml_nelements(a) == 1 && a->data && a->type == GGML_TYPE_F32
       && !bc.input_derived.count(a)) {
-    return ggml_scale(bc.ctx, ggml_cont(bc.ctx, b), bc.host_acc.read_f32(a));
+    auto* src = ggml_is_contiguous(b) ? b : ggml_cont(bc.ctx, b);
+    return ggml_scale(bc.ctx, src, bc.host_acc.read_f32(a));
   }
   if (ggml_nelements(a) < ggml_nelements(b)) {
     std::swap(a, b);
@@ -267,7 +271,8 @@ static inline struct ggml_tensor* build_op_mul_scalar(BuildContext& bc) {
   if (bc.ir_tensor->op_params() && bc.ir_tensor->op_params()->size() >= 4) {
     memcpy(&scalar, bc.ir_tensor->op_params()->data(), sizeof(float));
   }
-  return ggml_scale(bc.ctx, ggml_cont(bc.ctx, bc.srcs[0]), scalar);
+  auto* src = ggml_is_contiguous(bc.srcs[0]) ? bc.srcs[0] : ggml_cont(bc.ctx, bc.srcs[0]);
+  return ggml_scale(bc.ctx, src, scalar);
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +366,22 @@ static inline struct ggml_tensor* build_op_div(BuildContext& bc) {
 // NEG
 // ---------------------------------------------------------------------------
 static inline struct ggml_tensor* build_op_neg(BuildContext& bc) {
-  return ggml_neg(bc.ctx, bc.srcs[0]);
+  struct ggml_tensor* src = bc.srcs[0];
+  // Eager-fold when src is a constant (NONE op with host data, not input-derived).
+  if (src->op == GGML_OP_NONE && src->data && !bc.input_derived.count(src) &&
+      src->type == GGML_TYPE_F32) {
+    const int64_t n = ggml_nelements(src);
+    ggml_set_no_alloc(bc.ctx, false);
+    struct ggml_tensor* out = ggml_new_tensor_4d(bc.ctx, GGML_TYPE_F32,
+                                                 src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+    ggml_set_no_alloc(bc.ctx, true);
+    out->op = GGML_OP_NONE;
+    const float* sd = (const float*)bc.host_acc.get(src);
+    float* od = (float*)out->data;
+    for (int64_t i = 0; i < n; i++) od[i] = -sd[i];
+    return out;
+  }
+  return ggml_neg(bc.ctx, src);
 }
 
 // ---------------------------------------------------------------------------

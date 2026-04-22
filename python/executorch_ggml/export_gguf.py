@@ -394,7 +394,7 @@ def export_gguf_to_pte(
         quant_config=quant_cfg,
         gguf_weight_map=gguf_weight_map,
         skip_weight_data=export_config.skip_weight_data,
-        preserve_sdpa=not is_direct,  # Direct-export models decompose SDPA to bmm+softmax
+        preserve_sdpa=True,  # Preserve SDPA so full-attention layers use flash_attn_ext instead of decomposed matmul+softmax+GQA-broadcast
     )
 
     # Lower to edge with GGML delegation

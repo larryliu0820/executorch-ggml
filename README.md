@@ -194,6 +194,20 @@ Qwen3-0.6B Q8_0 decode throughput:
 
 Pre-exported model: [larryliu0820/Qwen3-0.6B-Q8_0-ExecuTorch-GGML](https://huggingface.co/larryliu0820/Qwen3-0.6B-Q8_0-ExecuTorch-GGML)
 
+### Qwen3.5-35B-A3B MoE (Hybrid SSM + Attention)
+
+Qwen3.5-35B-A3B Q4_K_M decode throughput on NVIDIA A100-40GB:
+
+| Metric | executorch-ggml | llama.cpp | vs llama.cpp |
+|---|---:|---:|:---|
+| Decode tok/s | **129.0** | 105.8 | **122%** |
+| Graph nodes | 3,094 | 3,778 | **82%** |
+| Decode ms/tok | 7.8 | 9.5 | **82%** |
+
+Key optimizations: fused `ggml_gated_delta_net` for the GatedDeltaNet linear-attention layers (single CUDA kernel replaces ~80 ops × 30 layers), `preserve_sdpa=True` to map full-attention to `ggml_flash_attn_ext` with native GQA, fused `ggml.rope` for partial RoPE (`rotary_dim=64` of `head_dim=256`), CUDA-fusion-friendly emission (`RMS_NORM+MUL`, `SSM_CONV+silu`), L2-norm scale folded into weight tensors, and build-time eager folding of constant `-exp(A_log)`.
+
+See [docs/qwen35moe-perf.md](docs/qwen35moe-perf.md) for the full optimization timeline.
+
 **Export:**
 ```bash
 # Q8_0 quantized

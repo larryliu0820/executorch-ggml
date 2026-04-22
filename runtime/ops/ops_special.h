@@ -54,7 +54,8 @@ static inline struct ggml_tensor* build_op_llama_attention(BuildContext& bc) {
       if (mask->type == GGML_TYPE_F32) {
         if (was_boolean) {
           // Boolean 0/1 mask: scale to {0, -65504} for F16
-          struct ggml_tensor* scaled = ggml_scale(bc.ctx, ggml_cont(bc.ctx, mask), 65504.0f);
+          struct ggml_tensor* mask_cont = ggml_is_contiguous(mask) ? mask : ggml_cont(bc.ctx, mask);
+          struct ggml_tensor* scaled = ggml_scale(bc.ctx, mask_cont, 65504.0f);
           mask = safe_ggml_cast(bc.ctx,
               ggml_add(bc.ctx, scaled, make_f32_scalar(bc.ctx, -65504.0f)),
               GGML_TYPE_F16, &bc.host_acc);
