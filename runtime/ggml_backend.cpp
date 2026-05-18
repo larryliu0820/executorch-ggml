@@ -62,6 +62,7 @@
 #include "ops/ops_comparison.h"
 #include "ops/ops_special.h"
 #include "ops/ops_moe.h"
+#include "ops/ops_cond.h"
 #include "gguf_data_map.h"
 
 namespace executorch_ggml {
@@ -79,6 +80,68 @@ using executorch::runtime::Span;
 
 namespace {
 
+// Parse a single FlatBuffer Tensor into a CachedIRTensor. Used for both
+// the parent graph and any cond subgraphs.
+static void parse_one_tensor(const ggml_ir::Tensor* t, CachedIRTensor& ct) {
+  ct.id = t->id();
+  ct.op = static_cast<int>(t->op());
+  ct.ir_type = static_cast<int>(t->type());
+  ct.ne[0] = ct.ne[1] = ct.ne[2] = ct.ne[3] = 1;
+  if (t->ne()) {
+    for (size_t d = 0; d < t->ne()->size() && d < 4; ++d)
+      ct.ne[d] = t->ne()->Get(d);
+  }
+  ct.n_dims = 4;
+  for (int d = 3; d >= 1; --d) {
+    if (ct.ne[d] == 1) ct.n_dims = d; else break;
+  }
+  if (ct.n_dims == 0) ct.n_dims = 1;
+  ct.is_input = t->is_input();
+  ct.is_output = t->is_output();
+  ct.input_index = t->input_index();
+  ct.data_key = (t->data_key() && t->data_key()->c_str()) ? t->data_key()->c_str() : "";
+  ct.elem_size = t->elem_size();
+  if (t->op_params() && t->op_params()->size() > 0) {
+    ct.op_params.assign(t->op_params()->data(),
+                        t->op_params()->data() + t->op_params()->size());
+  }
+  if (t->src_ids()) {
+    ct.src_ids.resize(t->src_ids()->size());
+    for (size_t s = 0; s < t->src_ids()->size(); ++s)
+      ct.src_ids[s] = t->src_ids()->Get(s);
+  }
+  ct.has_sym_dims = false;
+  ct.sym_dim_ids[0] = ct.sym_dim_ids[1] = ct.sym_dim_ids[2] = ct.sym_dim_ids[3] = -1;
+  if (t->sym_dim_ids()) {
+    for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
+      ct.sym_dim_ids[d] = t->sym_dim_ids()->Get(d);
+      if (ct.sym_dim_ids[d] != -1) ct.has_sym_dims = true;
+    }
+    // Cache bytecode for expression dims (sym_dim_id == -2)
+    if (t->sym_dim_exprs()) {
+      for (size_t d = 0; d < 4; ++d) {
+        if (ct.sym_dim_ids[d] == -2) {
+          const uint8_t* code = nullptr; size_t code_len = 0;
+          if (get_dim_expr_bytecode(t->sym_dim_exprs(), d, code, code_len)) {
+            ct.sym_dim_exprs[d].bytecode.assign(code, code + code_len);
+          }
+        }
+      }
+    }
+  }
+  // Cond-only fields.
+  if (t->subgraph_ids()) {
+    ct.subgraph_ids.resize(t->subgraph_ids()->size());
+    for (size_t s = 0; s < t->subgraph_ids()->size(); ++s)
+      ct.subgraph_ids[s] = t->subgraph_ids()->Get(s);
+  }
+  if (t->cond_operand_ids()) {
+    ct.cond_operand_ids.resize(t->cond_operand_ids()->size());
+    for (size_t s = 0; s < t->cond_operand_ids()->size(); ++s)
+      ct.cond_operand_ids[s] = t->cond_operand_ids()->Get(s);
+  }
+}
+
 // Parse FlatBuffer IR into CachedIRTensor vector (once, reused on every rebuild).
 static void populate_ir_cache(GgmlDelegateHandle* handle) {
   const auto* fb_graph = ggml_ir::GetGgmlGraph(handle->ir_copy.data());
@@ -86,56 +149,39 @@ static void populate_ir_cache(GgmlDelegateHandle* handle) {
   const auto* fb_tensors = fb_graph->tensors();
   const int n = static_cast<int>(fb_tensors->size());
   handle->ir_cache.resize(n);
+  bool any_cond = false;
   for (int i = 0; i < n; ++i) {
-    const auto* t = fb_tensors->Get(i);
-    auto& ct = handle->ir_cache[i];
-    ct.id = t->id();
-    ct.op = static_cast<int>(t->op());
-    ct.ir_type = static_cast<int>(t->type());
-    ct.ne[0] = ct.ne[1] = ct.ne[2] = ct.ne[3] = 1;
-    if (t->ne()) {
-      for (size_t d = 0; d < t->ne()->size() && d < 4; ++d)
-        ct.ne[d] = t->ne()->Get(d);
+    parse_one_tensor(fb_tensors->Get(i), handle->ir_cache[i]);
+    if (static_cast<ggml_ir::OpCode>(handle->ir_cache[i].op) == ggml_ir::OpCode::COND) {
+      any_cond = true;
     }
-    ct.n_dims = 4;
-    for (int d = 3; d >= 1; --d) {
-      if (ct.ne[d] == 1) ct.n_dims = d; else break;
-    }
-    if (ct.n_dims == 0) ct.n_dims = 1;
-    ct.is_input = t->is_input();
-    ct.is_output = t->is_output();
-    ct.input_index = t->input_index();
-    ct.data_key = (t->data_key() && t->data_key()->c_str()) ? t->data_key()->c_str() : "";
-    ct.elem_size = t->elem_size();
-    if (t->op_params() && t->op_params()->size() > 0) {
-      ct.op_params.assign(t->op_params()->data(),
-                          t->op_params()->data() + t->op_params()->size());
-    }
-    if (t->src_ids()) {
-      ct.src_ids.resize(t->src_ids()->size());
-      for (size_t s = 0; s < t->src_ids()->size(); ++s)
-        ct.src_ids[s] = t->src_ids()->Get(s);
-    }
-    ct.has_sym_dims = false;
-    ct.sym_dim_ids[0] = ct.sym_dim_ids[1] = ct.sym_dim_ids[2] = ct.sym_dim_ids[3] = -1;
-    if (t->sym_dim_ids()) {
-      for (size_t d = 0; d < t->sym_dim_ids()->size() && d < 4; ++d) {
-        ct.sym_dim_ids[d] = t->sym_dim_ids()->Get(d);
-        if (ct.sym_dim_ids[d] != -1) ct.has_sym_dims = true;
-      }
-      // Cache bytecode for expression dims (sym_dim_id == -2)
-      if (t->sym_dim_exprs()) {
-        for (size_t d = 0; d < 4; ++d) {
-          if (ct.sym_dim_ids[d] == -2) {
-            const uint8_t* code = nullptr; size_t code_len = 0;
-            if (get_dim_expr_bytecode(t->sym_dim_exprs(), d, code, code_len)) {
-              ct.sym_dim_exprs[d].bytecode.assign(code, code + code_len);
-            }
-          }
+  }
+  // Parse subgraphs (referenced by OP_COND.subgraph_ids).
+  if (fb_graph->subgraphs()) {
+    const auto* fb_subs = fb_graph->subgraphs();
+    handle->subgraph_caches.resize(fb_subs->size());
+    for (size_t si = 0; si < fb_subs->size(); ++si) {
+      const auto* sg = fb_subs->Get(si);
+      auto& csg = handle->subgraph_caches[si];
+      if (sg->tensors()) {
+        csg.tensors.resize(sg->tensors()->size());
+        for (size_t k = 0; k < sg->tensors()->size(); ++k) {
+          parse_one_tensor(sg->tensors()->Get(k), csg.tensors[k]);
         }
+      }
+      if (sg->input_tensor_ids()) {
+        csg.input_tensor_ids.resize(sg->input_tensor_ids()->size());
+        for (size_t k = 0; k < sg->input_tensor_ids()->size(); ++k)
+          csg.input_tensor_ids[k] = sg->input_tensor_ids()->Get(k);
+      }
+      if (sg->output_tensor_ids()) {
+        csg.output_tensor_ids.resize(sg->output_tensor_ids()->size());
+        for (size_t k = 0; k < sg->output_tensor_ids()->size(); ++k)
+          csg.output_tensor_ids[k] = sg->output_tensor_ids()->Get(k);
       }
     }
   }
+  handle->has_cond = any_cond;
 }
 
 // input_ne_overrides: nullptr on first call (use serialized shapes).
@@ -617,6 +663,7 @@ static Error build_graph(
         case ggml_ir::OpCode::MOE_FFN:      gt = build_op_moe_ffn(bc); break;
         case ggml_ir::OpCode::SSM_CONV:     gt = build_op_ssm_conv(bc); break;
         case ggml_ir::OpCode::GATED_DELTA_NET: gt = build_op_gated_delta_net(bc); break;
+        case ggml_ir::OpCode::COND:         gt = build_op_cond(bc); break;
 
         default:
           fprintf(stderr, "[executorch-ggml] Unsupported OpCode %d\n", (int) op);
@@ -1648,6 +1695,8 @@ Error GgmlBackendInterface::execute(
   }
   ProfileContext prof_ctx;
   if (profile_mode) {
+    const char* shape_env = std::getenv("GGML_PROFILE_SHAPES");
+    prof_ctx.per_shape = (shape_env && std::string(shape_env) != "0");
     ggml_backend_sched_set_eval_callback(active->sched, profile_eval_callback, &prof_ctx);
   }
 

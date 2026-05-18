@@ -38,6 +38,17 @@ struct CachedIRTensor {
   // Per-dim bytecode for sym_dim_ids == -2 (expression)
   struct DimExpr { std::vector<uint8_t> bytecode; };
   DimExpr sym_dim_exprs[4];
+  // For OP_COND tensors only: subgraph indices into Handle::subgraph_caches
+  // and parent-IR tensor IDs feeding the branches' placeholders.
+  std::vector<int32_t> subgraph_ids;
+  std::vector<int32_t> cond_operand_ids;
+};
+
+// Cached subgraph for OP_COND.
+struct CachedIRSubgraph {
+  std::vector<CachedIRTensor> tensors;     // own ID space
+  std::vector<int32_t> input_tensor_ids;   // local IDs of placeholders
+  std::vector<int32_t> output_tensor_ids;  // local IDs of returned tensors
 };
 
 // Per-graph instance -- owns context, graph, and tensor bookkeeping for one
@@ -156,6 +167,15 @@ struct GgmlDelegateHandle {
 
   // Cached IR: parsed once from FlatBuffer, reused on all subsequent builds.
   std::vector<CachedIRTensor> ir_cache;
+
+  // Cached subgraphs (one per cond branch in the IR). OP_COND tensors
+  // reference these via CachedIRTensor::subgraph_ids.
+  std::vector<CachedIRSubgraph> subgraph_caches;
+
+  // True if any IR tensor has op==COND. When set, the runtime disables
+  // CUDA graph capture (kernel sequence is data-dependent on the
+  // predicate).
+  bool has_cond = false;
 };
 
 } // namespace executorch_ggml
