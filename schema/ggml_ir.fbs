@@ -120,7 +120,21 @@ enum OpCode : int32 {
     MOE_FFN = 96,        // src_ids: [input, gate_inp, gate_exps, up_exps, down_exps] op_params: int32 n_expert, int32 top_k
     SOFTPLUS = 97,       // src_ids: [x] log(1 + exp(x)) with numerically stable threshold at x > 20
     SSM_CONV = 98,       // src_ids: [conv_input, weight] depthwise conv1d with state; maps to llama.cpp ggml_ssm_conv
-    GATED_DELTA_NET = 99 // src_ids: [q, k, v, g, beta, state] fused gated delta-rule step; maps to llama.cpp ggml_gated_delta_net. Emits TWO outputs (output, new_state) identified by output_index in op_params.
+    GATED_DELTA_NET = 99, // src_ids: [q, k, v, g, beta, state] fused gated delta-rule step; maps to llama.cpp ggml_gated_delta_net. Emits TWO outputs (output, new_state) identified by output_index in op_params.
+
+    // Higher-order: torch.cond
+    //   src_ids: [predicate]                    - 0-D bool tensor; CPU-readable
+    //   op_params: int32 num_outputs            - both branches must produce
+    //                                              this many tensors with
+    //                                              identical shapes
+    //   subgraph_ids: [true_idx, false_idx]     - indices into GgmlGraph.subgraphs
+    //   cond_operand_ids: [op0, op1, ...]       - parent IR tensor IDs whose
+    //                                              values bind 1:1 to each
+    //                                              subgraph's input_tensor_ids
+    // For cond outputs with num_outputs > 1, the subgraph emits one COND
+    // tensor per output, with op_params encoding `(num_outputs, output_index)`.
+    // Downstream getitem(cond, k) resolves to the k-th COND tensor.
+    COND = 100
 }
 
 enum TensorType : int32 {
@@ -174,11 +188,40 @@ table Tensor {
     // The runtime places these in a dedicated mutable_buf (not the scheduler
     // pool) so they survive graph rebuilds and aren't corrupted by the allocator.
     is_mutable:bool = false;
+
+    // For OP_COND tensors only: indices into GgmlGraph.subgraphs for the
+    // true/false branches (always exactly 2 entries: [true_idx, false_idx]).
+    // For all other ops: empty.
+    subgraph_ids:[int32];
+
+    // For OP_COND tensors only: parent-IR tensor IDs feeding the branches'
+    // input placeholders. Length matches each subgraph's input_tensor_ids.
+    cond_operand_ids:[int32];
+}
+
+table Subgraph {
+    // Tensors in this subgraph use a fresh local ID space (so a subgraph's
+    // tensor IDs do NOT collide with the parent's).
+    tensors:[Tensor];
+
+    // Subgraph IDs (in this Subgraph's local ID space) of the placeholder
+    // tensors that bind to the cond's `cond_operand_ids` at runtime.
+    input_tensor_ids:[int32];
+
+    // Subgraph IDs of the tensors this subgraph returns (corresponding 1:1
+    // to the cond node's tuple outputs). Both true/false subgraphs of a
+    // given COND must produce the same number of outputs in the same order.
+    output_tensor_ids:[int32];
 }
 
 table GgmlGraph {
     tensors:[Tensor];      // in topological order
     n_threads:int32 = 1;
+
+    // Subgraphs referenced by OP_COND tensors via Tensor.subgraph_ids.
+    // Empty for graphs without torch.cond. Subgraphs are flat (no nesting
+    // of cond inside cond is supported today).
+    subgraphs:[Subgraph];
 }
 
 root_type GgmlGraph;

@@ -40,6 +40,10 @@ class TestNeedleEagerVsJax(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        try:
+            import jax  # noqa: F401
+        except ModuleNotFoundError:
+            raise unittest.SkipTest("jax not installed; skip JAX comparison")
         cls.ckpt_path = _checkpoint_path()
         torch.manual_seed(0)
         np.random.seed(0)

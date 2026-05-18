@@ -121,6 +121,9 @@ OP_SOFTPLUS = 97
 OP_SSM_CONV = 98
 OP_GATED_DELTA_NET = 99
 
+# Higher-order: torch.cond (see schema/ggml_ir.fbs for layout)
+OP_COND = 100
+
 # Fused attention (llama.cpp/ggml)
 OP_LLAMA_ATTENTION = 60
 
@@ -158,6 +161,8 @@ class IrTensor:
         "sym_dim_exprs",
         "elem_size",
         "is_mutable",
+        "subgraph_ids",
+        "cond_operand_ids",
     )
 
     def __init__(
@@ -176,6 +181,8 @@ class IrTensor:
         sym_dim_exprs: Optional[bytes] = None,
         elem_size: int = 0,
         is_mutable: bool = False,
+        subgraph_ids: Optional[List[int]] = None,
+        cond_operand_ids: Optional[List[int]] = None,
     ):
         self.id = tensor_id
         self.tensor_type = tensor_type
@@ -191,6 +198,29 @@ class IrTensor:
         self.sym_dim_exprs = sym_dim_exprs or b""
         self.elem_size = elem_size
         self.is_mutable = is_mutable
+        # Only set on OP_COND tensors. Empty for all others.
+        self.subgraph_ids = subgraph_ids or []
+        self.cond_operand_ids = cond_operand_ids or []
+
+
+class IrSubgraph:
+    """A self-contained subgraph for OP_COND.
+
+    Tensor IDs in `tensors` use a fresh local ID space (not the parent's).
+    `input_tensor_ids` / `output_tensor_ids` reference local IDs.
+    """
+
+    __slots__ = ("tensors", "input_tensor_ids", "output_tensor_ids")
+
+    def __init__(
+        self,
+        tensors: Optional[List["IrTensor"]] = None,
+        input_tensor_ids: Optional[List[int]] = None,
+        output_tensor_ids: Optional[List[int]] = None,
+    ):
+        self.tensors = tensors or []
+        self.input_tensor_ids = input_tensor_ids or []
+        self.output_tensor_ids = output_tensor_ids or []
 
 
 # ---------------------------------------------------------------------------
@@ -208,87 +238,130 @@ def _pytorch_shape_to_ggml_ne(shape: List[int]) -> List[int]:
     return ne[:4]
 
 
-def serialize_graph(tensors: List[IrTensor], n_threads: int = 1) -> bytes:
-    """Serialize a list of IrTensor objects into a FlatBuffer GgmlGraph blob."""
-    builder = flatbuffers.Builder(4096)
+def _build_tensor_offset(builder: flatbuffers.Builder, t: IrTensor) -> int:
+    """Serialize a single IrTensor into the builder, return its offset.
 
-    # Build tensors in reverse order (FlatBuffers vectors are built back-to-front)
-    tensor_offsets = []
-    for t in reversed(tensors):
-        # Vectors
-        if t.ne:
-            ne_vec = builder.CreateNumpyVector(
-                _to_int64_array(t.ne)
-            ) if _has_numpy() else _create_int64_vector(builder, t.ne)
-        else:
-            ne_vec = None
+    Internal helper shared between the parent graph and any subgraphs.
+    """
+    if t.ne:
+        ne_vec = builder.CreateNumpyVector(
+            _to_int64_array(t.ne)
+        ) if _has_numpy() else _create_int64_vector(builder, t.ne)
+    else:
+        ne_vec = None
 
-        if t.src_ids:
-            src_ids_vec = _create_int32_vector(builder, t.src_ids)
-        else:
-            src_ids_vec = None
+    src_ids_vec = _create_int32_vector(builder, t.src_ids) if t.src_ids else None
+    op_params_vec = _create_uint8_vector(builder, t.op_params) if t.op_params else None
+    data_key_off = builder.CreateString(t.data_key) if t.data_key else None
+    sym_vec = (
+        _create_int32_vector(builder, t.sym_dim_ids)
+        if t.sym_dim_ids and any(sid != -1 for sid in t.sym_dim_ids)
+        else None
+    )
+    sym_exprs_vec = _create_uint8_vector(builder, t.sym_dim_exprs) if t.sym_dim_exprs else None
+    subgraph_ids_vec = _create_int32_vector(builder, t.subgraph_ids) if t.subgraph_ids else None
+    cond_operand_ids_vec = (
+        _create_int32_vector(builder, t.cond_operand_ids) if t.cond_operand_ids else None
+    )
 
-        if t.op_params:
-            op_params_vec = _create_uint8_vector(builder, t.op_params)
-        else:
-            op_params_vec = None
+    # Tensor table now has 16 fields (14 base + 2 cond-only).
+    builder.StartObject(16)
+    builder.PrependInt32Slot(0, t.id, 0)
+    builder.PrependInt32Slot(1, t.tensor_type, 0)
+    if ne_vec is not None:
+        builder.PrependUOffsetTRelativeSlot(2, ne_vec, 0)
+    builder.PrependInt32Slot(3, t.op, 0)
+    if src_ids_vec is not None:
+        builder.PrependUOffsetTRelativeSlot(4, src_ids_vec, 0)
+    if op_params_vec is not None:
+        builder.PrependUOffsetTRelativeSlot(5, op_params_vec, 0)
+    if data_key_off is not None:
+        builder.PrependUOffsetTRelativeSlot(6, data_key_off, 0)
+    builder.PrependBoolSlot(7, t.is_input, False)
+    builder.PrependBoolSlot(8, t.is_output, False)
+    builder.PrependInt32Slot(9, t.input_index, -1)
+    if sym_vec is not None:
+        builder.PrependUOffsetTRelativeSlot(10, sym_vec, 0)
+    if sym_exprs_vec is not None:
+        builder.PrependUOffsetTRelativeSlot(11, sym_exprs_vec, 0)
+    if t.elem_size > 0:
+        builder.PrependUint8Slot(12, t.elem_size, 0)
+    builder.PrependBoolSlot(13, t.is_mutable, False)
+    if subgraph_ids_vec is not None:
+        builder.PrependUOffsetTRelativeSlot(14, subgraph_ids_vec, 0)
+    if cond_operand_ids_vec is not None:
+        builder.PrependUOffsetTRelativeSlot(15, cond_operand_ids_vec, 0)
+    return builder.EndObject()
 
-        if t.data_key:
-            data_key_off = builder.CreateString(t.data_key)
-        else:
-            data_key_off = None
 
-        if t.sym_dim_ids and any(sid != -1 for sid in t.sym_dim_ids):
-            sym_vec = _create_int32_vector(builder, t.sym_dim_ids)
-        else:
-            sym_vec = None
-
-        if t.sym_dim_exprs:
-            sym_exprs_vec = _create_uint8_vector(builder, t.sym_dim_exprs)
-        else:
-            sym_exprs_vec = None
-
-        # Build the Tensor table
-        # Start table with the right number of fields (14 fields)
-        builder.StartObject(14)
-
-        builder.PrependInt32Slot(0, t.id, 0)           # id
-        builder.PrependInt32Slot(1, t.tensor_type, 0)  # type
-        if ne_vec is not None:
-            builder.PrependUOffsetTRelativeSlot(2, ne_vec, 0)  # ne
-        builder.PrependInt32Slot(3, t.op, 0)           # op
-        if src_ids_vec is not None:
-            builder.PrependUOffsetTRelativeSlot(4, src_ids_vec, 0)  # src_ids
-        if op_params_vec is not None:
-            builder.PrependUOffsetTRelativeSlot(5, op_params_vec, 0)  # op_params
-        if data_key_off is not None:
-            builder.PrependUOffsetTRelativeSlot(6, data_key_off, 0)  # data_key
-        builder.PrependBoolSlot(7, t.is_input, False)    # is_input
-        builder.PrependBoolSlot(8, t.is_output, False)   # is_output
-        builder.PrependInt32Slot(9, t.input_index, -1)   # input_index
-        if sym_vec is not None:
-            builder.PrependUOffsetTRelativeSlot(10, sym_vec, 0)  # sym_dim_ids
-        if sym_exprs_vec is not None:
-            builder.PrependUOffsetTRelativeSlot(11, sym_exprs_vec, 0)  # sym_dim_exprs
-        if t.elem_size > 0:
-            builder.PrependUint8Slot(12, t.elem_size, 0)  # elem_size
-        builder.PrependBoolSlot(13, t.is_mutable, False)   # is_mutable
-
-        tensor_offsets.append(builder.EndObject())
-
-    # Reverse so they match the original order
+def _build_subgraph_offset(builder: flatbuffers.Builder, sg: "IrSubgraph") -> int:
+    """Serialize a single Subgraph into the builder, return its offset."""
+    # First, serialize each tensor — these go before the Subgraph table itself.
+    tensor_offsets = [
+        _build_tensor_offset(builder, t) for t in reversed(sg.tensors)
+    ]
     tensor_offsets.reverse()
 
-    # Build tensors vector
     builder.StartVector(4, len(tensor_offsets), 4)
     for off in reversed(tensor_offsets):
         builder.PrependUOffsetTRelative(off)
     tensors_vec = builder.EndVector()
 
-    # Build GgmlGraph table (2 fields: tensors, n_threads)
-    builder.StartObject(2)
-    builder.PrependUOffsetTRelativeSlot(0, tensors_vec, 0)  # tensors
-    builder.PrependInt32Slot(1, n_threads, 1)               # n_threads
+    in_ids_vec = _create_int32_vector(builder, sg.input_tensor_ids) if sg.input_tensor_ids else None
+    out_ids_vec = _create_int32_vector(builder, sg.output_tensor_ids) if sg.output_tensor_ids else None
+
+    builder.StartObject(3)
+    builder.PrependUOffsetTRelativeSlot(0, tensors_vec, 0)
+    if in_ids_vec is not None:
+        builder.PrependUOffsetTRelativeSlot(1, in_ids_vec, 0)
+    if out_ids_vec is not None:
+        builder.PrependUOffsetTRelativeSlot(2, out_ids_vec, 0)
+    return builder.EndObject()
+
+
+def serialize_graph(
+    tensors: List[IrTensor],
+    n_threads: int = 1,
+    subgraphs: Optional[List["IrSubgraph"]] = None,
+) -> bytes:
+    """Serialize a list of IrTensor objects into a FlatBuffer GgmlGraph blob.
+
+    `subgraphs` is appended to the FlatBuffer when present and OP_COND
+    tensors reference entries by index via `Tensor.subgraph_ids`.
+    """
+    builder = flatbuffers.Builder(4096)
+    subgraphs = subgraphs or []
+
+    # Each subgraph's tensors must be serialized before the parent's tensor
+    # vector references them via subgraph_ids — but FlatBuffers only stores
+    # offsets, so we just need the subgraph offsets before the GgmlGraph
+    # table writes its subgraphs vector. Order is: tensors, then subgraphs,
+    # then graph table.
+    tensor_offsets = [
+        _build_tensor_offset(builder, t) for t in reversed(tensors)
+    ]
+    tensor_offsets.reverse()
+
+    builder.StartVector(4, len(tensor_offsets), 4)
+    for off in reversed(tensor_offsets):
+        builder.PrependUOffsetTRelative(off)
+    tensors_vec = builder.EndVector()
+
+    if subgraphs:
+        subgraph_offsets = [_build_subgraph_offset(builder, sg) for sg in subgraphs]
+        builder.StartVector(4, len(subgraph_offsets), 4)
+        for off in reversed(subgraph_offsets):
+            builder.PrependUOffsetTRelative(off)
+        subgraphs_vec = builder.EndVector()
+    else:
+        subgraphs_vec = None
+
+    # GgmlGraph table: 3 fields (tensors, n_threads, subgraphs).
+    builder.StartObject(3)
+    builder.PrependUOffsetTRelativeSlot(0, tensors_vec, 0)
+    builder.PrependInt32Slot(1, n_threads, 1)
+    if subgraphs_vec is not None:
+        builder.PrependUOffsetTRelativeSlot(2, subgraphs_vec, 0)
     graph_offset = builder.EndObject()
 
     builder.Finish(graph_offset)

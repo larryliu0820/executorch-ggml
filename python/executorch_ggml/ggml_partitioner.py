@@ -168,10 +168,80 @@ _SUPPORTED_OP_NAMES = {
 }
 
 
+def _is_cond_node(node) -> bool:
+    """True if `node` is a `torch.ops.higher_order.cond` call.
+
+    Recognises the op at both export-IR (`torch.ops.higher_order.cond`)
+    and edge-dialect (a bare `CondOp` instance) levels. The latter shows
+    up with `target.__name__ == "cond"` and the class name `CondOp`.
+    """
+    if node.op != "call_function":
+        return False
+    t = node.target
+    if t is torch.ops.higher_order.cond:
+        return True
+    if getattr(t, "__name__", "") == "cond" and type(t).__name__ == "CondOp":
+        return True
+    return False
+
+
+def _is_supported_cond_target(target) -> bool:
+    """Cheap predicate for `_is_supported_target`'s cond branch."""
+    if target is torch.ops.higher_order.cond:
+        return True
+    if getattr(target, "__name__", "") == "cond" and type(target).__name__ == "CondOp":
+        return True
+    return False
+
+
+def _cond_is_supported(node) -> bool:
+    """True if both branches of a cond node consist only of supported ops.
+
+    Walks each subgraph's `call_function` nodes (one level deep — nested
+    cond is rejected explicitly). Returns False on the first unsupported op
+    so ET's outer executor handles the cond instead of us.
+    """
+    if not _is_cond_node(node):
+        return False
+    # cond.args = (predicate, true_attr, false_attr, operands)
+    if len(node.args) < 3:
+        return False
+    parent_gm = node.graph.owning_module
+    for branch_attr in (node.args[1], node.args[2]):
+        # branch_attr is a get_attr node; its .target is the submodule name.
+        attr_name = (
+            branch_attr.target if isinstance(branch_attr, torch.fx.Node)
+            else branch_attr
+        )
+        if not isinstance(attr_name, str):
+            return False
+        sub_gm = getattr(parent_gm, attr_name, None)
+        if not isinstance(sub_gm, torch.fx.GraphModule):
+            return False
+        for n in sub_gm.graph.nodes:
+            if n.op == "placeholder" or n.op == "output":
+                continue
+            if n.op == "get_attr":
+                # Tensor attrs in subgraphs are constants — fine.
+                continue
+            if n.op != "call_function":
+                return False
+            if _is_cond_node(n):
+                # Nested cond: not supported.
+                return False
+            if not _is_supported_target(n.target, n):
+                return False
+    return True
+
+
 def _is_supported_target(target, node=None) -> bool:
     s = str(target)
     if "<built-in function getitem>" in s:
         return True
+    # torch.cond: only supported when both branches are fully ggml-supported.
+    # Validation is in `_cond_is_supported`.
+    if _is_supported_cond_target(target):
+        return node is not None and _cond_is_supported(node)
     # auto_functionalized_v2 wraps inplace ops (index_copy_).
     # Delegate if the wrapped op is supported.
     if "auto_functionalized" in s:
@@ -397,6 +467,10 @@ class GgmlPartitioner(Partitioner):
             ops.append(torch.ops.ggml.rope.default)
         except AttributeError:
             pass  # rope_op not imported — skip
+        # Note: torch.ops.higher_order.cond is *not* listed here.
+        # `ops_to_not_decompose` only accepts OpOverload (aten ops); cond is
+        # a HigherOrderOperator. Cond is naturally preserved through edge
+        # lowering — `to_edge_transform_and_lower` does not decompose it.
         return (ops, None)
 
     def partition(self, exported_program: ExportedProgram) -> PartitionResult:
@@ -474,6 +548,14 @@ class GgmlPartitioner(Partitioner):
             part_idx += 1
             for node in group_nodes:
                 node.meta["delegation_tag"] = tag
+                # If this is a torch.cond, also tag the get_attr nodes for
+                # its true/false subgraphs so they ride along with the
+                # partition. Without this, the subgraph attrs end up
+                # unowned and ET's outer executor can't route them.
+                if _is_cond_node(node):
+                    for branch_attr in (node.args[1], node.args[2]):
+                        if isinstance(branch_attr, torch.fx.Node) and branch_attr.op == "get_attr":
+                            branch_attr.meta["delegation_tag"] = tag
             partition_tags[tag] = self.delegation_spec
 
         # Tag constant data (params, buffers) used exclusively by tagged nodes.

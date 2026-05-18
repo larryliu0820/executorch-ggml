@@ -18,178 +18,183 @@ namespace ggml_ir {
 struct Tensor;
 struct TensorBuilder;
 
+struct Subgraph;
+struct SubgraphBuilder;
+
 struct GgmlGraph;
 struct GgmlGraphBuilder;
 
-enum class OpCode : int32_t {
-  NONE = 0,
-  ADD = 1,
-  MUL_MAT = 2,
-  LEAKY_RELU = 3,
-  CONV_2D = 4,
-  CONV_2D_DW = 5,
-  HARDTANH = 6,
-  MEAN = 7,
-  VIEW = 8,
-  PERMUTE = 9,
-  MUL = 10,
-  NEG = 11,
-  SUB = 12,
-  MUL_SCALAR = 13,
-  POW = 14,
-  COS = 15,
-  SIN = 16,
-  BMM = 17,
-  SIGMOID = 18,
-  SOFTMAX = 19,
-  LINEAR = 20,
-  EMBEDDING = 21,
-  SILU = 22,
-  RELU = 23,
-  TANH = 24,
-  LAYER_NORM = 25,
-  BATCH_NORM = 26,
-  ARGMAX = 27,
-  DIV = 28,
-  RSQRT = 30,
-  UNSQUEEZE = 31,
-  TRANSPOSE = 40,
-  SLICE = 41,
-  CAT = 42,
-  REPEAT_INTERLEAVE = 43,
-  INDEX = 44,
-  INDEX_PUT = 45,
-  REPEAT = 46,
-  INDEX_MULTI = 47,
-  CAST = 48,
-  WHERE = 50,
-  ARANGE = 51,
-  FULL = 52,
-  CUMSUM = 53,
-  EQ = 54,
-  NE = 55,
-  LE = 56,
-  LT = 57,
-  GT = 58,
-  GE = 59,
-  LLAMA_ATTENTION = 60,
-  BITWISE_AND = 70,
-  BITWISE_OR = 71,
-  LOGICAL_NOT = 72,
-  ANY = 73,
-  UPDATE_CACHE = 74,
-  GELU = 75,
-  RMS_NORM = 76,
-  CONV_1D = 80,
-  CONV_1D_DW = 81,
-  PAD = 82,
-  ROPE = 83,
-  REMAINDER = 84,
-  TOPK = 85,
-  TOPK_INDICES = 86,
-  SORT = 87,
-  SORT_INDICES = 88,
-  MUL_MAT_ID = 89,
-  LOG1P = 90,
-  SPLIT = 91,
-  EXP = 92,
-  SUM = 93,
-  CLAMP = 94,
-  SLICE_SCATTER = 95,
-  MOE_FFN = 96,
-  SOFTPLUS = 97,
-  SSM_CONV = 98,
-  GATED_DELTA_NET = 99,
-  MIN = NONE,
-  MAX = GATED_DELTA_NET
+enum OpCode : int32_t {
+  OpCode_NONE = 0,
+  OpCode_ADD = 1,
+  OpCode_MUL_MAT = 2,
+  OpCode_LEAKY_RELU = 3,
+  OpCode_CONV_2D = 4,
+  OpCode_CONV_2D_DW = 5,
+  OpCode_HARDTANH = 6,
+  OpCode_MEAN = 7,
+  OpCode_VIEW = 8,
+  OpCode_PERMUTE = 9,
+  OpCode_MUL = 10,
+  OpCode_NEG = 11,
+  OpCode_SUB = 12,
+  OpCode_MUL_SCALAR = 13,
+  OpCode_POW = 14,
+  OpCode_COS = 15,
+  OpCode_SIN = 16,
+  OpCode_BMM = 17,
+  OpCode_SIGMOID = 18,
+  OpCode_SOFTMAX = 19,
+  OpCode_LINEAR = 20,
+  OpCode_EMBEDDING = 21,
+  OpCode_SILU = 22,
+  OpCode_RELU = 23,
+  OpCode_TANH = 24,
+  OpCode_LAYER_NORM = 25,
+  OpCode_BATCH_NORM = 26,
+  OpCode_ARGMAX = 27,
+  OpCode_DIV = 28,
+  OpCode_RSQRT = 30,
+  OpCode_UNSQUEEZE = 31,
+  OpCode_TRANSPOSE = 40,
+  OpCode_SLICE = 41,
+  OpCode_CAT = 42,
+  OpCode_REPEAT_INTERLEAVE = 43,
+  OpCode_INDEX = 44,
+  OpCode_INDEX_PUT = 45,
+  OpCode_REPEAT = 46,
+  OpCode_INDEX_MULTI = 47,
+  OpCode_CAST = 48,
+  OpCode_WHERE = 50,
+  OpCode_ARANGE = 51,
+  OpCode_FULL = 52,
+  OpCode_CUMSUM = 53,
+  OpCode_EQ = 54,
+  OpCode_NE = 55,
+  OpCode_LE = 56,
+  OpCode_LT = 57,
+  OpCode_GT = 58,
+  OpCode_GE = 59,
+  OpCode_LLAMA_ATTENTION = 60,
+  OpCode_BITWISE_AND = 70,
+  OpCode_BITWISE_OR = 71,
+  OpCode_LOGICAL_NOT = 72,
+  OpCode_ANY = 73,
+  OpCode_UPDATE_CACHE = 74,
+  OpCode_GELU = 75,
+  OpCode_RMS_NORM = 76,
+  OpCode_CONV_1D = 80,
+  OpCode_CONV_1D_DW = 81,
+  OpCode_PAD = 82,
+  OpCode_ROPE = 83,
+  OpCode_REMAINDER = 84,
+  OpCode_TOPK = 85,
+  OpCode_TOPK_INDICES = 86,
+  OpCode_SORT = 87,
+  OpCode_SORT_INDICES = 88,
+  OpCode_MUL_MAT_ID = 89,
+  OpCode_LOG1P = 90,
+  OpCode_SPLIT = 91,
+  OpCode_EXP = 92,
+  OpCode_SUM = 93,
+  OpCode_CLAMP = 94,
+  OpCode_SLICE_SCATTER = 95,
+  OpCode_MOE_FFN = 96,
+  OpCode_SOFTPLUS = 97,
+  OpCode_SSM_CONV = 98,
+  OpCode_GATED_DELTA_NET = 99,
+  OpCode_COND = 100,
+  OpCode_MIN = OpCode_NONE,
+  OpCode_MAX = OpCode_COND
 };
 
-inline const OpCode (&EnumValuesOpCode())[78] {
+inline const OpCode (&EnumValuesOpCode())[79] {
   static const OpCode values[] = {
-    OpCode::NONE,
-    OpCode::ADD,
-    OpCode::MUL_MAT,
-    OpCode::LEAKY_RELU,
-    OpCode::CONV_2D,
-    OpCode::CONV_2D_DW,
-    OpCode::HARDTANH,
-    OpCode::MEAN,
-    OpCode::VIEW,
-    OpCode::PERMUTE,
-    OpCode::MUL,
-    OpCode::NEG,
-    OpCode::SUB,
-    OpCode::MUL_SCALAR,
-    OpCode::POW,
-    OpCode::COS,
-    OpCode::SIN,
-    OpCode::BMM,
-    OpCode::SIGMOID,
-    OpCode::SOFTMAX,
-    OpCode::LINEAR,
-    OpCode::EMBEDDING,
-    OpCode::SILU,
-    OpCode::RELU,
-    OpCode::TANH,
-    OpCode::LAYER_NORM,
-    OpCode::BATCH_NORM,
-    OpCode::ARGMAX,
-    OpCode::DIV,
-    OpCode::RSQRT,
-    OpCode::UNSQUEEZE,
-    OpCode::TRANSPOSE,
-    OpCode::SLICE,
-    OpCode::CAT,
-    OpCode::REPEAT_INTERLEAVE,
-    OpCode::INDEX,
-    OpCode::INDEX_PUT,
-    OpCode::REPEAT,
-    OpCode::INDEX_MULTI,
-    OpCode::CAST,
-    OpCode::WHERE,
-    OpCode::ARANGE,
-    OpCode::FULL,
-    OpCode::CUMSUM,
-    OpCode::EQ,
-    OpCode::NE,
-    OpCode::LE,
-    OpCode::LT,
-    OpCode::GT,
-    OpCode::GE,
-    OpCode::LLAMA_ATTENTION,
-    OpCode::BITWISE_AND,
-    OpCode::BITWISE_OR,
-    OpCode::LOGICAL_NOT,
-    OpCode::ANY,
-    OpCode::UPDATE_CACHE,
-    OpCode::GELU,
-    OpCode::RMS_NORM,
-    OpCode::CONV_1D,
-    OpCode::CONV_1D_DW,
-    OpCode::PAD,
-    OpCode::ROPE,
-    OpCode::REMAINDER,
-    OpCode::TOPK,
-    OpCode::TOPK_INDICES,
-    OpCode::SORT,
-    OpCode::SORT_INDICES,
-    OpCode::MUL_MAT_ID,
-    OpCode::LOG1P,
-    OpCode::SPLIT,
-    OpCode::EXP,
-    OpCode::SUM,
-    OpCode::CLAMP,
-    OpCode::SLICE_SCATTER,
-    OpCode::MOE_FFN,
-    OpCode::SOFTPLUS,
-    OpCode::SSM_CONV,
-    OpCode::GATED_DELTA_NET
+    OpCode_NONE,
+    OpCode_ADD,
+    OpCode_MUL_MAT,
+    OpCode_LEAKY_RELU,
+    OpCode_CONV_2D,
+    OpCode_CONV_2D_DW,
+    OpCode_HARDTANH,
+    OpCode_MEAN,
+    OpCode_VIEW,
+    OpCode_PERMUTE,
+    OpCode_MUL,
+    OpCode_NEG,
+    OpCode_SUB,
+    OpCode_MUL_SCALAR,
+    OpCode_POW,
+    OpCode_COS,
+    OpCode_SIN,
+    OpCode_BMM,
+    OpCode_SIGMOID,
+    OpCode_SOFTMAX,
+    OpCode_LINEAR,
+    OpCode_EMBEDDING,
+    OpCode_SILU,
+    OpCode_RELU,
+    OpCode_TANH,
+    OpCode_LAYER_NORM,
+    OpCode_BATCH_NORM,
+    OpCode_ARGMAX,
+    OpCode_DIV,
+    OpCode_RSQRT,
+    OpCode_UNSQUEEZE,
+    OpCode_TRANSPOSE,
+    OpCode_SLICE,
+    OpCode_CAT,
+    OpCode_REPEAT_INTERLEAVE,
+    OpCode_INDEX,
+    OpCode_INDEX_PUT,
+    OpCode_REPEAT,
+    OpCode_INDEX_MULTI,
+    OpCode_CAST,
+    OpCode_WHERE,
+    OpCode_ARANGE,
+    OpCode_FULL,
+    OpCode_CUMSUM,
+    OpCode_EQ,
+    OpCode_NE,
+    OpCode_LE,
+    OpCode_LT,
+    OpCode_GT,
+    OpCode_GE,
+    OpCode_LLAMA_ATTENTION,
+    OpCode_BITWISE_AND,
+    OpCode_BITWISE_OR,
+    OpCode_LOGICAL_NOT,
+    OpCode_ANY,
+    OpCode_UPDATE_CACHE,
+    OpCode_GELU,
+    OpCode_RMS_NORM,
+    OpCode_CONV_1D,
+    OpCode_CONV_1D_DW,
+    OpCode_PAD,
+    OpCode_ROPE,
+    OpCode_REMAINDER,
+    OpCode_TOPK,
+    OpCode_TOPK_INDICES,
+    OpCode_SORT,
+    OpCode_SORT_INDICES,
+    OpCode_MUL_MAT_ID,
+    OpCode_LOG1P,
+    OpCode_SPLIT,
+    OpCode_EXP,
+    OpCode_SUM,
+    OpCode_CLAMP,
+    OpCode_SLICE_SCATTER,
+    OpCode_MOE_FFN,
+    OpCode_SOFTPLUS,
+    OpCode_SSM_CONV,
+    OpCode_GATED_DELTA_NET,
+    OpCode_COND
   };
   return values;
 }
 
 inline const char * const *EnumNamesOpCode() {
-  static const char * const names[101] = {
+  static const char * const names[102] = {
     "NONE",
     "ADD",
     "MUL_MAT",
@@ -290,42 +295,43 @@ inline const char * const *EnumNamesOpCode() {
     "SOFTPLUS",
     "SSM_CONV",
     "GATED_DELTA_NET",
+    "COND",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameOpCode(OpCode e) {
-  if (::flatbuffers::IsOutRange(e, OpCode::NONE, OpCode::GATED_DELTA_NET)) return "";
+  if (::flatbuffers::IsOutRange(e, OpCode_NONE, OpCode_COND)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesOpCode()[index];
 }
 
-enum class TensorType : int32_t {
-  F32 = 0,
-  F16 = 1,
-  I64 = 2,
-  I32 = 3,
-  BOOL = 4,
-  BF16 = 5,
-  Q8_0 = 6,
-  Q6_K = 7,
-  Q4_0 = 8,
-  MIN = F32,
-  MAX = Q4_0
+enum TensorType : int32_t {
+  TensorType_F32 = 0,
+  TensorType_F16 = 1,
+  TensorType_I64 = 2,
+  TensorType_I32 = 3,
+  TensorType_BOOL = 4,
+  TensorType_BF16 = 5,
+  TensorType_Q8_0 = 6,
+  TensorType_Q6_K = 7,
+  TensorType_Q4_0 = 8,
+  TensorType_MIN = TensorType_F32,
+  TensorType_MAX = TensorType_Q4_0
 };
 
 inline const TensorType (&EnumValuesTensorType())[9] {
   static const TensorType values[] = {
-    TensorType::F32,
-    TensorType::F16,
-    TensorType::I64,
-    TensorType::I32,
-    TensorType::BOOL,
-    TensorType::BF16,
-    TensorType::Q8_0,
-    TensorType::Q6_K,
-    TensorType::Q4_0
+    TensorType_F32,
+    TensorType_F16,
+    TensorType_I64,
+    TensorType_I32,
+    TensorType_BOOL,
+    TensorType_BF16,
+    TensorType_Q8_0,
+    TensorType_Q6_K,
+    TensorType_Q4_0
   };
   return values;
 }
@@ -347,7 +353,7 @@ inline const char * const *EnumNamesTensorType() {
 }
 
 inline const char *EnumNameTensorType(TensorType e) {
-  if (::flatbuffers::IsOutRange(e, TensorType::F32, TensorType::Q4_0)) return "";
+  if (::flatbuffers::IsOutRange(e, TensorType_F32, TensorType_Q4_0)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesTensorType()[index];
 }
@@ -368,7 +374,9 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_SYM_DIM_IDS = 24,
     VT_SYM_DIM_EXPRS = 26,
     VT_ELEM_SIZE = 28,
-    VT_IS_MUTABLE = 30
+    VT_IS_MUTABLE = 30,
+    VT_SUBGRAPH_IDS = 32,
+    VT_COND_OPERAND_IDS = 34
   };
   int32_t id() const {
     return GetField<int32_t>(VT_ID, 0);
@@ -412,6 +420,12 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   bool is_mutable() const {
     return GetField<uint8_t>(VT_IS_MUTABLE, 0) != 0;
   }
+  const ::flatbuffers::Vector<int32_t> *subgraph_ids() const {
+    return GetPointer<const ::flatbuffers::Vector<int32_t> *>(VT_SUBGRAPH_IDS);
+  }
+  const ::flatbuffers::Vector<int32_t> *cond_operand_ids() const {
+    return GetPointer<const ::flatbuffers::Vector<int32_t> *>(VT_COND_OPERAND_IDS);
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<int32_t>(verifier, VT_ID, 4) &&
@@ -434,6 +448,10 @@ struct Tensor FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            verifier.VerifyVector(sym_dim_exprs()) &&
            VerifyField<uint8_t>(verifier, VT_ELEM_SIZE, 1) &&
            VerifyField<uint8_t>(verifier, VT_IS_MUTABLE, 1) &&
+           VerifyOffset(verifier, VT_SUBGRAPH_IDS) &&
+           verifier.VerifyVector(subgraph_ids()) &&
+           VerifyOffset(verifier, VT_COND_OPERAND_IDS) &&
+           verifier.VerifyVector(cond_operand_ids()) &&
            verifier.EndTable();
   }
 };
@@ -484,6 +502,12 @@ struct TensorBuilder {
   void add_is_mutable(bool is_mutable) {
     fbb_.AddElement<uint8_t>(Tensor::VT_IS_MUTABLE, static_cast<uint8_t>(is_mutable), 0);
   }
+  void add_subgraph_ids(::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> subgraph_ids) {
+    fbb_.AddOffset(Tensor::VT_SUBGRAPH_IDS, subgraph_ids);
+  }
+  void add_cond_operand_ids(::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> cond_operand_ids) {
+    fbb_.AddOffset(Tensor::VT_COND_OPERAND_IDS, cond_operand_ids);
+  }
   explicit TensorBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -498,9 +522,9 @@ struct TensorBuilder {
 inline ::flatbuffers::Offset<Tensor> CreateTensor(
     ::flatbuffers::FlatBufferBuilder &_fbb,
     int32_t id = 0,
-    ggml_ir::TensorType type = ggml_ir::TensorType::F32,
+    ggml_ir::TensorType type = ggml_ir::TensorType_F32,
     ::flatbuffers::Offset<::flatbuffers::Vector<int64_t>> ne = 0,
-    ggml_ir::OpCode op = ggml_ir::OpCode::NONE,
+    ggml_ir::OpCode op = ggml_ir::OpCode_NONE,
     ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> src_ids = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> op_params = 0,
     ::flatbuffers::Offset<::flatbuffers::String> data_key = 0,
@@ -510,8 +534,12 @@ inline ::flatbuffers::Offset<Tensor> CreateTensor(
     ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> sym_dim_ids = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> sym_dim_exprs = 0,
     uint8_t elem_size = 0,
-    bool is_mutable = false) {
+    bool is_mutable = false,
+    ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> subgraph_ids = 0,
+    ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> cond_operand_ids = 0) {
   TensorBuilder builder_(_fbb);
+  builder_.add_cond_operand_ids(cond_operand_ids);
+  builder_.add_subgraph_ids(subgraph_ids);
   builder_.add_sym_dim_exprs(sym_dim_exprs);
   builder_.add_sym_dim_ids(sym_dim_ids);
   builder_.add_input_index(input_index);
@@ -532,9 +560,9 @@ inline ::flatbuffers::Offset<Tensor> CreateTensor(
 inline ::flatbuffers::Offset<Tensor> CreateTensorDirect(
     ::flatbuffers::FlatBufferBuilder &_fbb,
     int32_t id = 0,
-    ggml_ir::TensorType type = ggml_ir::TensorType::F32,
+    ggml_ir::TensorType type = ggml_ir::TensorType_F32,
     const std::vector<int64_t> *ne = nullptr,
-    ggml_ir::OpCode op = ggml_ir::OpCode::NONE,
+    ggml_ir::OpCode op = ggml_ir::OpCode_NONE,
     const std::vector<int32_t> *src_ids = nullptr,
     const std::vector<uint8_t> *op_params = nullptr,
     const char *data_key = nullptr,
@@ -544,13 +572,17 @@ inline ::flatbuffers::Offset<Tensor> CreateTensorDirect(
     const std::vector<int32_t> *sym_dim_ids = nullptr,
     const std::vector<uint8_t> *sym_dim_exprs = nullptr,
     uint8_t elem_size = 0,
-    bool is_mutable = false) {
+    bool is_mutable = false,
+    const std::vector<int32_t> *subgraph_ids = nullptr,
+    const std::vector<int32_t> *cond_operand_ids = nullptr) {
   auto ne__ = ne ? _fbb.CreateVector<int64_t>(*ne) : 0;
   auto src_ids__ = src_ids ? _fbb.CreateVector<int32_t>(*src_ids) : 0;
   auto op_params__ = op_params ? _fbb.CreateVector<uint8_t>(*op_params) : 0;
   auto data_key__ = data_key ? _fbb.CreateString(data_key) : 0;
   auto sym_dim_ids__ = sym_dim_ids ? _fbb.CreateVector<int32_t>(*sym_dim_ids) : 0;
   auto sym_dim_exprs__ = sym_dim_exprs ? _fbb.CreateVector<uint8_t>(*sym_dim_exprs) : 0;
+  auto subgraph_ids__ = subgraph_ids ? _fbb.CreateVector<int32_t>(*subgraph_ids) : 0;
+  auto cond_operand_ids__ = cond_operand_ids ? _fbb.CreateVector<int32_t>(*cond_operand_ids) : 0;
   return ggml_ir::CreateTensor(
       _fbb,
       id,
@@ -566,14 +598,97 @@ inline ::flatbuffers::Offset<Tensor> CreateTensorDirect(
       sym_dim_ids__,
       sym_dim_exprs__,
       elem_size,
-      is_mutable);
+      is_mutable,
+      subgraph_ids__,
+      cond_operand_ids__);
+}
+
+struct Subgraph FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+  typedef SubgraphBuilder Builder;
+  enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
+    VT_TENSORS = 4,
+    VT_INPUT_TENSOR_IDS = 6,
+    VT_OUTPUT_TENSOR_IDS = 8
+  };
+  const ::flatbuffers::Vector<::flatbuffers::Offset<ggml_ir::Tensor>> *tensors() const {
+    return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<ggml_ir::Tensor>> *>(VT_TENSORS);
+  }
+  const ::flatbuffers::Vector<int32_t> *input_tensor_ids() const {
+    return GetPointer<const ::flatbuffers::Vector<int32_t> *>(VT_INPUT_TENSOR_IDS);
+  }
+  const ::flatbuffers::Vector<int32_t> *output_tensor_ids() const {
+    return GetPointer<const ::flatbuffers::Vector<int32_t> *>(VT_OUTPUT_TENSOR_IDS);
+  }
+  bool Verify(::flatbuffers::Verifier &verifier) const {
+    return VerifyTableStart(verifier) &&
+           VerifyOffset(verifier, VT_TENSORS) &&
+           verifier.VerifyVector(tensors()) &&
+           verifier.VerifyVectorOfTables(tensors()) &&
+           VerifyOffset(verifier, VT_INPUT_TENSOR_IDS) &&
+           verifier.VerifyVector(input_tensor_ids()) &&
+           VerifyOffset(verifier, VT_OUTPUT_TENSOR_IDS) &&
+           verifier.VerifyVector(output_tensor_ids()) &&
+           verifier.EndTable();
+  }
+};
+
+struct SubgraphBuilder {
+  typedef Subgraph Table;
+  ::flatbuffers::FlatBufferBuilder &fbb_;
+  ::flatbuffers::uoffset_t start_;
+  void add_tensors(::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<ggml_ir::Tensor>>> tensors) {
+    fbb_.AddOffset(Subgraph::VT_TENSORS, tensors);
+  }
+  void add_input_tensor_ids(::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> input_tensor_ids) {
+    fbb_.AddOffset(Subgraph::VT_INPUT_TENSOR_IDS, input_tensor_ids);
+  }
+  void add_output_tensor_ids(::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> output_tensor_ids) {
+    fbb_.AddOffset(Subgraph::VT_OUTPUT_TENSOR_IDS, output_tensor_ids);
+  }
+  explicit SubgraphBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
+        : fbb_(_fbb) {
+    start_ = fbb_.StartTable();
+  }
+  ::flatbuffers::Offset<Subgraph> Finish() {
+    const auto end = fbb_.EndTable(start_);
+    auto o = ::flatbuffers::Offset<Subgraph>(end);
+    return o;
+  }
+};
+
+inline ::flatbuffers::Offset<Subgraph> CreateSubgraph(
+    ::flatbuffers::FlatBufferBuilder &_fbb,
+    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<ggml_ir::Tensor>>> tensors = 0,
+    ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> input_tensor_ids = 0,
+    ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> output_tensor_ids = 0) {
+  SubgraphBuilder builder_(_fbb);
+  builder_.add_output_tensor_ids(output_tensor_ids);
+  builder_.add_input_tensor_ids(input_tensor_ids);
+  builder_.add_tensors(tensors);
+  return builder_.Finish();
+}
+
+inline ::flatbuffers::Offset<Subgraph> CreateSubgraphDirect(
+    ::flatbuffers::FlatBufferBuilder &_fbb,
+    const std::vector<::flatbuffers::Offset<ggml_ir::Tensor>> *tensors = nullptr,
+    const std::vector<int32_t> *input_tensor_ids = nullptr,
+    const std::vector<int32_t> *output_tensor_ids = nullptr) {
+  auto tensors__ = tensors ? _fbb.CreateVector<::flatbuffers::Offset<ggml_ir::Tensor>>(*tensors) : 0;
+  auto input_tensor_ids__ = input_tensor_ids ? _fbb.CreateVector<int32_t>(*input_tensor_ids) : 0;
+  auto output_tensor_ids__ = output_tensor_ids ? _fbb.CreateVector<int32_t>(*output_tensor_ids) : 0;
+  return ggml_ir::CreateSubgraph(
+      _fbb,
+      tensors__,
+      input_tensor_ids__,
+      output_tensor_ids__);
 }
 
 struct GgmlGraph FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   typedef GgmlGraphBuilder Builder;
   enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
     VT_TENSORS = 4,
-    VT_N_THREADS = 6
+    VT_N_THREADS = 6,
+    VT_SUBGRAPHS = 8
   };
   const ::flatbuffers::Vector<::flatbuffers::Offset<ggml_ir::Tensor>> *tensors() const {
     return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<ggml_ir::Tensor>> *>(VT_TENSORS);
@@ -581,12 +696,18 @@ struct GgmlGraph FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   int32_t n_threads() const {
     return GetField<int32_t>(VT_N_THREADS, 1);
   }
+  const ::flatbuffers::Vector<::flatbuffers::Offset<ggml_ir::Subgraph>> *subgraphs() const {
+    return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<ggml_ir::Subgraph>> *>(VT_SUBGRAPHS);
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyOffset(verifier, VT_TENSORS) &&
            verifier.VerifyVector(tensors()) &&
            verifier.VerifyVectorOfTables(tensors()) &&
            VerifyField<int32_t>(verifier, VT_N_THREADS, 4) &&
+           VerifyOffset(verifier, VT_SUBGRAPHS) &&
+           verifier.VerifyVector(subgraphs()) &&
+           verifier.VerifyVectorOfTables(subgraphs()) &&
            verifier.EndTable();
   }
 };
@@ -600,6 +721,9 @@ struct GgmlGraphBuilder {
   }
   void add_n_threads(int32_t n_threads) {
     fbb_.AddElement<int32_t>(GgmlGraph::VT_N_THREADS, n_threads, 1);
+  }
+  void add_subgraphs(::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<ggml_ir::Subgraph>>> subgraphs) {
+    fbb_.AddOffset(GgmlGraph::VT_SUBGRAPHS, subgraphs);
   }
   explicit GgmlGraphBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
@@ -615,8 +739,10 @@ struct GgmlGraphBuilder {
 inline ::flatbuffers::Offset<GgmlGraph> CreateGgmlGraph(
     ::flatbuffers::FlatBufferBuilder &_fbb,
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<ggml_ir::Tensor>>> tensors = 0,
-    int32_t n_threads = 1) {
+    int32_t n_threads = 1,
+    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<ggml_ir::Subgraph>>> subgraphs = 0) {
   GgmlGraphBuilder builder_(_fbb);
+  builder_.add_subgraphs(subgraphs);
   builder_.add_n_threads(n_threads);
   builder_.add_tensors(tensors);
   return builder_.Finish();
@@ -625,12 +751,15 @@ inline ::flatbuffers::Offset<GgmlGraph> CreateGgmlGraph(
 inline ::flatbuffers::Offset<GgmlGraph> CreateGgmlGraphDirect(
     ::flatbuffers::FlatBufferBuilder &_fbb,
     const std::vector<::flatbuffers::Offset<ggml_ir::Tensor>> *tensors = nullptr,
-    int32_t n_threads = 1) {
+    int32_t n_threads = 1,
+    const std::vector<::flatbuffers::Offset<ggml_ir::Subgraph>> *subgraphs = nullptr) {
   auto tensors__ = tensors ? _fbb.CreateVector<::flatbuffers::Offset<ggml_ir::Tensor>>(*tensors) : 0;
+  auto subgraphs__ = subgraphs ? _fbb.CreateVector<::flatbuffers::Offset<ggml_ir::Subgraph>>(*subgraphs) : 0;
   return ggml_ir::CreateGgmlGraph(
       _fbb,
       tensors__,
-      n_threads);
+      n_threads,
+      subgraphs__);
 }
 
 inline const ggml_ir::GgmlGraph *GetGgmlGraph(const void *buf) {

@@ -7,7 +7,7 @@ from torch.export import ExportedProgram
 
 from executorch.exir._serialize._named_data_store import NamedDataStore
 
-from executorch_ggml.serialize import IrTensor
+from executorch_ggml.serialize import IrSubgraph, IrTensor
 
 
 class PreprocessContext:
@@ -30,6 +30,9 @@ class PreprocessContext:
         self.node_to_id: Dict[torch.fx.Node, int] = {}
         # Accumulated IR tensors
         self.ir_tensors: List[IrTensor] = []
+        # Subgraphs (populated when torch.cond is encountered).
+        # OP_COND tensors reference these by index via subgraph_ids.
+        self.subgraphs: List[IrSubgraph] = []
         # Monotonic ID counter
         self._next_id: int = 0
         # Maps symbolic variable name (e.g. "s0") -> unique integer ID

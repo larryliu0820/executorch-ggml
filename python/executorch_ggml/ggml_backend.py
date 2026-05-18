@@ -10,7 +10,9 @@ from executorch.exir.backend.compile_spec_schema import CompileSpec
 from executorch.exir._serialize._named_data_store import NamedDataStore
 
 from executorch_ggml.serialize import (
+    IrSubgraph,
     IrTensor,
+    OP_COND,
     OP_NONE,
     TYPE_F32,
     TYPE_F16,
@@ -47,9 +49,17 @@ from executorch_ggml.ops._sym_expr import (
     _sym_dim_info_ggml,
 )
 from executorch_ggml.ops._context import PreprocessContext
+from executorch_ggml.ops._cond import _is_cond_target, handle_cond as _handle_cond_node_impl
 
 # Importing ops triggers registration of all operator handlers.
 from executorch_ggml.ops import dispatch_op  # noqa: F401 (side-effect import)
+
+
+def _handle_cond_node(ctx, node, edge_program, data_store, quant_config,
+                       gguf_weight_map, skip_weight_data):
+    """Thin wrapper around `_handle_cond_node_impl` so the closures over
+    quant/data_store stay implicit via `ctx`."""
+    _handle_cond_node_impl(ctx, node)
 
 
 class GgmlBackend(BackendDetails):
@@ -247,9 +257,25 @@ class GgmlBackend(BackendDetails):
                     node_to_id[node] = tid
                     runtime_input_idx += 1
 
+            elif node.op == "get_attr":
+                # Subgraph attrs (e.g. submodule_0/submodule_1 for cond's
+                # branches) are resolved at the cond site itself; we don't
+                # emit IR here. Just record the attr so the cond handler
+                # can find it via owning_module.<target>.
+                continue
+
             elif node.op == "call_function":
                 target = node.target
                 target_str = str(target)
+
+                # --- torch.cond: handle separately (recurse into both
+                # branches, emit OP_COND IR tensors). ---
+                if _is_cond_target(target):
+                    _handle_cond_node(
+                        ctx, node, edge_program, data_store, quant_config,
+                        gguf_weight_map, skip_weight_data,
+                    )
+                    continue
 
                 # --- Dispatch to registered operator handlers ---
                 if dispatch_op(ctx, node, target_str):
@@ -306,8 +332,8 @@ class GgmlBackend(BackendDetails):
                                 break
                     user_out_idx += 1
 
-        # Serialize to FlatBuffer
-        fb_bytes = serialize_graph(ir_tensors)
+        # Serialize to FlatBuffer (includes any cond subgraphs).
+        fb_bytes = serialize_graph(ir_tensors, subgraphs=ctx.subgraphs)
         return PreprocessResult(
             processed_bytes=fb_bytes,
             data_store_output=data_store.get_named_data_store_output(),
