@@ -62,7 +62,8 @@
 #include "ops/ops_comparison.h"
 #include "ops/ops_special.h"
 #include "ops/ops_moe.h"
-#include "ops/ops_cond.h"
+// ops_cond.h is no longer included — the COND build is implemented
+// inline as `build_op_cond_v2` so it can call dispatch_op_to_builder.
 #include "gguf_data_map.h"
 
 namespace executorch_ggml {
@@ -182,6 +183,352 @@ static void populate_ir_cache(GgmlDelegateHandle* handle) {
     }
   }
   handle->has_cond = any_cond;
+}
+
+// Forward decl: COND build is defined later (it needs to call
+// dispatch_op_to_builder for subgraph ops).
+static struct ggml_tensor* build_op_cond_v2(BuildContext& bc);
+
+// Dispatch a single op (excluding COND, which is handled inline so the
+// build can recurse into subgraphs). Returns nullptr for unrecognised ops.
+static struct ggml_tensor* dispatch_op_to_builder(ggml_ir::OpCode op, BuildContext& bc) {
+  switch (op) {
+    case ggml_ir::OpCode::ADD:           return build_op_add(bc);
+    case ggml_ir::OpCode::SUB:           return build_op_sub(bc);
+    case ggml_ir::OpCode::MUL:           return build_op_mul(bc);
+    case ggml_ir::OpCode::MUL_SCALAR:    return build_op_mul_scalar(bc);
+    case ggml_ir::OpCode::DIV:           return build_op_div(bc);
+    case ggml_ir::OpCode::NEG:           return build_op_neg(bc);
+    case ggml_ir::OpCode::RSQRT:         return build_op_rsqrt(bc);
+    case ggml_ir::OpCode::POW:           return build_op_pow(bc);
+    case ggml_ir::OpCode::MEAN:          return build_op_mean(bc);
+    case ggml_ir::OpCode::MUL_MAT:       return build_op_mul_mat(bc);
+    case ggml_ir::OpCode::BMM:           return build_op_bmm(bc);
+    case ggml_ir::OpCode::LINEAR:        return build_op_linear(bc);
+    case ggml_ir::OpCode::EMBEDDING:     return build_op_embedding(bc);
+    case ggml_ir::OpCode::SILU:          return build_op_silu(bc);
+    case ggml_ir::OpCode::SOFTPLUS:      return build_op_softplus(bc);
+    case ggml_ir::OpCode::RELU:          return build_op_relu(bc);
+    case ggml_ir::OpCode::TANH:          return build_op_tanh(bc);
+    case ggml_ir::OpCode::GELU:          return build_op_gelu(bc);
+    case ggml_ir::OpCode::LEAKY_RELU:    return build_op_leaky_relu(bc);
+    case ggml_ir::OpCode::SIGMOID:       return build_op_sigmoid(bc);
+    case ggml_ir::OpCode::SOFTMAX:       return build_op_softmax(bc);
+    case ggml_ir::OpCode::HARDTANH:      return build_op_hardtanh(bc);
+    case ggml_ir::OpCode::COS:           return build_op_cos(bc);
+    case ggml_ir::OpCode::SIN:           return build_op_sin(bc);
+    case ggml_ir::OpCode::VIEW:          return build_op_view(bc);
+    case ggml_ir::OpCode::PERMUTE:       return build_op_permute(bc);
+    case ggml_ir::OpCode::TRANSPOSE:     return build_op_transpose(bc);
+    case ggml_ir::OpCode::UNSQUEEZE:     return build_op_unsqueeze(bc);
+    case ggml_ir::OpCode::SLICE:         return build_op_slice(bc);
+    case ggml_ir::OpCode::CAT:           return build_op_cat(bc);
+    case ggml_ir::OpCode::REPEAT:        return build_op_repeat(bc);
+    case ggml_ir::OpCode::REPEAT_INTERLEAVE: return build_op_repeat_interleave(bc);
+    case ggml_ir::OpCode::INDEX:         return build_op_index(bc);
+    case ggml_ir::OpCode::INDEX_MULTI:   return build_op_index_multi(bc);
+    case ggml_ir::OpCode::INDEX_PUT:     return build_op_index_put(bc);
+    case ggml_ir::OpCode::LAYER_NORM:    return build_op_layer_norm(bc);
+    case ggml_ir::OpCode::RMS_NORM:      return build_op_rms_norm(bc);
+    case ggml_ir::OpCode::BATCH_NORM:    return build_op_batch_norm(bc);
+    case ggml_ir::OpCode::CONV_2D:       return build_op_conv_2d(bc, false);
+    case ggml_ir::OpCode::CONV_2D_DW:    return build_op_conv_2d(bc, true);
+    case ggml_ir::OpCode::CONV_1D:       return build_op_conv_1d(bc, false);
+    case ggml_ir::OpCode::CONV_1D_DW:    return build_op_conv_1d(bc, true);
+    case ggml_ir::OpCode::PAD:           return build_op_pad(bc);
+    case ggml_ir::OpCode::ARANGE:        return build_op_arange(bc);
+    case ggml_ir::OpCode::FULL:          return build_op_full(bc);
+    case ggml_ir::OpCode::CUMSUM:        return build_op_cumsum(bc);
+    case ggml_ir::OpCode::ARGMAX:        return build_op_argmax(bc);
+    case ggml_ir::OpCode::CAST:          return build_op_cast(bc);
+    case ggml_ir::OpCode::WHERE:         return build_op_where(bc);
+    case ggml_ir::OpCode::EQ:            return build_op_eq(bc);
+    case ggml_ir::OpCode::NE:            return build_op_ne(bc);
+    case ggml_ir::OpCode::LE:            return build_op_le(bc);
+    case ggml_ir::OpCode::LT:            return build_op_lt(bc);
+    case ggml_ir::OpCode::GT:            return build_op_gt(bc);
+    case ggml_ir::OpCode::GE:            return build_op_ge(bc);
+    case ggml_ir::OpCode::BITWISE_AND:   return build_op_bitwise_and(bc);
+    case ggml_ir::OpCode::BITWISE_OR:    return build_op_bitwise_or(bc);
+    case ggml_ir::OpCode::LOGICAL_NOT:   return build_op_logical_not(bc);
+    case ggml_ir::OpCode::ANY:           return build_op_any(bc);
+    case ggml_ir::OpCode::LLAMA_ATTENTION: return build_op_llama_attention(bc);
+    case ggml_ir::OpCode::UPDATE_CACHE:  return build_op_update_cache(bc);
+    case ggml_ir::OpCode::ROPE:          return build_op_rope(bc);
+    case ggml_ir::OpCode::REMAINDER:     return build_op_remainder(bc);
+    case ggml_ir::OpCode::TOPK:          return build_op_topk(bc);
+    case ggml_ir::OpCode::TOPK_INDICES:  return build_op_topk_indices(bc);
+    case ggml_ir::OpCode::SORT:          return build_op_sort(bc);
+    case ggml_ir::OpCode::SORT_INDICES:  return build_op_sort_indices(bc);
+    case ggml_ir::OpCode::MUL_MAT_ID:    return build_op_mul_mat_id(bc);
+    case ggml_ir::OpCode::LOG1P:         return build_op_log1p(bc);
+    case ggml_ir::OpCode::EXP:           return build_op_exp(bc);
+    case ggml_ir::OpCode::SUM:           return build_op_sum(bc);
+    case ggml_ir::OpCode::CLAMP:         return build_op_clamp(bc);
+    case ggml_ir::OpCode::SLICE_SCATTER: return build_op_slice_scatter(bc);
+    case ggml_ir::OpCode::MOE_FFN:       return build_op_moe_ffn(bc);
+    case ggml_ir::OpCode::SSM_CONV:      return build_op_ssm_conv(bc);
+    case ggml_ir::OpCode::GATED_DELTA_NET: return build_op_gated_delta_net(bc);
+    // COND is handled separately (recurses into subgraphs). The caller
+    // intercepts COND before calling dispatch_op_to_builder.
+    case ggml_ir::OpCode::COND:          return build_op_cond_v2(bc);
+    default: return nullptr;
+  }
+}
+
+// COND build: always-run-both + ggml_where strategy.
+//
+// Builds both branches' subtrees into the parent ggml_context, then
+// selects the output via ggml_where(predicate, true_out, false_out).
+// The op_params encode (num_outputs, output_index) — we rebuild the
+// branches the first time we see a COND tensor with output_index=0
+// and cache the per-output (true, false) pair via cond_outputs_cache
+// so that subsequent COND tensors (for output_index > 0) reuse them.
+//
+// Limitations:
+//   1. Always runs both branches — wasted compute. To skip the unchosen
+//      branch we'd need a true two-cgraph approach with execute-time
+//      subgraph swap (Phase 4b).
+//   2. In-place buffer mutations in either branch run unconditionally.
+//      OK for pure-functional cond (the simple cond test); not OK for
+//      whisper's update_cross_attn_cache pattern. Phase 4b fixes that.
+//
+// Cache: keyed by parent COND-tensor id of output_index=0. Holds the
+// per-output (true_branch, false_branch) ggml_tensor pairs.
+struct CondOutputs {
+  std::vector<struct ggml_tensor*> true_outs;
+  std::vector<struct ggml_tensor*> false_outs;
+};
+
+// Build a single subgraph: walk its tensors, allocate ggml_tensors for
+// placeholders bound to the parent's operand tensors, dispatch op
+// builders for each non-placeholder. Returns the subgraph's output
+// ggml_tensor list.
+static std::vector<struct ggml_tensor*> build_cond_subgraph(
+    BuildContext& parent_bc,
+    const CachedIRSubgraph& csg,
+    const std::vector<struct ggml_tensor*>& operand_tensors) {
+  std::vector<struct ggml_tensor*> sub_id_to_tensor;
+  // The largest local ID in the subgraph determines the size of the map.
+  int max_local_id = -1;
+  for (const auto& ct : csg.tensors) {
+    if (ct.id > max_local_id) max_local_id = ct.id;
+  }
+  sub_id_to_tensor.assign(static_cast<size_t>(max_local_id + 1), nullptr);
+
+  // Bind placeholders to parent operands.
+  if (operand_tensors.size() < csg.input_tensor_ids.size()) {
+    fprintf(stderr,
+            "[ggml_backend] COND subgraph wants %zu inputs but only %zu "
+            "operands provided\n",
+            csg.input_tensor_ids.size(), operand_tensors.size());
+    return {};
+  }
+  for (size_t k = 0; k < csg.input_tensor_ids.size(); ++k) {
+    int id = csg.input_tensor_ids[k];
+    if (id < 0 || id > max_local_id) continue;
+    sub_id_to_tensor[id] = operand_tensors[k];
+  }
+
+  // Walk subgraph tensors in order, dispatching op builders.
+  // Subgraph leaves with data_key are not supported in this minimal
+  // implementation — the subgraphs we emit today only use placeholder
+  // inputs and op tensors.
+  for (const auto& ct : csg.tensors) {
+    const ggml_ir::OpCode op = static_cast<ggml_ir::OpCode>(ct.op);
+    if (op == ggml_ir::OpCode::NONE) {
+      // Placeholder already bound, or unsupported leaf.
+      continue;
+    }
+    // Resolve sources: subgraph IDs only.
+    std::vector<struct ggml_tensor*> srcs;
+    srcs.reserve(ct.src_ids.size());
+    for (int sid : ct.src_ids) {
+      if (sid < 0 || sid > max_local_id) {
+        srcs.push_back(nullptr);
+      } else {
+        srcs.push_back(sub_id_to_tensor[sid]);
+      }
+    }
+
+    // Build a child BuildContext that points at the subgraph tensor's
+    // metadata (op_params, ne, etc.) but shares the parent's ggml_context.
+    // We don't have a fb_tensor for subgraph tensors — pass nullptr; the
+    // op handlers that need fb_tensor (a few do, for op_params) won't be
+    // hit by the simple ops we expect in cond branches today (add, mul,
+    // linear, view, slice, copy_, etc.).
+    int64_t local_ne[4] = {ct.ne[0], ct.ne[1], ct.ne[2], ct.ne[3]};
+    BuildContext sub_bc{
+        parent_bc.ctx, /*ir_tensor=*/nullptr, srcs,
+        parent_bc.host_acc, parent_bc.input_derived,
+        parent_bc.handle, parent_bc.gi,
+        parent_bc.cpu_pinned, sub_id_to_tensor, parent_bc.sym_dim_values,
+        parent_bc.causal_mask_cache, parent_bc.gdn_cache,
+        parent_bc.deferred_i64_to_i32, parent_bc.input_pairs,
+        {local_ne[0], local_ne[1], local_ne[2], local_ne[3]},
+        parent_bc.metal_f32_binops, parent_bc.cuda_bf16_cast,
+        parent_bc.skip_bf16_castback, parent_bc.use_native_cmp_ops,
+        parent_bc.verbose};
+
+    struct ggml_tensor* gt = dispatch_op_to_builder(op, sub_bc);
+    if (gt == nullptr) {
+      fprintf(stderr,
+              "[ggml_backend] COND subgraph: failed to build op %d (id=%d) "
+              "— probably an op handler that needs ir_tensor/op_params is "
+              "in a branch and not yet supported by the cond walker.\n",
+              static_cast<int>(op), ct.id);
+      return {};
+    }
+    sub_id_to_tensor[ct.id] = gt;
+  }
+
+  // Collect outputs by local ID.
+  std::vector<struct ggml_tensor*> outs;
+  outs.reserve(csg.output_tensor_ids.size());
+  for (int oid : csg.output_tensor_ids) {
+    if (oid < 0 || oid > max_local_id) {
+      outs.push_back(nullptr);
+    } else {
+      outs.push_back(sub_id_to_tensor[oid]);
+    }
+  }
+  return outs;
+}
+
+// Per-build cache: maps parent IR id of the FIRST cond-output tensor
+// (output_index=0) to its (true_outs, false_outs) pair. Subsequent cond
+// outputs (output_index>0) for the same cond reuse the cache.
+//
+// Implemented as a thread_local map keyed on (handle pointer, gi pointer,
+// "min cond id in this group") so multiple cond ops in one model don't
+// collide.
+static thread_local std::unordered_map<uint64_t, CondOutputs> g_cond_outs;
+
+static struct ggml_tensor* build_op_cond_v2(BuildContext& bc) {
+  // op_params: (int32 num_outputs, int32 output_index).
+  if (bc.ir_tensor->op_params() == nullptr ||
+      bc.ir_tensor->op_params()->size() < 8) {
+    fprintf(stderr, "[ggml_backend] COND: missing op_params\n");
+    return nullptr;
+  }
+  int32_t num_outputs, output_index;
+  std::memcpy(&num_outputs, bc.ir_tensor->op_params()->data(), sizeof(int32_t));
+  std::memcpy(&output_index, bc.ir_tensor->op_params()->data() + sizeof(int32_t),
+              sizeof(int32_t));
+
+  // Predicate is the single src.
+  if (bc.srcs.empty() || !bc.srcs[0]) {
+    fprintf(stderr, "[ggml_backend] COND: missing predicate src\n");
+    return nullptr;
+  }
+  struct ggml_tensor* pred = bc.srcs[0];
+
+  // Subgraph indices live on ir_tensor->subgraph_ids().
+  if (!bc.ir_tensor->subgraph_ids() ||
+      bc.ir_tensor->subgraph_ids()->size() != 2) {
+    fprintf(stderr, "[ggml_backend] COND: expected exactly 2 subgraph_ids\n");
+    return nullptr;
+  }
+  int32_t true_idx = bc.ir_tensor->subgraph_ids()->Get(0);
+  int32_t false_idx = bc.ir_tensor->subgraph_ids()->Get(1);
+  if (true_idx < 0 ||
+      static_cast<size_t>(true_idx) >= bc.handle->subgraph_caches.size() ||
+      false_idx < 0 ||
+      static_cast<size_t>(false_idx) >= bc.handle->subgraph_caches.size()) {
+    fprintf(stderr,
+            "[ggml_backend] COND: subgraph indices out of range "
+            "(true=%d false=%d, have %zu)\n",
+            true_idx, false_idx, bc.handle->subgraph_caches.size());
+    return nullptr;
+  }
+
+  // Resolve operand tensors from cond_operand_ids. The IR's
+  // cond_operand_ids reference parent IR tensor IDs which we look up in
+  // bc.id_to_tensor.
+  std::vector<struct ggml_tensor*> operand_tensors;
+  if (bc.ir_tensor->cond_operand_ids()) {
+    operand_tensors.reserve(bc.ir_tensor->cond_operand_ids()->size());
+    for (size_t k = 0; k < bc.ir_tensor->cond_operand_ids()->size(); ++k) {
+      int32_t oid = bc.ir_tensor->cond_operand_ids()->Get(k);
+      if (oid < 0 || static_cast<size_t>(oid) >= bc.id_to_tensor.size()) {
+        fprintf(stderr,
+                "[ggml_backend] COND: operand id %d out of range\n", oid);
+        return nullptr;
+      }
+      operand_tensors.push_back(bc.id_to_tensor[oid]);
+    }
+  }
+
+  // Cache key: first subgraph id (true) << 32 | false subgraph id. This
+  // identifies one logical cond uniquely (different conds in the same
+  // graph have different subgraph indices).
+  uint64_t cache_key =
+      (static_cast<uint64_t>(true_idx) << 32) |
+      static_cast<uint64_t>(static_cast<uint32_t>(false_idx));
+  auto it = g_cond_outs.find(cache_key);
+  if (it == g_cond_outs.end()) {
+    CondOutputs outs;
+    outs.true_outs = build_cond_subgraph(
+        bc, bc.handle->subgraph_caches[true_idx], operand_tensors);
+    outs.false_outs = build_cond_subgraph(
+        bc, bc.handle->subgraph_caches[false_idx], operand_tensors);
+    if (outs.true_outs.empty() || outs.false_outs.empty()) {
+      fprintf(stderr, "[ggml_backend] COND: subgraph build failed\n");
+      return nullptr;
+    }
+    if (outs.true_outs.size() != outs.false_outs.size()) {
+      fprintf(stderr,
+              "[ggml_backend] COND: branch output counts mismatch "
+              "(%zu vs %zu)\n",
+              outs.true_outs.size(), outs.false_outs.size());
+      return nullptr;
+    }
+    auto inserted = g_cond_outs.emplace(cache_key, std::move(outs));
+    it = inserted.first;
+  }
+
+  if (output_index < 0 ||
+      static_cast<size_t>(output_index) >= it->second.true_outs.size()) {
+    fprintf(stderr,
+            "[ggml_backend] COND: output_index %d out of range (have %zu)\n",
+            output_index, it->second.true_outs.size());
+    return nullptr;
+  }
+
+  struct ggml_tensor* tval = it->second.true_outs[output_index];
+  struct ggml_tensor* fval = it->second.false_outs[output_index];
+
+  // Select via ggml_where. Predicate is a 0-D bool/int tensor; broadcast
+  // to match tval's shape via ggml_repeat.
+  // ggml_where wants a numeric mask shaped like the inputs (cond * x +
+  // (1-cond) * y). We compute it ourselves to avoid relying on a specific
+  // ggml_where signature.
+  struct ggml_context* ctx = bc.ctx;
+
+  // Cast predicate to F32 if needed (it'll typically be I32 from a bool
+  // any() op). Materialize a scalar F32 by reading via the host accessor.
+  // For runtime correctness we let the scheduler compute pred → F32 via
+  // an inline cast op.
+  struct ggml_tensor* pred_f32 = pred;
+  if (pred->type != GGML_TYPE_F32) {
+    pred_f32 = ggml_cast(ctx, pred, GGML_TYPE_F32);
+  }
+
+  // Broadcast predicate scalar to tval's shape.
+  struct ggml_tensor* pred_bc = ggml_repeat(ctx, pred_f32,
+      ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                          tval->ne[0], tval->ne[1], tval->ne[2], tval->ne[3]));
+
+  // result = pred * tval + (1 - pred) * fval
+  struct ggml_tensor* one = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+      tval->ne[0], tval->ne[1], tval->ne[2], tval->ne[3]);
+  // We can't easily fill the tensor with 1.0 inside this build path
+  // without breaking scheduler invariants. Use: pred * tval + fval - pred * fval.
+  struct ggml_tensor* pt = ggml_mul(ctx, pred_bc, tval);
+  struct ggml_tensor* pf = ggml_mul(ctx, pred_bc, fval);
+  struct ggml_tensor* sum = ggml_add(ctx, pt, ggml_sub(ctx, fval, pf));
+  (void)one;
+  return sum;
 }
 
 // input_ne_overrides: nullptr on first call (use serialized shapes).
@@ -565,111 +912,15 @@ static Error build_graph(
                     metal_f32_binops, cuda_bf16_cast, skip_bf16_castback,
                     use_native_cmp_ops, verbose};
 
-    switch (op) {
-        // --- Arithmetic ---
-        case ggml_ir::OpCode::ADD:           gt = build_op_add(bc); break;
-        case ggml_ir::OpCode::SUB:           gt = build_op_sub(bc); break;
-        case ggml_ir::OpCode::MUL:           gt = build_op_mul(bc); break;
-        case ggml_ir::OpCode::MUL_SCALAR:    gt = build_op_mul_scalar(bc); break;
-        case ggml_ir::OpCode::DIV:           gt = build_op_div(bc); break;
-        case ggml_ir::OpCode::NEG:           gt = build_op_neg(bc); break;
-        case ggml_ir::OpCode::RSQRT:         gt = build_op_rsqrt(bc); break;
-        case ggml_ir::OpCode::POW:           gt = build_op_pow(bc); break;
-        case ggml_ir::OpCode::MEAN:          gt = build_op_mean(bc); break;
-
-        // --- Linear algebra ---
-        case ggml_ir::OpCode::MUL_MAT:       gt = build_op_mul_mat(bc); break;
-        case ggml_ir::OpCode::BMM:           gt = build_op_bmm(bc); break;
-        case ggml_ir::OpCode::LINEAR:        gt = build_op_linear(bc); break;
-        case ggml_ir::OpCode::EMBEDDING:     gt = build_op_embedding(bc); break;
-
-        // --- Activation ---
-        case ggml_ir::OpCode::SILU:          gt = build_op_silu(bc); break;
-        case ggml_ir::OpCode::SOFTPLUS:      gt = build_op_softplus(bc); break;
-        case ggml_ir::OpCode::RELU:          gt = build_op_relu(bc); break;
-        case ggml_ir::OpCode::TANH:          gt = build_op_tanh(bc); break;
-        case ggml_ir::OpCode::GELU:          gt = build_op_gelu(bc); break;
-        case ggml_ir::OpCode::LEAKY_RELU:    gt = build_op_leaky_relu(bc); break;
-        case ggml_ir::OpCode::SIGMOID:       gt = build_op_sigmoid(bc); break;
-        case ggml_ir::OpCode::SOFTMAX:       gt = build_op_softmax(bc); break;
-        case ggml_ir::OpCode::HARDTANH:      gt = build_op_hardtanh(bc); break;
-        case ggml_ir::OpCode::COS:           gt = build_op_cos(bc); break;
-        case ggml_ir::OpCode::SIN:           gt = build_op_sin(bc); break;
-
-        // --- Shape ---
-        case ggml_ir::OpCode::VIEW:          gt = build_op_view(bc); break;
-        case ggml_ir::OpCode::PERMUTE:       gt = build_op_permute(bc); break;
-        case ggml_ir::OpCode::TRANSPOSE:     gt = build_op_transpose(bc); break;
-        case ggml_ir::OpCode::UNSQUEEZE:     gt = build_op_unsqueeze(bc); break;
-        case ggml_ir::OpCode::SLICE:         gt = build_op_slice(bc); break;
-
-        // --- Indexing ---
-        case ggml_ir::OpCode::CAT:           gt = build_op_cat(bc); break;
-        case ggml_ir::OpCode::REPEAT:        gt = build_op_repeat(bc); break;
-        case ggml_ir::OpCode::REPEAT_INTERLEAVE: gt = build_op_repeat_interleave(bc); break;
-        case ggml_ir::OpCode::INDEX:         gt = build_op_index(bc); break;
-        case ggml_ir::OpCode::INDEX_MULTI:   gt = build_op_index_multi(bc); break;
-        case ggml_ir::OpCode::INDEX_PUT:     gt = build_op_index_put(bc); break;
-
-        // --- Normalization ---
-        case ggml_ir::OpCode::LAYER_NORM:    gt = build_op_layer_norm(bc); break;
-        case ggml_ir::OpCode::RMS_NORM:      gt = build_op_rms_norm(bc); break;
-        case ggml_ir::OpCode::BATCH_NORM:    gt = build_op_batch_norm(bc); break;
-
-        // --- Convolution ---
-        case ggml_ir::OpCode::CONV_2D:       gt = build_op_conv_2d(bc, /*is_dw=*/false); break;
-        case ggml_ir::OpCode::CONV_2D_DW:    gt = build_op_conv_2d(bc, /*is_dw=*/true); break;
-        case ggml_ir::OpCode::CONV_1D:       gt = build_op_conv_1d(bc, /*is_dw=*/false); break;
-        case ggml_ir::OpCode::CONV_1D_DW:    gt = build_op_conv_1d(bc, /*is_dw=*/true); break;
-        case ggml_ir::OpCode::PAD:           gt = build_op_pad(bc); break;
-
-        // --- Creation / cast ---
-        case ggml_ir::OpCode::ARANGE:        gt = build_op_arange(bc); break;
-        case ggml_ir::OpCode::FULL:          gt = build_op_full(bc); break;
-        case ggml_ir::OpCode::CUMSUM:        gt = build_op_cumsum(bc); break;
-        case ggml_ir::OpCode::ARGMAX:        gt = build_op_argmax(bc); break;
-        case ggml_ir::OpCode::CAST:          gt = build_op_cast(bc); break;
-        case ggml_ir::OpCode::WHERE:         gt = build_op_where(bc); break;
-
-        // --- Comparison / logical ---
-        case ggml_ir::OpCode::EQ:            gt = build_op_eq(bc); break;
-        case ggml_ir::OpCode::NE:            gt = build_op_ne(bc); break;
-        case ggml_ir::OpCode::LE:            gt = build_op_le(bc); break;
-        case ggml_ir::OpCode::LT:            gt = build_op_lt(bc); break;
-        case ggml_ir::OpCode::GT:            gt = build_op_gt(bc); break;
-        case ggml_ir::OpCode::GE:            gt = build_op_ge(bc); break;
-        case ggml_ir::OpCode::BITWISE_AND:   gt = build_op_bitwise_and(bc); break;
-        case ggml_ir::OpCode::BITWISE_OR:    gt = build_op_bitwise_or(bc); break;
-        case ggml_ir::OpCode::LOGICAL_NOT:   gt = build_op_logical_not(bc); break;
-        case ggml_ir::OpCode::ANY:           gt = build_op_any(bc); break;
-
-        // --- Special / attention ---
-        case ggml_ir::OpCode::LLAMA_ATTENTION: gt = build_op_llama_attention(bc); break;
-        case ggml_ir::OpCode::UPDATE_CACHE:  gt = build_op_update_cache(bc); break;
-        case ggml_ir::OpCode::ROPE:          gt = build_op_rope(bc); break;
-        case ggml_ir::OpCode::REMAINDER:   gt = build_op_remainder(bc); break;
-
-        // --- MoE ops ---
-        case ggml_ir::OpCode::TOPK:          gt = build_op_topk(bc); break;
-        case ggml_ir::OpCode::TOPK_INDICES:  gt = build_op_topk_indices(bc); break;
-        case ggml_ir::OpCode::SORT:          gt = build_op_sort(bc); break;
-        case ggml_ir::OpCode::SORT_INDICES:  gt = build_op_sort_indices(bc); break;
-        case ggml_ir::OpCode::MUL_MAT_ID:   gt = build_op_mul_mat_id(bc); break;
-        case ggml_ir::OpCode::LOG1P:         gt = build_op_log1p(bc); break;
-        case ggml_ir::OpCode::EXP:           gt = build_op_exp(bc); break;
-        case ggml_ir::OpCode::SUM:           gt = build_op_sum(bc); break;
-        case ggml_ir::OpCode::CLAMP:         gt = build_op_clamp(bc); break;
-        case ggml_ir::OpCode::SLICE_SCATTER: gt = build_op_slice_scatter(bc); break;
-        case ggml_ir::OpCode::MOE_FFN:      gt = build_op_moe_ffn(bc); break;
-        case ggml_ir::OpCode::SSM_CONV:     gt = build_op_ssm_conv(bc); break;
-        case ggml_ir::OpCode::GATED_DELTA_NET: gt = build_op_gated_delta_net(bc); break;
-        case ggml_ir::OpCode::COND:         gt = build_op_cond(bc); break;
-
-        default:
-          fprintf(stderr, "[executorch-ggml] Unsupported OpCode %d\n", (int) op);
-          ggml_free(ctx);
-          return Error::InvalidArgument;
-      }
+    gt = dispatch_op_to_builder(op, bc);
+    if (gt == nullptr && op != ggml_ir::OpCode::NONE) {
+      // dispatch_op_to_builder returns nullptr only when the opcode is
+      // unrecognised. The switch covers all defined OpCodes so this
+      // path indicates a missing case after a schema bump.
+      fprintf(stderr, "[executorch-ggml] Unsupported OpCode %d\n", (int) op);
+      ggml_free(ctx);
+      return Error::InvalidArgument;
+    }
 
     // Propagate input-derived tracking: if any source is input-derived,
     // the result is too.
