@@ -68,6 +68,34 @@ endif()
 
 message(STATUS "benchmark_llm target configured")
 
+# Standalone Triton SDPA integration test.
+# No executorch dependency — raw ggml + CUDA.
+if(TARGET ggml-cuda AND TARGET executorch_ggml_fused_kernels)
+  add_executable(test_triton_sdpa test_triton_sdpa.cpp)
+  target_include_directories(test_triton_sdpa PRIVATE
+    "${LLAMA_CPP_DIR}/ggml/include"
+    "/usr/local/cuda/include")
+  target_link_libraries(test_triton_sdpa PRIVATE
+    $<TARGET_FILE:executorch_ggml_fused_kernels>
+    ggml ggml-base ggml-cpu ggml-cuda
+    -L/usr/local/cuda/lib64 -lcudart -lcuda)
+  set_target_properties(test_triton_sdpa PROPERTIES
+    BUILD_RPATH "${CMAKE_BINARY_DIR}/ggml/src")
+  message(STATUS "test_triton_sdpa target configured")
+
+  add_executable(test_triton_moe test_triton_moe.cpp)
+  target_include_directories(test_triton_moe PRIVATE
+    "${LLAMA_CPP_DIR}/ggml/include"
+    "/usr/local/cuda/include")
+  target_link_libraries(test_triton_moe PRIVATE
+    $<TARGET_FILE:executorch_ggml_fused_kernels>
+    ggml ggml-base ggml-cpu ggml-cuda
+    -L/usr/local/cuda/lib64 -lcudart -lcuda)
+  set_target_properties(test_triton_moe PROPERTIES
+    BUILD_RPATH "${CMAKE_BINARY_DIR}/ggml/src")
+  message(STATUS "test_triton_moe target configured")
+endif()
+
 # Voxtral decoder benchmark — same build config as benchmark_llm.
 add_executable(benchmark_voxtral benchmark_voxtral.cpp)
 target_include_directories(benchmark_voxtral PRIVATE
@@ -98,6 +126,37 @@ if(TARGET portable_ops_lib)
 endif()
 set_target_properties(benchmark_voxtral PROPERTIES BUILD_RPATH "${CMAKE_BINARY_DIR}/ggml/src")
 message(STATUS "benchmark_voxtral target configured")
+
+# Needle encoder/decoder benchmark — same build config as benchmark_voxtral.
+add_executable(benchmark_needle benchmark_needle.cpp)
+target_include_directories(benchmark_needle PRIVATE
+  "${CMAKE_SOURCE_DIR}/runtime"
+  "${CMAKE_SOURCE_DIR}/schema"
+  "${LLAMA_CPP_DIR}/ggml/include"
+  "${EXECUTORCH_DIR}/.."
+  "${EXECUTORCH_DIR}"
+  "${EXECUTORCH_DIR}/include"
+  "${EXECUTORCH_DIR}/third-party/flatbuffers/include"
+)
+target_link_libraries(benchmark_needle PRIVATE
+  -Wl,--whole-archive executorch_ggml_runtime -Wl,--no-whole-archive
+  -Wl,--no-as-needed executorch -Wl,--as-needed
+  ggml ggml-base ggml-cpu
+  extension_module_static
+  extension_tensor
+)
+if(TARGET ggml-blas)
+  target_link_libraries(benchmark_needle PRIVATE ggml-blas)
+endif()
+if(TARGET ggml-cuda)
+  target_link_libraries(benchmark_needle PRIVATE ggml-cuda)
+  target_link_libraries(benchmark_needle PRIVATE -Wl,--no-as-needed -L/usr/local/cuda/lib64 -lcudart -Wl,--as-needed)
+endif()
+if(TARGET portable_ops_lib)
+  target_link_libraries(benchmark_needle PRIVATE -Wl,--no-as-needed portable_ops_lib portable_kernels -Wl,--as-needed)
+endif()
+set_target_properties(benchmark_needle PROPERTIES BUILD_RPATH "${CMAKE_BINARY_DIR}/ggml/src")
+message(STATUS "benchmark_needle target configured")
 
 else()
   message(STATUS "Skipping benchmarks: requires EXECUTORCH_GGML_BUILD_LLAMA_RUNNER=ON")

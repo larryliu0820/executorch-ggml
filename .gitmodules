@@ -4,3 +4,6 @@
 [submodule "third-party/executorch"]
 	path = third-party/executorch
 	url = https://github.com/pytorch/executorch.git
+[submodule "third-party/needle"]
+	path = third-party/needle
+	url = https://github.com/cactus-compute/needle.git
